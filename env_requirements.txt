@@ -1,0 +1,29 @@
+# create anaconda environment 
+# conda create --name env_stentviz python
+
+# activate the environment
+# conda activate env_stentviz
+
+
+matplotlib
+numpy
+pandas
+scipy
+trimesh
+IPython
+joblib
+h5py
+ipykernel
+plotly
+
+scikit-image
+networkx   
+
+# requests
+# psimpy
+# coscine
+
+# jupyter
+
+# To delete the environment
+# conda remove --name curve_skeleton_construction_env --all
