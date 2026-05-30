@@ -41,6 +41,8 @@ def _build_tube_mesh(
     radii: np.ndarray,
     n_circumference: int = 32,
     cap_ends: bool = True,
+    noise_amplitude: float = 0.0,
+    noise_seed: int | None = None,
 ) -> trimesh.Trimesh:
     """
     Build a watertight tube mesh around a 3D centerline with varying radii.
@@ -55,12 +57,21 @@ def _build_tube_mesh(
         Number of vertices around each cross-section ring.
     cap_ends : bool
         If True, close both ends with triangulated caps.
+    noise_amplitude : float
+        Biological wall irregularity as a fraction of the local radius
+        (0 = perfectly smooth, 0.05 = ±5% radius variation).
+        Combines a smooth axial component (stenosis/dilatation-like lumen
+        variation) with a smaller high-frequency surface roughness component.
+    noise_seed : int or None
+        Random seed for reproducibility. None = non-deterministic.
 
     Returns
     -------
     trimesh.Trimesh
         Watertight triangulated surface mesh of the tube.
     """
+    from scipy.ndimage import gaussian_filter1d, gaussian_filter
+
     n_sections = len(centerline)
     nc = n_circumference
 
@@ -101,19 +112,56 @@ def _build_tube_mesh(
 
     binormals = np.cross(tangents, normals)
 
-    # --- Place circle rings at each centreline point ---
-    circle_2d = _make_circle_points(1.0, nc)  # unit circle
+    # --- Build biological noise field (n_sections, nc) if requested ----------
+    # Two superimposed components:
+    #   1. Axial (75%): smooth low-frequency radius variation along the length,
+    #      mimicking natural stenosis/dilatation.  Correlation length ≈ 12% of arc.
+    #   2. Roughness (25%): small-scale per-vertex surface irregularity,
+    #      mimicking endothelial texture.  Correlation length ≈ 3% of arc axially.
+    # The combined field is expressed as a *fractional* deviation of the local
+    # radius, clamped so the radius never drops below 10% of its nominal value.
+    if noise_amplitude > 0.0:
+        rng = np.random.default_rng(noise_seed)
 
-    vertices = np.zeros((n_sections * nc, 3))
-    for i in range(n_sections):
-        R = radii[i]
-        centre = centerline[i]
-        n_vec = normals[i]
-        b_vec = binormals[i]
-        for j in range(nc):
-            vertices[i * nc + j] = (
-                centre + R * (circle_2d[j, 0] * n_vec + circle_2d[j, 1] * b_vec)
-            )
+        raw_axial = rng.standard_normal(n_sections)
+        sigma_a = max(2, int(0.12 * n_sections))
+        axial = gaussian_filter1d(raw_axial, sigma_a)
+        axial /= axial.std() + 1e-12
+
+        raw_rough = rng.standard_normal((n_sections, nc))
+        sigma_r = (max(1, int(0.03 * n_sections)), 1)
+        rough = gaussian_filter(raw_rough, sigma_r)
+        rough /= rough.std() + 1e-12
+
+        noise_field = noise_amplitude * (0.75 * axial[:, np.newaxis] + 0.25 * rough)
+    else:
+        noise_field = None
+
+    # --- Vectorised vertex placement -----------------------------------------
+    circle_2d = _make_circle_points(1.0, nc)  # (nc, 3) unit circle
+    cos_t = circle_2d[:, 0]                   # (nc,)
+    sin_t = circle_2d[:, 1]                   # (nc,)
+
+    # ring_dirs[i, j] = cos(θ_j)·N_i + sin(θ_j)·B_i,  shape (n_sections, nc, 3)
+    ring_dirs = (
+        cos_t[np.newaxis, :, np.newaxis] * normals[:, np.newaxis, :]
+        + sin_t[np.newaxis, :, np.newaxis] * binormals[:, np.newaxis, :]
+    )
+
+    # Effective per-vertex radius with optional noise, shape (n_sections, nc)
+    if noise_field is not None:
+        R_eff = np.clip(
+            radii[:, np.newaxis] * (1.0 + noise_field),
+            radii[:, np.newaxis] * 0.1,  # never shrink below 10% of nominal
+            None,
+        )
+    else:
+        R_eff = radii[:, np.newaxis]
+
+    # (n_sections, nc, 3) → (n_sections*nc, 3)
+    vertices = (
+        centerline[:, np.newaxis, :] + R_eff[:, :, np.newaxis] * ring_dirs
+    ).reshape(-1, 3)
 
     # --- Build quad faces (split into triangles) between consecutive rings ---
     faces = []
@@ -332,6 +380,8 @@ def generate_straight_artery(
     wall_thickness: float = 0.0,
     n_circumference: int = 32,
     n_axial: int = 100,
+    noise_amplitude: float = 0.0,
+    noise_seed: int | None = None,
 ) -> trimesh.Trimesh:
     """
     Generate a straight cylindrical artery.
@@ -348,10 +398,15 @@ def generate_straight_artery(
         Vertices around each ring.
     n_axial : int
         Number of cross-section rings along the length.
+    noise_amplitude : float
+        Biological wall irregularity as a fraction of radius (0 = smooth, 0.05 = ±5%).
+    noise_seed : int or None
+        Random seed for reproducibility.
     """
     cl = straight_centreline(length, n_axial)
     radii = np.full(n_axial, radius)
-    mesh = _build_tube_mesh(cl, radii, n_circumference)
+    mesh = _build_tube_mesh(cl, radii, n_circumference,
+                            noise_amplitude=noise_amplitude, noise_seed=noise_seed)
 
     if wall_thickness > 0:
         outer_radii = np.full(n_axial, radius + wall_thickness)
@@ -370,6 +425,8 @@ def generate_curved_artery(
     bend_angle_deg: float = 45.0,
     n_circumference: int = 32,
     n_axial: int = 100,
+    noise_amplitude: float = 0.0,
+    noise_seed: int | None = None,
 ) -> trimesh.Trimesh:
     """
     Generate a curved artery with a single bend.
@@ -384,10 +441,15 @@ def generate_curved_artery(
         Radius of curvature at the bend in mm.
     bend_angle_deg : float
         Bend angle in degrees.
+    noise_amplitude : float
+        Biological wall irregularity as a fraction of radius (0 = smooth, 0.05 = ±5%).
+    noise_seed : int or None
+        Random seed for reproducibility.
     """
     cl = curved_centreline(length, bend_radius, bend_angle_deg, n_axial)
     radii = np.full(n_axial, radius)
-    return _build_tube_mesh(cl, radii, n_circumference)
+    return _build_tube_mesh(cl, radii, n_circumference,
+                            noise_amplitude=noise_amplitude, noise_seed=noise_seed)
 
 
 def generate_s_bend_artery(
@@ -397,6 +459,8 @@ def generate_s_bend_artery(
     bend_angle_deg: float = 25.0,
     n_circumference: int = 32,
     n_axial: int = 150,
+    noise_amplitude: float = 0.0,
+    noise_seed: int | None = None,
 ) -> trimesh.Trimesh:
     """
     Generate an S-shaped artery with two opposite bends.
@@ -411,10 +475,15 @@ def generate_s_bend_artery(
         Radius of curvature for each bend in mm.
     bend_angle_deg : float
         Bend angle for each curve segment in degrees.
+    noise_amplitude : float
+        Biological wall irregularity as a fraction of radius (0 = smooth, 0.05 = ±5%).
+    noise_seed : int or None
+        Random seed for reproducibility.
     """
     cl = s_bend_centreline(length, bend_radius, bend_angle_deg, n_axial)
     radii = np.full(len(cl), radius)
-    return _build_tube_mesh(cl, radii, n_circumference)
+    return _build_tube_mesh(cl, radii, n_circumference,
+                            noise_amplitude=noise_amplitude, noise_seed=noise_seed)
 
 
 def generate_tapered_artery(
@@ -423,6 +492,8 @@ def generate_tapered_artery(
     length: float = 30.0,
     n_circumference: int = 32,
     n_axial: int = 100,
+    noise_amplitude: float = 0.0,
+    noise_seed: int | None = None,
 ) -> trimesh.Trimesh:
     """
     Generate a straight artery that tapers from proximal to distal end.
@@ -435,126 +506,14 @@ def generate_tapered_artery(
         Radius at the far (distal) end in mm.
     length : float
         Vessel length in mm.
+    noise_amplitude : float
+        Biological wall irregularity as a fraction of radius (0 = smooth, 0.05 = ±5%).
+    noise_seed : int or None
+        Random seed for reproducibility.
     """
     cl = straight_centreline(length, n_axial)
     radii = tapered_radii(radius_proximal, radius_distal, n_axial)
-    return _build_tube_mesh(cl, radii, n_circumference)
+    return _build_tube_mesh(cl, radii, n_circumference,
+                            noise_amplitude=noise_amplitude, noise_seed=noise_seed)
 
 
-# ---------------------------------------------------------------------------
-# Convenience: generate all defaults
-# ---------------------------------------------------------------------------
-
-DEFAULTS = {
-    "straight": {
-        "func": generate_straight_artery,
-        "kwargs": {"radius": 1.5, "length": 25.0},
-    },
-    "curved": {
-        "func": generate_curved_artery,
-        "kwargs": {"radius": 1.5, "length": 30.0, "bend_radius": 20.0, "bend_angle_deg": 45.0},
-    },
-    "s_bend": {
-        "func": generate_s_bend_artery,
-        "kwargs": {"radius": 1.5, "length": 40.0, "bend_radius": 25.0, "bend_angle_deg": 25.0},
-    },
-    "tapered": {
-        "func": generate_tapered_artery,
-        "kwargs": {"radius_proximal": 2.0, "radius_distal": 1.2, "length": 30.0},
-    },
-}
-
-
-def generate_all(output_dir: str | Path = ".") -> dict[str, Path]:
-    """Generate all default artery geometries and save as STL files."""
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    saved = {}
-
-    for name, spec in DEFAULTS.items():
-        mesh = spec["func"](**spec["kwargs"])
-        filepath = output_dir / f"artery_{name}.stl"
-        mesh.export(filepath)
-
-        # Print mesh summary
-        print(f"  {name:12s} → {filepath.name}")
-        print(f"               vertices: {len(mesh.vertices):,}")
-        print(f"               faces:    {len(mesh.faces):,}")
-        print(f"               watertight: {mesh.is_watertight}")
-        print(f"               bounds:   {mesh.bounds[0].round(2)} → {mesh.bounds[1].round(2)}")
-        print()
-
-        saved[name] = filepath
-
-    return saved
-
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Generate parametric artery STL files for stentFIT",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=(
-            "Examples:\n"
-            "  python generate_artery.py                          # all defaults\n"
-            "  python generate_artery.py --type curved            # just curved\n"
-            "  python generate_artery.py --type straight -r 2.0 -l 35 -o custom.stl\n"
-        ),
-    )
-    parser.add_argument(
-        "--type", "-t",
-        choices=["all", "straight", "curved", "s_bend", "tapered"],
-        default="all",
-        help="Artery type to generate (default: all)",
-    )
-    parser.add_argument("--radius", "-r", type=float, default=None, help="Lumen radius in mm")
-    parser.add_argument("--length", "-l", type=float, default=None, help="Vessel length in mm")
-    parser.add_argument("--bend-radius", type=float, default=None, help="Bend radius in mm")
-    parser.add_argument("--bend-angle", type=float, default=None, help="Bend angle in degrees")
-    parser.add_argument("--output", "-o", type=str, default=None, help="Output STL filename")
-    parser.add_argument(
-        "--output-dir", "-d",
-        type=str,
-        default=".",
-        help="Output directory (used when --type=all)",
-    )
-
-    args = parser.parse_args()
-
-    if args.type == "all":
-        print("Generating all default artery geometries:\n")
-        generate_all(args.output_dir)
-        print("Done.")
-        return
-
-    # Single geometry mode
-    spec = DEFAULTS[args.type]
-    kwargs = spec["kwargs"].copy()
-
-    # Override with CLI args if provided
-    if args.radius is not None:
-        if "radius" in kwargs:
-            kwargs["radius"] = args.radius
-        if "radius_proximal" in kwargs:
-            kwargs["radius_proximal"] = args.radius
-    if args.length is not None:
-        kwargs["length"] = args.length
-    if args.bend_radius is not None and "bend_radius" in kwargs:
-        kwargs["bend_radius"] = args.bend_radius
-    if args.bend_angle is not None and "bend_angle_deg" in kwargs:
-        kwargs["bend_angle_deg"] = args.bend_angle
-
-    mesh = spec["func"](**kwargs)
-    output_path = args.output or f"artery_{args.type}.stl"
-    mesh.export(output_path)
-    print(f"Saved: {output_path}")
-    print(f"  vertices:   {len(mesh.vertices):,}")
-    print(f"  faces:      {len(mesh.faces):,}")
-    print(f"  watertight: {mesh.is_watertight}")
-
-
-if __name__ == "__main__":
-    main()

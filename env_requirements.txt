@@ -21,6 +21,7 @@ plotly
 
 scikit-image
 networkx   
+beamme
 
 # requests
 # psimpy
