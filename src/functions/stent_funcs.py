@@ -3,6 +3,8 @@ import trimesh
 from trimesh.path.entities import Line
 import matplotlib.pyplot as plt
 import pandas as pd
+import ast
+import datetime
 
 from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import connected_components
@@ -520,4 +522,109 @@ def analyze_skeleton_connectivity(
     df_result['neighbor_ids']      = neighbors
 
     return df_result
+
+def _write_skeleton_stp(skeleton_df: pd.DataFrame, output_path: str) -> None:
+    """Write skeleton wireframe as an ISO 10303-21 (STEP) file."""
+    pts_data = skeleton_df.reset_index(drop=True)
+    pts = pts_data[['x', 'y', 'z']].values
+    id_to_idx = {int(row.skeleton_point_id): i for i, row in enumerate(pts_data.itertuples())}
+
+    # Build unique edge set from neighbor_ids
+    edges = set()
+    for row in pts_data.itertuples():
+        pid = int(row.skeleton_point_id)
+        nbrs = row.neighbor_ids
+        if isinstance(nbrs, str):
+            nbrs = ast.literal_eval(nbrs)
+        for nid in nbrs:
+            edges.add((min(pid, nid), max(pid, nid)))
+    edges = sorted(edges)
+
+    buf = []
+    now = datetime.datetime.now().strftime('%Y-%m-%dT%H:%M:%S')
+
+    buf.append('ISO-10303-21;')
+    buf.append('HEADER;')
+    buf.append("FILE_DESCRIPTION(('Stent Skeleton Wireframe'),'2;1');")
+    buf.append(f"FILE_NAME('skeleton_points.stp','{now}',(''),(''),(''),(''),(''));")
+    buf.append("FILE_SCHEMA(('AUTOMOTIVE_DESIGN'));")
+    buf.append('ENDSEC;')
+    buf.append('DATA;')
+
+    eid = 1
+
+    unit_id = eid
+    buf.append(f'#{eid}=(LENGTH_UNIT()NAMED_UNIT(*)SI_UNIT(.MILLI.,.METRE.));')
+    eid += 1
+
+    angle_id = eid
+    buf.append(f'#{eid}=(PLANE_ANGLE_UNIT()NAMED_UNIT(*)SI_UNIT($,.RADIAN.));')
+    eid += 1
+
+    solid_id = eid
+    buf.append(f'#{eid}=(NAMED_UNIT(*)SI_UNIT($,.STERADIAN.)SOLID_ANGLE_UNIT());')
+    eid += 1
+
+    unc_id = eid
+    buf.append(f"#{eid}=UNCERTAINTY_MEASURE_WITH_UNIT(LENGTH_MEASURE(1.E-07),#{unit_id},'distance_accuracy_value','confusion accuracy');")
+    eid += 1
+
+    ctx_id = eid
+    buf.append(
+        f"#{eid}=(GEOMETRIC_REPRESENTATION_CONTEXT(3)"
+        f"GLOBAL_UNCERTAINTY_ASSIGNED_CONTEXT((#{unc_id}))"
+        f"GLOBAL_UNIT_ASSIGNED_CONTEXT((#{unit_id},#{angle_id},#{solid_id}))"
+        f"REPRESENTATION_CONTEXT('Context #1','3D Context with UNIT and UNCERTAINTY'));"
+    )
+    eid += 1
+
+    # One CARTESIAN_POINT per skeleton vertex
+    cp_ids = []
+    for pt in pts:
+        buf.append(f"#{eid}=CARTESIAN_POINT('',({pt[0]:.6f},{pt[1]:.6f},{pt[2]:.6f}));")
+        cp_ids.append(eid)
+        eid += 1
+
+    # DIRECTION + VECTOR + LINE for each unique edge
+    line_ids = []
+    for (pi, pj) in edges:
+        idx_i = id_to_idx.get(pi)
+        idx_j = id_to_idx.get(pj)
+        if idx_i is None or idx_j is None:
+            continue
+        d = pts[idx_j] - pts[idx_i]
+        length = np.linalg.norm(d)
+        if length < 1e-10:
+            continue
+        dn = d / length
+
+        dir_id = eid
+        buf.append(f"#{eid}=DIRECTION('',({dn[0]:.6f},{dn[1]:.6f},{dn[2]:.6f}));")
+        eid += 1
+
+        vec_id = eid
+        buf.append(f"#{eid}=VECTOR('',#{dir_id},{length:.6f});")
+        eid += 1
+
+        line_id = eid
+        buf.append(f"#{eid}=LINE('',#{cp_ids[idx_i]},#{vec_id});")
+        eid += 1
+        line_ids.append(line_id)
+
+    # GEOMETRIC_CURVE_SET collecting all lines
+    gcs_id = eid
+    refs = ','.join(f'#{lid}' for lid in line_ids)
+    buf.append(f"#{eid}=GEOMETRIC_CURVE_SET('Skeleton Wireframe',({refs}));")
+    eid += 1
+
+    # SHAPE_REPRESENTATION referencing the curve set and context
+    buf.append(f"#{eid}=SHAPE_REPRESENTATION('Stent Skeleton',(#{gcs_id}),#{ctx_id});")
+    eid += 1
+
+    buf.append('ENDSEC;')
+    buf.append('END-ISO-10303-21;')
+
+    with open(output_path, 'w') as f:
+        f.write('\n'.join(buf))
+
 
