@@ -1,28 +1,7 @@
-"""
-generate_artery.py — Parametric artery STL generator for stentFIT
-
-Generates cylindrical vessel geometries (straight, curved, S-bend, tapered)
-as watertight STL meshes for use in virtual stent implantation simulations.
-
-Usage:
-    python generate_artery.py                        # generates all default geometries
-    python generate_artery.py --type curved           # generates only the curved artery
-    python generate_artery.py --type straight --radius 2.0 --length 30.0 --output my_artery.stl
-
-All dimensions are in millimeters.
-"""
-
 import argparse
 import numpy as np
 from pathlib import Path
-
-try:
-    import trimesh
-except ImportError:
-    raise ImportError(
-        "trimesh is required: pip install trimesh\n"
-        "Add it to your env_requirements.txt"
-    )
+import trimesh
 
 
 # ---------------------------------------------------------------------------
@@ -515,5 +494,91 @@ def generate_tapered_artery(
     radii = tapered_radii(radius_proximal, radius_distal, n_axial)
     return _build_tube_mesh(cl, radii, n_circumference,
                             noise_amplitude=noise_amplitude, noise_seed=noise_seed)
+
+
+def generate_artery_for_stent(
+    features: dict,
+    artery_type: str = "s_bend",
+    noise_amplitude: float = 0.1,
+    noise_seed: int | None = 42,
+    bend_angle_deg: float = 45.0,
+) -> tuple:
+    """
+    Generate an artery mesh and centreline sized to match the given stent features.
+
+    Bend radii are chosen so the full arc fits within the artery length with
+    a 10% margin.
+
+    Parameters
+    ----------
+    features       : dict  each key maps to {"value": ..., "unit": "..."}
+    artery_type    : "straight" | "curved" | "s_bend"
+    noise_amplitude: fractional radius perturbation (0 = smooth, 0.05 = ±5%)
+    noise_seed     : int for reproducibility, or None for random
+    bend_angle_deg : bend angle [deg]; only used for "curved" and "s_bend"
+
+    Returns
+    -------
+    artery_mesh  : trimesh.Trimesh
+    artery_cl    : (M, 3) ndarray  centreline points
+    artery_radius: float  nominal lumen radius [mm]
+    """
+    artery_radius = features["r_outer"]["value"] + 1
+    stent_length  = features["length"]["value"]
+
+    _len_c = stent_length * 1.5
+    _len_s = stent_length * 2.0
+    _ba    = np.radians(bend_angle_deg)
+    _br_c  = min(20.0, 0.9 * _len_c / _ba)
+    _br_s  = min(15.0, 0.9 * _len_s / (2.0 * _ba))
+
+    configs = {
+        "straight": dict(
+            radius=artery_radius, length=stent_length * 1.5,
+            n_circumference=64, n_axial=150,
+        ),
+        "curved": dict(
+            radius=artery_radius, length=stent_length * 1.5,
+            bend_radius=_br_c, bend_angle_deg=bend_angle_deg,
+            n_circumference=64, n_axial=150,
+        ),
+        "s_bend": dict(
+            radius=artery_radius, length=stent_length * 2.0,
+            bend_radius=_br_s, bend_angle_deg=bend_angle_deg,
+            n_circumference=64, n_axial=150,
+        ),
+    }
+    mesh_gen = {
+        "straight": generate_straight_artery,
+        "curved":   generate_curved_artery,
+        "s_bend":   generate_s_bend_artery,
+    }
+
+    p           = configs[artery_type]
+    artery_mesh = mesh_gen[artery_type](**p, noise_amplitude=noise_amplitude, noise_seed=noise_seed)
+
+    if artery_type == "straight":
+        artery_cl = straight_centreline(p["length"], p["n_axial"])
+    elif artery_type == "curved":
+        artery_cl = curved_centreline(p["length"], p["bend_radius"], p["bend_angle_deg"], p["n_axial"])
+    elif artery_type == "s_bend":
+        artery_cl = s_bend_centreline(p["length"], p["bend_radius"], p["bend_angle_deg"], p["n_axial"])
+
+    total_arc = np.linalg.norm(np.diff(artery_cl, axis=0), axis=1).sum()
+
+    print(f"Artery type      : {artery_type}")
+    print(f"Artery radius    : {artery_radius:.3f} mm")
+    print(f"Noise amplitude  : {noise_amplitude} ({noise_amplitude*100:.0f}% of radius)  seed={noise_seed}")
+    if artery_type == "curved":
+        print(f"Bend angle       : {bend_angle_deg:.1f} deg")
+        print(f"Bend radius      : {_br_c:.2f} mm  (arc = {_br_c * _ba:.2f} mm)")
+    if artery_type == "s_bend":
+        print(f"Bend angle       : {bend_angle_deg:.1f} deg")
+        print(f"Bend radius      : {_br_s:.2f} mm  (2× arc = {2 * _br_s * _ba:.2f} mm)")
+    print(f"Arc length       : {total_arc:.2f} mm  (stent {stent_length:.2f} mm = {stent_length/total_arc*100:.0f}% of artery)")
+    print(f"Centreline       : {len(artery_cl)} points  bounds {artery_cl.min(0).round(2)} → {artery_cl.max(0).round(2)}")
+    print(f"Mesh             : {len(artery_mesh.vertices):,} vertices  {len(artery_mesh.faces):,} faces  watertight={artery_mesh.is_watertight}")
+
+    return artery_mesh, artery_cl, artery_radius
 
 
