@@ -807,7 +807,7 @@ def tune_skeleton_params(
     pps0: float = 10.0,           # starting pixels_per_strut (continuous)
     dil0: int = 3,                # starting dilate_px (integer disk radius)
     pps_min: float = 5.0,
-    pps_max: float = 80.0,        # hard cap requested (keeps runtime bounded)
+    pps_max: float = 120.0,        # hard cap requested (keeps runtime bounded)
     dil_min: int = 1,
     dil_max: int = 30,            # cap on disk radius -> bounds per-step cost
     s_pps_conn: float = 25.0,     # pps push from bad connections
@@ -819,11 +819,13 @@ def tune_skeleton_params(
     w_conn: float = 1.0,
     w_loop: float = 1.0,
     w_empty: float = 1.0,
-    w_pps_reward: float = 0.25,   # score reward: prefer higher pps (<1 so it never beats a real error)
+    w_pps_dil_ratio_reward: float = 2,   # score reward: prefer higher pps (<1 so it never beats a real error)
+    reward_no_improve_max: int = 3,   # steps (after the first clean step) with no reward gain
+    reward_improve_tol: float = 1e-2,     # min score gain to reset the no-improve counter (avoid noise)
     target_penalty: float = 0.0,  # penalty <= this counts as "feasible"
     max_repeats: int = 4,        # stop once the SAME (pps, dil) state has been visited this many times
     pad_fraction: float = 0.20,
-    time_limit: float = 90.0,
+    time_limit: float = 100.0,
     max_iters: int = int(1e3),
     plot: bool = True,
     verbose: bool = True,
@@ -855,19 +857,24 @@ def tune_skeleton_params(
     maximises a *score* = reward - penalty, where the reward is a small bonus for
     higher `pixels_per_strut` (so bigger score = better):
 
-        reward = w_pps_reward * (pps - pps_min) / (pps_max - pps_min)   in [0, w_pps_reward]
+        reward = w_pps_dil_ratio_reward * (pps/dil - pps_min/dil_max) / (pps_max/dil_min - pps_min/dil_max)   in [0, w_pps_dil_ratio_reward]
 
     Reaching penalty <= `target_penalty` does NOT stop the search — once feasible
-    it keeps pushing resolution up (pps += s_pps_explore, with dilate_px scaled by
-    the same factor so the *physical* dilation, hence feasibility, is preserved).
+    it keeps pushing resolution up (pps += s_pps_explore while dil is held fixed,
+    so the ratio pps/dil and hence the reward genuinely rises). Holding dil thins
+    the physical dilation; if loops/empties reappear the infeasible branch thickens
+    dil back, and the post-feasibility no-improve counter bounds the search.
 
     STOPPING is purely cycle-based: the update is deterministic, so if a (pps, dil)
     pair ever recurs the whole trajectory from it repeats. The tuner counts how
     often each (pps, dil) state is visited and stops once any state has been seen
     `max_repeats` times (a true limit cycle, or pinned at a bound). Once the
-    skeleton is clean it also stops after 10 clean steps with no score gain
-    (converged). It also stops after `time_limit` s / `max_iters`. Returns the
-    highest-score step.
+    skeleton is clean for the first time, a no-improve counter starts and runs on
+    EVERY subsequent step (it is not reset by later infeasible excursions); the
+    tuner stops after `reward_no_improve_max` steps with no gain in the reward
+    bucket (converged). It also stops after `time_limit` s / `max_iters`. Returns the
+    highest-score step; ties within `reward_improve_tol` (the same-reward band
+    used for the no-improve count) are broken by the highest pps/dil ratio.
     """
     r_mid = stent_features['r_mid']
     circ  = 2 * np.pi * r_mid
@@ -894,8 +901,9 @@ def tune_skeleton_params(
     dil = int(np.clip(round(dil0), dil_min, min(dil_max, int(pps))))
     best, history = None, []
     seen = Counter()              # (round(pps), dil) -> times visited (cycle / pinned detector)
-    best_feasible = None          # best score seen with penalty == 0
-    no_improve = 0                # consecutive clean steps with no score gain
+    best_bucket = None            # best reward bucket since feasibility was first reached
+    feasible_reached = False      # latches True at the first penalty<=target step
+    no_improve = 0                # steps (post-feasibility) since the reward bucket improved
     t0 = time.time()
     durs = []                     # per-iteration wall times -> predict the next step's cost
 
@@ -935,10 +943,10 @@ def tune_skeleton_params(
         durs.append(time.time() - _it_t0)
         n_conn, n_loop, e_empty = _errors(qr)
         P = w_conn * n_conn + w_loop * n_loop + w_empty * e_empty
-        # Reward higher resolution. score is what we MAXIMISE: bigger = better.
-        # A clean skeleton (P=0) scores +reward (small, in [0, w_pps_reward]);
+        # Reward higher resolution, if pps/dil ratio is more, it shows higher resolution skeleton
+        # A clean skeleton (P=0) scores +reward (small, in [0, w_pps_dil_ratio_reward]);
         # any error makes P large and drags the score negative.
-        reward = w_pps_reward * (pps - pps_min) / max(1e-9, pps_max - pps_min)
+        reward = w_pps_dil_ratio_reward * (pps/dil - pps_min/dil_max) / (pps_max/dil_min - pps_min/dil_max)
         score  = reward - P
         elapsed = time.time() - t0
         history.append(dict(step=it, pps=round(pps, 2), dil_px=dil, conn=n_conn,
@@ -948,21 +956,35 @@ def tune_skeleton_params(
             print(f"{it:>4} {pps:>7.2f} {dil:>6d} | {n_conn:>5d} {n_loop:>5d} "
                   f"{e_empty:>6.2f} | {P:>8.3f} {score:>8.3f} | {elapsed:>5.1f}")
 
-        if best is None or score > best['score'] + 1e-9:
-            best = dict(score=score, penalty=P, pps=pps, dil=dil, conn=n_conn, loop=n_loop,
-                        empty=e_empty, result=res, quality_report=qr)
+        # Selection key: prefer a higher score, but treat scores within
+        # `reward_improve_tol` of each other as the *same reward* (one tolerance
+        # bucket) and break that tie by the highest pps/dil ratio (finest
+        # resolution). So among the equal-reward steps the highest-ratio one is
+        # kept — not the first seen.
+        ratio        = pps / dil
+        score_bucket = round(score / reward_improve_tol)
+        cand_key     = (score_bucket, ratio)
+        if best is None or cand_key > best['key']:
+            best = dict(key=cand_key, score=score, ratio=ratio, penalty=P, pps=pps,
+                        dil=dil, conn=n_conn, loop=n_loop, empty=e_empty,
+                        result=res, quality_report=qr)
 
-        # Convergence stop: once the skeleton is clean (penalty 0), keep going only
-        # while the score keeps improving. A clean step that beats the best clean
-        # score resets the counter; 10 clean steps with no gain -> stop.
+        # Convergence stop: counting begins the first time the skeleton is clean
+        # (penalty <= target) and then runs EVERY step — it is NOT reset by later
+        # infeasible excursions (e.g. an explore step that overshoots into loops).
+        # A step whose reward bucket beats the best-so-far resets the counter;
+        # `reward_no_improve_max` steps with no reward gain -> stop.
         if P <= target_penalty:
-            if best_feasible is None or score > best_feasible + 1e-9:
-                best_feasible = score
-                no_improve = 0
+            feasible_reached = True
+        if feasible_reached:
+            if best_bucket is None or score_bucket > best_bucket:
+                best_bucket = score_bucket
+                no_improve  = 0
             else:
                 no_improve += 1
-                if no_improve >= 10:
-                    print(f"[tune] no score gain for {no_improve} clean steps — stopping (converged)")
+                if no_improve >= reward_no_improve_max:
+                    print(f"[tune] reward not improved for {no_improve} steps since "
+                          f"reaching a clean skeleton — stopping (converged)")
                     break
 
         # Cycle / pinned detector: the update is deterministic, so a repeated
@@ -976,10 +998,14 @@ def tune_skeleton_params(
 
         # ── Parameter update ──────────────────────────────────────────────────
         if P <= target_penalty:
-            # Feasible: keep pushing resolution up to raise the score,
-            # scaling dilate_px with pps so the physical shape (and feasibility) holds.
+            # Feasible: push resolution up by raising pps while HOLDING dil fixed,
+            # so the ratio pps/dil (the reward) actually increases. This thins the
+            # physical dilation (dil*pixel_size shrinks as pps grows); if that
+            # reintroduces loops/empties the next step's infeasible branch will
+            # thicken dil back, and the post-feasibility no-improve counter bounds
+            # the search either way.
             pps_new = pps + s_pps_explore
-            dil_new = int(round(dil * pps_new / pps))
+            dil_new = dil
         else:
             # Infeasible: error-proportional correction (errors normalised to [0,1]).
             e_conn_n  = min(1.0, n_conn  / max(1, n_regions))
@@ -1006,13 +1032,13 @@ def tune_skeleton_params(
     if plot:
         # penalty trajectory
         fig, ax = plt.subplots(figsize=(9, 3.2))
-        ax.plot(hist_df['step'], hist_df['penalty'], '-o', color='steelblue', label='penalty')
-        ax.plot(hist_df['step'], hist_df['score'],   '-D', color='crimson',   label='score')
+        ax.plot(hist_df['step'], hist_df['penalty'], '-', color='steelblue', label='penalty')
+        ax.plot(hist_df['step'], hist_df['score'],   '-', color='crimson',   label='score')
         ax.axhline(0, color='grey', lw=0.8, ls=':')   # score > 0 = clean skeleton
         ax.set_xlabel('step'); ax.set_ylabel('penalty / score'); ax.set_title('tuning trajectory')
         ax2 = ax.twinx()
-        ax2.plot(hist_df['step'], hist_df['pps'],    '--s', color='darkorange', label='pps')
-        ax2.plot(hist_df['step'], hist_df['dil_px'], '--^', color='seagreen',   label='dilate_px')
+        ax2.plot(hist_df['step'], hist_df['pps'],    '--', color='darkorange', label='pps')
+        ax2.plot(hist_df['step'], hist_df['dil_px'], '--', color='seagreen',   label='dilate_px')
         ax2.set_ylabel('pps / dilate_px')
         ax.legend(loc='upper right'); ax2.legend(loc='center right')
         plt.tight_layout(); plt.show()

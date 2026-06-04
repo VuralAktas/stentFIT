@@ -4,6 +4,139 @@ import trimesh
 from scipy.spatial import cKDTree
 
 
+def downsample_skeleton(skel: pd.DataFrame, factor: int = 1) -> pd.DataFrame:
+    """
+    Topology-preserving downsampling of a stent skeleton graph.
+
+    Every junction and endpoint (degree != 2) is always kept so the wireframe
+    topology is preserved. The straight degree-2 chains *between* them are
+    thinned by ``factor`` (every ``factor``-th node along the chain is kept),
+    so strut curvature is retained rather than collapsed to a single edge.
+
+    The returned DataFrame keeps the same schema and re-numbers
+    ``skeleton_point_id`` to a contiguous ``0..M-1`` matching row order, with
+    ``neighbor_ids`` remapped accordingly — this is required by the downstream
+    mapping / beam-mesh code, which indexes the mapped node array positionally.
+
+    Parameters
+    ----------
+    skel   : skeleton DataFrame with columns
+             skeleton_point_id, x, y, z, r, theta, node_type, degree, neighbor_ids
+    factor : int  keep every ``factor``-th node along each chain (1 = no change)
+
+    Returns
+    -------
+    pd.DataFrame  reduced skeleton with the same columns
+    """
+    if factor is None or factor <= 1:
+        return skel.reset_index(drop=True)
+
+    # ── Build adjacency (filtered to existing ids) ────────────────────────
+    adj = {int(r.skeleton_point_id): list(r.neighbor_ids)
+           for r in skel.itertuples()}
+    ids = set(adj)
+    adj = {k: [n for n in v if n in ids] for k, v in adj.items()}
+    deg = {k: len(v) for k, v in adj.items()}
+    essential = {k for k, d in deg.items() if d != 2}
+
+    def _walk_chain(start, second):
+        """Ordered node ids from an essential node along a degree-2 chain
+        until the next essential node (or back to start for a pure loop)."""
+        path = [start, second]
+        prev, cur = start, second
+        while cur not in essential:
+            nxt = next((n for n in adj[cur] if n != prev), None)
+            if nxt is None:
+                break
+            path.append(nxt)
+            prev, cur = cur, nxt
+            if cur == start:           # closed loop
+                break
+        return path
+
+    kept_edges = set()                  # frozenset({a, b}) in ORIGINAL ids
+    kept_nodes = set(essential)         # isolated nodes (deg 0) included here
+    processed = set()                   # every node touched by a walked chain
+    visited_dir = set()                 # directed (a, b) first-steps already walked
+
+    # ── Chains anchored at essential nodes ────────────────────────────────
+    for e in essential:
+        for nb in adj[e]:
+            if (e, nb) in visited_dir:
+                continue
+            path = _walk_chain(e, nb)
+            visited_dir.add((e, nb))
+            visited_dir.add((path[-1], path[-2]))   # reverse end of this chain
+            processed.update(path)
+            # Thin the interior by `factor` but never to zero: keeping >= 1
+            # interior node retains strut curvature AND prevents parallel
+            # struts (A-i-B and A-j-B) from collapsing onto the same A-B edge.
+            interior = path[1:-1]
+            kept_interior = interior[::factor]          # non-empty if interior is
+            if path[0] == path[-1] and len(kept_interior) < 2:
+                # self-loop A..A needs >= 2 distinct interior nodes, otherwise
+                # its two edges dedup into a single dangling spur
+                kept_interior = interior[:2]
+            keep = [path[0]] + kept_interior + [path[-1]]
+            kept_nodes.update(keep)
+            for a, b in zip(keep[:-1], keep[1:]):
+                if a != b:
+                    kept_edges.add(frozenset((a, b)))
+
+    # ── Pure degree-2 loops with no essential anchor (e.g. closed rings) ──
+    # Only nodes never touched above; decimated-away chain interiors are
+    # already in `processed` and must NOT be re-created as spurious rings.
+    unvisited = {k for k in adj if k not in processed and deg[k] == 2}
+    while unvisited:
+        start = unvisited.pop()
+        path = _walk_chain(start, adj[start][0])    # returns to start
+        if path[-1] == start:
+            path = path[:-1]
+        processed.update(path)
+        unvisited -= set(path)
+        keep = path[::factor] or [start]
+        kept_nodes.update(keep)
+        ring = keep + [keep[0]]                     # close the loop
+        for a, b in zip(ring[:-1], ring[1:]):
+            if a != b:
+                kept_edges.add(frozenset((a, b)))
+
+    # ── Re-number to contiguous 0..M-1 in original-id order ───────────────
+    keep_sorted = sorted(kept_nodes)
+    old_to_new = {old: new for new, old in enumerate(keep_sorted)}
+
+    new_adj = {new: [] for new in range(len(keep_sorted))}
+    for e in kept_edges:
+        a, b = tuple(e)
+        na, nb = old_to_new[a], old_to_new[b]
+        new_adj[na].append(nb)
+        new_adj[nb].append(na)
+
+    src = skel.set_index("skeleton_point_id")
+    rows = []
+    for old in keep_sorted:
+        new = old_to_new[old]
+        nbrs = sorted(new_adj[new])
+        d = len(nbrs)
+        ntype = ("isolated" if d == 0 else "endpoint" if d == 1
+                 else "line" if d == 2 else "junction")
+        s = src.loc[old]
+        rows.append({
+            "skeleton_point_id": new,
+            "x": s["x"], "y": s["y"], "z": s["z"],
+            "r": s["r"], "theta": s["theta"],
+            "node_type": ntype,
+            "degree": d,
+            "neighbor_ids": nbrs,
+        })
+
+    out = pd.DataFrame(rows).sort_values("skeleton_point_id").reset_index(drop=True)
+    print(f"Downsampled skeleton (factor={factor}): "
+          f"{len(skel):,} → {len(out):,} nodes, "
+          f"{len(kept_edges):,} edges  (kept {len(essential):,} junctions/endpoints)")
+    return out
+
+
 def _compute_rmf(cl: np.ndarray):
     """Rotation-minimising frame (Bishop frame) along a polyline centreline."""
     n   = len(cl)
