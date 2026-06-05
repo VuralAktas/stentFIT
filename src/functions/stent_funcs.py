@@ -819,7 +819,7 @@ def tune_skeleton_params(
     w_conn: float = 1.0,
     w_loop: float = 1.0,
     w_empty: float = 1.0,
-    w_pps_dil_ratio_reward: float = 2,   # score reward: prefer higher pps (<1 so it never beats a real error)
+    w_pps_dil_ratio_reward: float = 4,   # score reward: prefer higher pps (<1 so it never beats a real error)
     reward_no_improve_max: int = 3,   # steps (after the first clean step) with no reward gain
     reward_improve_tol: float = 1e-2,     # min score gain to reset the no-improve counter (avoid noise)
     target_penalty: float = 0.0,  # penalty <= this counts as "feasible"
@@ -1201,6 +1201,268 @@ def analyze_skeleton_connectivity(
     df_result['neighbor_ids']      = neighbors
 
     return df_result
+
+
+def reconnect_skeleton_endpoints(
+    df_connectivity: pd.DataFrame,
+    pixel_size: float,
+    max_gap_factor: float = 12.0,
+    min_cos: float = 0.5,
+    exclude_hops: int = 3,
+    verbose: bool = True,
+) -> pd.DataFrame:
+    """
+    Bridge spurious breaks in the skeleton graph.
+
+    Rasterise → thin can split a continuous strut into two pieces, each ending in
+    a degree-1 node. Left untouched these artificial endpoints act as free strut
+    ends in the contact simulation and concentrate large spurious bending /
+    deformation. This step walks every endpoint, looks *forward* along the
+    strut's own tangent, and reconnects it to the nearest skeleton point lying
+    inside a forward cone within `max_gap`.
+
+    Genuine tips (e.g. open crowns at a free stent end) have no continuation in
+    their forward direction, so no candidate is found and they stay endpoints —
+    the geometry decides, no explicit/per-design tip detection is needed.
+
+    Parameters
+    ----------
+    max_gap_factor : multiplied by `pixel_size` to set the largest bridgeable gap.
+    min_cos        : forward-cone half-angle as a cosine (0.5 => 60°). Stops the
+                     search from jumping sideways onto a parallel strut.
+    exclude_hops   : candidates within this many graph hops of the endpoint are
+                     skipped, so an endpoint never reconnects to its own stub.
+
+    Returns a copy of `df_connectivity` with `neighbor_ids`, `degree` and
+    `node_type` recomputed after the bridges are inserted.
+    """
+    df  = df_connectivity.reset_index(drop=True).copy()
+    pts = df[['x', 'y', 'z']].values
+    N   = len(pts)
+    max_gap = max_gap_factor * pixel_size
+
+    # Symmetric adjacency from neighbor_ids
+    adj = [set() for _ in range(N)]
+    for i, nbrs in enumerate(df['neighbor_ids']):
+        if isinstance(nbrs, str):
+            nbrs = ast.literal_eval(nbrs)
+        for j in nbrs:
+            j = int(j)
+            adj[i].add(j); adj[j].add(i)
+
+    deg = np.array([len(a) for a in adj])
+
+    def _within_hops(src, hops):
+        seen, frontier = {src}, {src}
+        for _ in range(hops):
+            nxt = set()
+            for u in frontier:
+                nxt |= adj[u]
+            nxt -= seen
+            seen |= nxt
+            frontier = nxt
+            if not frontier:
+                break
+        return seen
+
+    tree      = cKDTree(pts)
+    endpoints = np.where(deg == 1)[0].tolist()
+
+    new_edges = []
+    resolved  = set()
+
+    for e in endpoints:
+        if e in resolved or deg[e] != 1:
+            continue
+        nb      = next(iter(adj[e]))
+        tangent = pts[e] - pts[nb]                 # points outward, away from stub
+        tlen    = np.linalg.norm(tangent)
+        if tlen < 1e-12:
+            continue
+        tangent /= tlen
+
+        near = _within_hops(e, exclude_hops)
+        cand = tree.query_ball_point(pts[e], r=max_gap)
+
+        best, best_score = None, -np.inf
+        for c in cand:
+            if c == e or c in near or c in resolved:
+                continue
+            d    = pts[c] - pts[e]
+            dist = np.linalg.norm(d)
+            if dist < 1e-9:
+                continue
+            cos = float(np.dot(tangent, d / dist))
+            if cos < min_cos:                      # outside the forward cone
+                continue
+            score = cos / dist                     # aligned & near wins
+            if score > best_score:
+                best, best_score = c, score
+
+        if best is not None:
+            new_edges.append((e, best))
+            adj[e].add(best); adj[best].add(e)
+            deg[e] += 1; deg[best] += 1
+            resolved.add(e)
+            if deg[best] == 2 and best in set(endpoints):
+                resolved.add(best)                 # bridged endpoint↔endpoint pair
+
+    # Recompute connectivity fields from the final adjacency
+    neighbors = [sorted(adj[i]) for i in range(N)]
+    degrees   = np.array([len(a) for a in neighbors])
+    node_type = np.select(
+        [degrees == 0, degrees == 1, degrees == 2],
+        ['isolated',   'endpoint',   'line'],
+        default='junction',
+    )
+
+    df['neighbor_ids'] = neighbors
+    df['degree']       = degrees
+    df['node_type']    = node_type
+
+    if verbose:
+        print(f"[reconnect] endpoints {len(endpoints)} → {int((degrees == 1).sum())}  "
+              f"({len(new_edges)} bridges added, max_gap = {max_gap:.4f} mm, "
+              f"cone = {np.degrees(np.arccos(min_cos)):.0f}°)")
+
+    return df
+
+
+def prune_skeleton_spurs(
+    df_connectivity: pd.DataFrame,
+    pixel_size: float,
+    tip_frac: float = 0.05,
+    max_spur_len: float = None,
+    max_iter: int = 10,
+    verbose: bool = True,
+) -> pd.DataFrame:
+    """
+    Remove spurs: short dead-end branches that are not genuine stent tips.
+
+    After reconnect_skeleton_endpoints, any remaining degree-1 node is either a
+    real tip (open crown at an axial end of the stent) or a spur — a small twig
+    left by the rasterise→thin step. Spurs act as free strut ends in the contact
+    simulation and concentrate spurious bending, so they are pruned here.
+
+    A degree-1 node counts as a *tip* (and is kept) when it lies within
+    `tip_frac` of the axial (z) span from either end. Every other dead-end is
+    walked back along its degree-2 chain to the first junction and the whole
+    twig is deleted. The walk repeats (`max_iter`) so chained spurs collapse.
+
+    Parameters
+    ----------
+    tip_frac     : axial tip band as a fraction of (z_max - z_min). Endpoints
+                   inside the band at either end are treated as real tips.
+    max_spur_len : optional safety cap (mm). A non-tip dead-end longer than this
+                   is left in place (it is likely a real strut whose far end
+                   failed to bridge — raise the reconnect gap instead of pruning).
+                   None = prune every non-tip dead-end regardless of length.
+
+    Returns a re-indexed copy of `df_connectivity` (contiguous
+    skeleton_point_id, remapped neighbor_ids, recomputed degree / node_type).
+    """
+    df  = df_connectivity.reset_index(drop=True).copy()
+    pts = df[['x', 'y', 'z']].values
+    N   = len(pts)
+    z   = pts[:, 2]
+    z_min, z_max = z.min(), z.max()
+    tip_band = tip_frac * (z_max - z_min)
+
+    def _is_tip(i):
+        return (z[i] - z_min) <= tip_band or (z_max - z[i]) <= tip_band
+
+    adj = [set() for _ in range(N)]
+    for i, nbrs in enumerate(df['neighbor_ids']):
+        if isinstance(nbrs, str):
+            nbrs = ast.literal_eval(nbrs)
+        for j in nbrs:
+            j = int(j)
+            adj[i].add(j); adj[j].add(i)
+
+    alive = np.ones(N, dtype=bool)
+
+    def _deg(i):
+        return sum(1 for n in adj[i] if alive[n])
+
+    n_branches   = 0
+    n_removed    = 0
+    skipped_long = 0
+
+    for _ in range(max_iter):
+        endpoints = [i for i in range(N) if alive[i] and _deg(i) == 1]
+        to_remove = set()
+
+        for e in endpoints:
+            if not alive[e] or _deg(e) != 1 or _is_tip(e):
+                continue
+
+            # Walk the dead-end chain to the first junction / other endpoint
+            chain   = [e]
+            visited = {e}
+            prev    = e
+            cur      = next(n for n in adj[e] if alive[n])
+            length   = float(np.linalg.norm(pts[cur] - pts[prev]))
+            terminal = None
+            while True:
+                d_cur = _deg(cur)
+                if d_cur >= 3:
+                    terminal = ('junction', cur); break           # stop before junction
+                if d_cur == 1:
+                    chain.append(cur); terminal = ('endpoint', cur); break
+                nxts = [n for n in adj[cur] if alive[n] and n != prev]
+                if not nxts or nxts[0] in visited:
+                    chain.append(cur); terminal = ('loop', cur); break
+                chain.append(cur); visited.add(cur)
+                nxt = nxts[0]
+                length += float(np.linalg.norm(pts[nxt] - pts[cur]))
+                prev, cur = cur, nxt
+
+            # Keep floating segments that terminate on a real tip
+            if terminal[0] == 'endpoint' and _is_tip(terminal[1]):
+                continue
+            if max_spur_len is not None and length > max_spur_len:
+                skipped_long += 1
+                continue
+
+            to_remove.update(chain)
+            n_branches += 1
+
+        if not to_remove:
+            break
+        for n in to_remove:
+            alive[n] = False
+        n_removed += len(to_remove)
+
+    # Re-index surviving nodes and remap neighbours
+    keep       = np.where(alive)[0]
+    old_to_new = {int(o): i for i, o in enumerate(keep)}
+    new        = df.iloc[keep].reset_index(drop=True).copy()
+
+    new_neighbors = [sorted(old_to_new[n] for n in adj[o] if alive[n]) for o in keep]
+    degrees       = np.array([len(n) for n in new_neighbors])
+    node_type     = np.select(
+        [degrees == 0, degrees == 1, degrees == 2],
+        ['isolated',   'endpoint',   'line'],
+        default='junction',
+    )
+
+    new['skeleton_point_id'] = np.arange(len(new))
+    new['neighbor_ids']      = new_neighbors
+    new['degree']            = degrees
+    new['node_type']         = node_type
+
+    if verbose:
+        nz       = new['z'].values
+        rem_nontip = int(np.sum((degrees == 1) &
+                                ~(((nz - z_min) <= tip_band) | ((z_max - nz) <= tip_band))))
+        msg = (f"[prune_spurs] removed {n_removed} nodes in {n_branches} spur branch(es); "
+               f"remaining non-tip endpoints: {rem_nontip}")
+        if skipped_long:
+            msg += f"; {skipped_long} dead-end(s) kept (> max_spur_len)"
+        print(msg)
+
+    return new
+
 
 def _write_skeleton_stp(skeleton_df: pd.DataFrame, output_path: str) -> None:
     """Write skeleton wireframe as an ISO 10303-21 (STEP) file."""

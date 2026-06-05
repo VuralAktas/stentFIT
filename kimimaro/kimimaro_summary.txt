@@ -1,8 +1,0 @@
-Kimimaro (TEASAR) skeleton of stent5.stl
-voxel pitch            : 0.03 mm
-skeleton nodes         : 9690
-skeleton edges         : 9689
-axial span             : 15.240 mm
-strut radius median    : 0.0671 mm
-endpoints / junctions  : 242 / 240
-segment len min/med/max: 0.0300 / 0.0424 / 0.0520 mm
