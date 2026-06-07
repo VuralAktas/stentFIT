@@ -826,6 +826,7 @@ def tune_skeleton_params(
     max_repeats: int = 4,        # stop once the SAME (pps, dil) state has been visited this many times
     pad_fraction: float = 0.20,
     time_limit: float = 100.0,
+    predictive_stop: bool = False,
     max_iters: int = int(1e3),
     plot: bool = True,
     verbose: bool = True,
@@ -914,15 +915,13 @@ def tune_skeleton_params(
 
     for it in range(max_iters):
         elapsed = time.time() - t0
-        # Hard stop: already over budget.
+        # Hard stop: always active.
         if elapsed > time_limit:
             print(f"[tune] time limit ({time_limit:.0f}s) reached — stopping")
             break
-        # Predictive stop: each step is finer (higher pps) and so costlier than
-        # the last, and a step can't be interrupted once started. Project the
-        # next step from the last step scaled by the observed step-to-step
-        # growth, and stop before launching one that won't finish in time.
-        if durs:
+        # Predictive stop: project the next step's cost and stop before launching
+        # one that won't finish in time. Disable with predictive_stop=False.
+        if predictive_stop and durs:
             growth = durs[-1] / durs[-2] if len(durs) >= 2 and durs[-2] > 0 else 1.0
             proj   = durs[-1] * max(1.0, growth)
             if elapsed + proj > time_limit:
