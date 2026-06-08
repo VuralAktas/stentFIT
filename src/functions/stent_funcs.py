@@ -16,6 +16,8 @@ from scipy.spatial import cKDTree
 from scipy.ndimage import uniform_filter1d
 from skimage.morphology import skeletonize, dilation, closing, disk
 
+REPO_ROOT = pathlib.Path(__file__).parent.parent.parent.absolute()
+
 
 def compute_pre_stent_size_ratio(mesh: trimesh.Trimesh) -> dict:
     pts      = mesh.vertices
@@ -46,12 +48,15 @@ def preprocess_stent(
     slice_cutoff: int,
     thickness_calc_plot: bool,
     remove_supports: bool,
+    random_seed: int = None,
 ) -> dict:
 
     # ------------------------------------------------------------------
     # 1. Sample surface
     # ------------------------------------------------------------------
-    pts, face_idx = trimesh.sample.sample_surface(mesh, n_samples)
+    # `random_seed=None` draws a fresh random sample each call (use to audit
+    # sampling stability); an int pins the sample for reproducible skeletons.
+    pts, face_idx = trimesh.sample.sample_surface(mesh, n_samples, seed=random_seed)
 
     # ------------------------------------------------------------------
     # 2. PCA — centroid + main axis
@@ -813,16 +818,16 @@ def tune_skeleton_params(
     s_pps_conn: float = 25.0,     # pps push from bad connections
     s_pps_empty: float = 20.0,    # pps push from empty regions (size-weighted)
     s_pps_loop: float = 15.0,     # pps pull-down for loops when dilate_px is capped
-    s_pps_explore: float = 5.0,   # when feasible, step pps up by this to chase a higher score (resolution)
+    s_pps_explore: float = 5.0,   # when defect-free, step pps up by this to shrink the quality residual
     s_dil_loop: float = 20.0,     # dilate_px push from loops (thicken to fill holes)
     s_dil_conn: float = 8.0,      # dilate_px pull-down from connections (thin)
-    w_conn: float = 1.0,
+    w_conn: float = 5.0,
     w_loop: float = 1.0,
-    w_empty: float = 1.0,
-    w_pps_dil_ratio_reward: float = 4,   # score reward: prefer higher pps (<1 so it never beats a real error)
-    reward_no_improve_max: int = 3,   # steps (after the first clean step) with no reward gain
-    reward_improve_tol: float = 1e-2,     # min score gain to reset the no-improve counter (avoid noise)
-    target_penalty: float = 0.0,  # penalty <= this counts as "feasible"
+    w_empty: float = 3.0,
+    q_eps: float = 1e-3,          # floor on the quality residual so total_error stays > 0
+    res_no_improve_max: int = 3,  # steps (after the first clean step) with no total_error improvement
+    improve_tol: float = 1e-2,    # defect-bucket width & min total_error gain to reset the no-improve counter
+    target_penalty: float = 0.0,  # defect_error <= this counts as "feasible" (clean)
     max_repeats: int = 4,        # stop once the SAME (pps, dil) state has been visited this many times
     pad_fraction: float = 0.20,
     time_limit: float = 100.0,
@@ -854,17 +859,26 @@ def tune_skeleton_params(
     strut spacing always bridges neighbouring struts, so the effective ceiling is
     min(dil_max, floor(pps)).
 
-    Penalty = w_conn*conn + w_loop*loop + w_empty*empty. The step kept as `best`
-    maximises a *score* = reward - penalty, where the reward is a small bonus for
-    higher `pixels_per_strut` (so bigger score = better):
+    SELECTION minimises a single *total error* toward an (unreachable) ideal of 0:
 
-        reward = w_pps_dil_ratio_reward * (pps/dil - pps_min/dil_max) / (pps_max/dil_min - pps_min/dil_max)   in [0, w_pps_dil_ratio_reward]
+        defect_error  = w_conn*conn + w_loop*loop + w_empty*empty    # -> 0 ideal
+        quality_error = clip(1 - (pps/dil - pps_min/dil_max)
+                                / (pps_max/dil_min - pps_min/dil_max), q_eps, 1)
+        total_error   = defect_error + quality_error
 
-    Reaching penalty <= `target_penalty` does NOT stop the search — once feasible
+    `quality_error` is a strictly-positive residual (a finer skeleton makes it
+    smaller but it never reaches 0), so `total_error` can only be driven toward 0.
+    The step kept as `best` is the one with the lowest `total_error` AMONG the
+    candidates whose `defect_error` is 0 (a clean skeleton always beats a defective
+    one — correctness is a strict gate, resolution only breaks ties between clean
+    skeletons). This is implemented as a lexicographic argmin over
+    (defect_bucket, total_error) with defect_bucket = round(defect_error/improve_tol).
+
+    Reaching defect_error <= `target_penalty` does NOT stop the search — once clean
     it keeps pushing resolution up (pps += s_pps_explore while dil is held fixed,
-    so the ratio pps/dil and hence the reward genuinely rises). Holding dil thins
-    the physical dilation; if loops/empties reappear the infeasible branch thickens
-    dil back, and the post-feasibility no-improve counter bounds the search.
+    so pps/dil rises and the quality residual shrinks). Holding dil thins the
+    physical dilation; if loops/empties reappear the infeasible branch thickens dil
+    back, and the post-feasibility no-improve counter bounds the search.
 
     STOPPING is purely cycle-based: the update is deterministic, so if a (pps, dil)
     pair ever recurs the whole trajectory from it repeats. The tuner counts how
@@ -872,10 +886,9 @@ def tune_skeleton_params(
     `max_repeats` times (a true limit cycle, or pinned at a bound). Once the
     skeleton is clean for the first time, a no-improve counter starts and runs on
     EVERY subsequent step (it is not reset by later infeasible excursions); the
-    tuner stops after `reward_no_improve_max` steps with no gain in the reward
-    bucket (converged). It also stops after `time_limit` s / `max_iters`. Returns the
-    highest-score step; ties within `reward_improve_tol` (the same-reward band
-    used for the no-improve count) are broken by the highest pps/dil ratio.
+    tuner stops after `res_no_improve_max` steps in which the incumbent (lowest
+    total_error) did not improve (converged). It also stops after `time_limit` s /
+    `max_iters`.
     """
     r_mid = stent_features['r_mid']
     circ  = 2 * np.pi * r_mid
@@ -902,16 +915,18 @@ def tune_skeleton_params(
     dil = int(np.clip(round(dil0), dil_min, min(dil_max, int(pps))))
     best, history = None, []
     seen = Counter()              # (round(pps), dil) -> times visited (cycle / pinned detector)
-    best_bucket = None            # best reward bucket since feasibility was first reached
-    feasible_reached = False      # latches True at the first penalty<=target step
-    no_improve = 0                # steps (post-feasibility) since the reward bucket improved
+    feasible_reached = False      # latches True at the first defect_error<=target step
+    no_improve = 0                # steps (post-feasibility) since the incumbent improved
     t0 = time.time()
     durs = []                     # per-iteration wall times -> predict the next step's cost
 
+    # Constant span used to normalise pps/dil into the quality residual [0, 1].
+    ratio_span = (pps_max / dil_min) - (pps_min / dil_max)
+
     if verbose:
         print(f"{'step':>4} {'pps':>7} {'dil_px':>6} | {'conn':>5} {'loop':>5} {'empty':>6} "
-              f"| {'penalty':>8} {'score':>8} | {'t(s)':>5}")
-        print("-" * 75)
+              f"| {'defect':>8} {'qual':>6} {'total':>8} | {'t(s)':>5}")
+        print("-" * 82)
 
     for it in range(max_iters):
         elapsed = time.time() - t0
@@ -941,48 +956,53 @@ def tune_skeleton_params(
         )
         durs.append(time.time() - _it_t0)
         n_conn, n_loop, e_empty = _errors(qr)
-        P = w_conn * n_conn + w_loop * n_loop + w_empty * e_empty
-        # Reward higher resolution, if pps/dil ratio is more, it shows higher resolution skeleton
-        # A clean skeleton (P=0) scores +reward (small, in [0, w_pps_dil_ratio_reward]);
-        # any error makes P large and drags the score negative.
-        reward = w_pps_dil_ratio_reward * (pps/dil - pps_min/dil_max) / (pps_max/dil_min - pps_min/dil_max)
-        score  = reward - P
+        # Single total error, minimised toward an (unreachable) ideal of 0:
+        #   defect_error  -> 0 when no connections / loops / empty regions remain
+        #   quality_error -> strictly-positive residual; a finer skeleton (higher
+        #                    pps/dil) shrinks it but it never reaches 0
+        defect_error  = w_conn * n_conn + w_loop * n_loop + w_empty * e_empty
+        quality_error = float(np.clip(1.0 - (pps/dil - pps_min/dil_max) / ratio_span, q_eps, 1.0))
+        total_error   = defect_error + quality_error
         elapsed = time.time() - t0
         history.append(dict(step=it, pps=round(pps, 2), dil_px=dil, conn=n_conn,
                             loop=n_loop, empty=round(e_empty, 2),
-                            penalty=round(P, 3), score=round(score, 3), t=round(elapsed, 1)))
+                            defect_error=round(defect_error, 3),
+                            quality_error=round(quality_error, 4),
+                            total_error=round(total_error, 3), t=round(elapsed, 1)))
         if verbose:
             print(f"{it:>4} {pps:>7.2f} {dil:>6d} | {n_conn:>5d} {n_loop:>5d} "
-                  f"{e_empty:>6.2f} | {P:>8.3f} {score:>8.3f} | {elapsed:>5.1f}")
+                  f"{e_empty:>6.2f} | {defect_error:>8.3f} {quality_error:>6.3f} "
+                  f"{total_error:>8.3f} | {elapsed:>5.1f}")
 
-        # Selection key: prefer a higher score, but treat scores within
-        # `reward_improve_tol` of each other as the *same reward* (one tolerance
-        # bucket) and break that tie by the highest pps/dil ratio (finest
-        # resolution). So among the equal-reward steps the highest-ratio one is
-        # kept — not the first seen.
-        ratio        = pps / dil
-        score_bucket = round(score / reward_improve_tol)
-        cand_key     = (score_bucket, ratio)
-        if best is None or cand_key > best['key']:
-            best = dict(key=cand_key, score=score, ratio=ratio, penalty=P, pps=pps,
-                        dil=dil, conn=n_conn, loop=n_loop, empty=e_empty,
+        # Selection: lexicographic argmin over (defect_bucket, total_error). Every
+        # defective candidate has defect_bucket > 0 and every clean one has 0, so a
+        # clean skeleton is always preferred; ties between clean skeletons are then
+        # broken by the lowest total_error (= smallest quality residual = finest
+        # resolution). defect_bucket quantises defect_error by `improve_tol` so a
+        # tiny fractional empty-region error does not flip the gate on noise.
+        defect_bucket = round(defect_error / improve_tol)
+        cand_key      = (defect_bucket, total_error)
+        improved      = best is None or cand_key < best['key']
+        if improved:
+            best = dict(key=cand_key, total_error=total_error, defect_error=defect_error,
+                        quality_error=quality_error, pps=pps, dil=dil,
+                        conn=n_conn, loop=n_loop, empty=e_empty,
                         result=res, quality_report=qr)
 
         # Convergence stop: counting begins the first time the skeleton is clean
-        # (penalty <= target) and then runs EVERY step — it is NOT reset by later
-        # infeasible excursions (e.g. an explore step that overshoots into loops).
-        # A step whose reward bucket beats the best-so-far resets the counter;
-        # `reward_no_improve_max` steps with no reward gain -> stop.
-        if P <= target_penalty:
+        # (defect_error <= target) and then runs EVERY step — it is NOT reset by
+        # later infeasible excursions (e.g. an explore step that overshoots into
+        # loops). A step that improves the incumbent (new lowest total_error) resets
+        # the counter; `res_no_improve_max` steps with no improvement -> stop.
+        if defect_error <= target_penalty:
             feasible_reached = True
         if feasible_reached:
-            if best_bucket is None or score_bucket > best_bucket:
-                best_bucket = score_bucket
-                no_improve  = 0
+            if improved:
+                no_improve = 0
             else:
                 no_improve += 1
-                if no_improve >= reward_no_improve_max:
-                    print(f"[tune] reward not improved for {no_improve} steps since "
+                if no_improve >= res_no_improve_max:
+                    print(f"[tune] total_error not improved for {no_improve} steps since "
                           f"reaching a clean skeleton — stopping (converged)")
                     break
 
@@ -996,9 +1016,9 @@ def tune_skeleton_params(
             break
 
         # ── Parameter update ──────────────────────────────────────────────────
-        if P <= target_penalty:
+        if defect_error <= target_penalty:
             # Feasible: push resolution up by raising pps while HOLDING dil fixed,
-            # so the ratio pps/dil (the reward) actually increases. This thins the
+            # so the ratio pps/dil rises and the quality residual shrinks. This thins the
             # physical dilation (dil*pixel_size shrinks as pps grows); if that
             # reintroduces loops/empties the next step's infeasible branch will
             # thicken dil back, and the post-feasibility no-improve counter bounds
@@ -1023,18 +1043,22 @@ def tune_skeleton_params(
         dil = int(np.clip(dil_new, dil_min, min(dil_max, int(pps))))
 
     hist_df = pd.DataFrame(history)
-    print("\n[tune] BEST  pps={:.2f}  dilate_px={}  penalty={:.3f}  score={:.3f}  "
-          "(conn={}, loop={}, empty={:.2f})".format(
-              best['pps'], best['dil'], best['penalty'], best['score'],
+    print("\n[tune] BEST  pps={:.2f}  dilate_px={}  total_error={:.3f}  "
+          "(defect={:.3f}, quality={:.4f}; conn={}, loop={}, empty={:.2f})".format(
+              best['pps'], best['dil'], best['total_error'],
+              best['defect_error'], best['quality_error'],
               int(best['conn']), int(best['loop']), best['empty']))
 
     if plot:
-        # penalty trajectory
+        # total-error trajectory: defect_error -> 0, leaving the quality residual
         fig, ax = plt.subplots(figsize=(9, 3.2))
-        ax.plot(hist_df['step'], hist_df['penalty'], '-', color='steelblue', label='penalty')
-        ax.plot(hist_df['step'], hist_df['score'],   '-', color='crimson',   label='score')
-        ax.axhline(0, color='grey', lw=0.8, ls=':')   # score > 0 = clean skeleton
-        ax.set_xlabel('step'); ax.set_ylabel('penalty / score'); ax.set_title('tuning trajectory')
+        ax.plot(hist_df['step'], hist_df['total_error'],  '-', color='crimson',
+                label='total_error', linewidth=2)
+        ax.plot(hist_df['step'], hist_df['defect_error'], '-', color='steelblue',
+                label='defect_error')
+        ax.axhline(0, color='grey', lw=0.8, ls=':')   # ideal (unreachable) total_error = 0
+        ax.set_ylim(bottom=0)
+        ax.set_xlabel('step'); ax.set_ylabel('error'); ax.set_title('tuning trajectory (minimise total_error)')
         ax2 = ax.twinx()
         ax2.plot(hist_df['step'], hist_df['pps'],    '--', color='darkorange', label='pps')
         ax2.plot(hist_df['step'], hist_df['dil_px'], '--', color='seagreen',   label='dilate_px')
@@ -1043,12 +1067,14 @@ def tune_skeleton_params(
         plt.tight_layout(); plt.show()
 
     return {
-        'best_pps'       : best['pps'],
-        'best_dilate_px' : best['dil'],
-        'best_penalty'   : best['penalty'],
-        'history'        : hist_df,
-        'skeleton_2d'    : best['result'],
-        'quality_report' : best['quality_report'],
+        'best_pps'          : best['pps'],
+        'best_dilate_px'    : best['dil'],
+        'best_defect_error' : best['defect_error'],
+        'best_quality_error': best['quality_error'],
+        'best_total_error'  : best['total_error'],
+        'history'           : hist_df,
+        'skeleton_2d'       : best['result'],
+        'quality_report'    : best['quality_report'],
     }
 
 
@@ -1596,7 +1622,7 @@ def load_update_stent_data(stent_name, material_name, youngs_modulus, poissons_r
     _MAT_KEYS = {"material_name", "youngs_modulus", "poissons_ratio",
                  "shear_modulus", "density", "max_elastic_strain"}
 
-    stent_dir = pathlib.Path("../../notebook_outputs") / stent_name
+    stent_dir = REPO_ROOT / "examples" / "notebook_outputs" / stent_name
     print(f"Loading stent data from: {stent_dir.resolve()}")
 
     with open(stent_dir / "stent_features.json") as f:
