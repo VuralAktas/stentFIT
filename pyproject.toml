@@ -21,6 +21,7 @@ dependencies = [
     "plotly",
     "trimesh",
     "scikit-image",
+    "scikit-learn",
     "networkx",
     "h5py",
     "joblib",

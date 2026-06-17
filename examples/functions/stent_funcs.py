@@ -9,11 +9,13 @@ import pathlib
 import json
 import time
 from collections import deque, Counter
+from sklearn.cluster import DBSCAN
 
 from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import connected_components
 from scipy.spatial import cKDTree
 from scipy.ndimage import uniform_filter1d
+from scipy.signal import find_peaks
 from skimage.morphology import skeletonize, dilation, closing, disk
 
 REPO_ROOT = pathlib.Path(__file__).parent.parent.parent.absolute()
@@ -95,19 +97,98 @@ def preprocess_stent(
     z_cyl = shifted[:, 2]
 
     if remove_supports:
-        z_min, z_max = z_cyl.min(), z_cyl.max()
-        z_cutoff     = 3.0
-        cutoff_mask  = (z_cyl >= z_min + z_cutoff) & (z_cyl <= z_max - z_cutoff)
-        n_removed    = int((~cutoff_mask).sum())
-        print(f"[3.4] End cutoff: {n_removed:,} points dropped "
-              f"({100 * n_removed / len(r):.1f}%) for z_cyl ∉ "
-              f"[{z_min + z_cutoff:.4f}, {z_max - z_cutoff:.4f}] mm")
-        if n_removed > 0:
-            pts     = pts[cutoff_mask]
-            shifted = shifted[cutoff_mask]
-            r       = r[cutoff_mask]
-            theta   = theta[cutoff_mask]
-            z_cyl   = z_cyl[cutoff_mask]
+        # Step1: Estimate the inner wall radius from the MIDDLE of the stent
+        # (central 40% of the axial span), where there are no tip supports, then
+        # remove any point whose r is smaller than that clean inner radius.
+        # A global low-percentile estimate is biased low because the support
+        # points themselves sit near the axis and pull the inner radius down.
+        z_mid_center = 0.5 * (z_cyl.min() + z_cyl.max())
+        z_span       = z_cyl.max() - z_cyl.min()
+        middle_band  = np.abs(z_cyl - z_mid_center) < 0.20 * z_span
+        r_inner_mid  = np.percentile(r[middle_band], 1)
+        radial_keep  = r >= r_inner_mid * 0.8
+
+        # Step2a: +z support — density-based clustering (DBSCAN).
+        # The detached / nearly-detached +z support is too sparse to join the
+        # dense stent wall, so it ends up as noise or a small cluster and is
+        # dropped when we keep only the largest cluster.
+        # NOTE: DBSCAN on ~1e6 points is memory/time heavy — tune eps/min_samples
+        # at a lower n_samples first, then scale back up.
+
+        strut_est = np.percentile(r, 98) - r_inner_mid
+
+        kept_idx = np.flatnonzero(radial_keep)
+        coords   = shifted[kept_idx]
+
+        db_labels  = DBSCAN(eps=strut_est * 0.1, min_samples=10).fit(coords).labels_
+        body_label = np.bincount(db_labels[db_labels >= 0]).argmax()
+        body_keep  = db_labels == body_label
+
+        keep_mask = np.zeros(len(pts), dtype=bool)
+        keep_mask[kept_idx[body_keep]] = True
+
+        pts     = pts[keep_mask]
+        shifted = shifted[keep_mask]
+        r       = r[keep_mask]
+        theta   = theta[keep_mask]
+        z_cyl   = z_cyl[keep_mask]
+
+        # Step2b: -z support — trim the solid closing band at the -z extreme.
+        # The diagnostic shows the genuine stent is an open lattice (theta
+        # coverage ~0.7-0.9, 1-6 open cells per slice), while each end closes
+        # into a SOLID ring (coverage ~1.0, zero open cells). The +z band
+        # detaches and is already removed by DBSCAN; the -z band stays fused,
+        # so we walk inward from the -z end and drop the contiguous solid
+        # slices, stopping at the first lattice slice.
+        n_az_slices = 200
+        cov_solid   = 0.9           # theta coverage above this = solid ring (knob)
+        gap_deg     = 15.0           # theta gap wider than this = an open cell
+        min_in_slice = 5
+
+        edges       = np.linspace(z_cyl.min(), z_cyl.max(), n_az_slices + 1)
+        slice_id    = np.clip(np.digitize(z_cyl, edges) - 1, 0, n_az_slices - 1)
+        theta_edges = np.linspace(-np.pi, np.pi, 73)   # 72 bins of 5 deg
+
+        def _slice_is_solid(idx):
+            if idx.size < min_in_slice:
+                return False                            # too sparse to call solid
+            t       = np.sort(theta[idx])
+            cov     = (np.histogram(t, bins=theta_edges)[0] > 0).mean()
+            gaps    = np.r_[np.diff(t), (t[0] + 2 * np.pi) - t[-1]]
+            n_cells = (gaps > np.deg2rad(gap_deg)).sum()
+            return cov >= cov_solid and n_cells == 0
+
+        band_keep = np.ones(len(z_cyl), dtype=bool)
+        for i in range(n_az_slices):                    # i = 0 is the -z end
+            idx = np.flatnonzero(slice_id == i)
+            if idx.size == 0:
+                continue
+            if _slice_is_solid(idx):
+                band_keep[idx] = False
+            else:
+                break                                   # hit the lattice -> stop
+
+        pts     = pts[band_keep]
+        shifted = shifted[band_keep]
+        r       = r[band_keep]
+        theta   = theta[band_keep]
+        z_cyl   = z_cyl[band_keep]
+
+        ## NOTE: Keep from points where z > -9.842 mm and (maybe) z < 10.2954
+        pts     = pts[z_cyl > -9.8]
+        shifted = shifted[z_cyl > -9.8]
+        r       = r[z_cyl > -9.8]
+        theta   = theta[z_cyl > -9.8]
+        z_cyl   = z_cyl[z_cyl > -9.8]
+
+        pts     = pts[z_cyl < 10.1]
+        shifted = shifted[z_cyl < 10.1]
+        r       = r[z_cyl < 10.1]
+        theta   = theta[z_cyl < 10.1]
+        z_cyl   = z_cyl[z_cyl < 10.1]
+
+        print(f"[preprocess] removed supports: {len(pts)} points remain")
+
 
     df = pd.DataFrame({
         'point_id'     : np.arange(len(pts)),
@@ -216,32 +297,187 @@ def preprocess_stent(
         'stent_centerline_direction' : pca_axis,
     }
 
-def segment_stent(
+def find_crowns(
     stent_df: pd.DataFrame,
-    n_long_slices: int,
-    segmentation_wanted: bool,
     strut_thickness: float,
-    small_logic: str = 'or',          # 'or' = small by count OR by span; 'and' = both
+    min_crown_frac: float = 0.2,      # crown < frac * (90th-pct point-count) = "tiny"
     show_plots: bool = False,
 ) -> dict:
     """
-    Longitudinal-slice connected components + valley-threshold merge of small fragments.
+    Split the stent into crown-to-crown bands and number them ("crowns").
 
-    A fragment is judged "small" using TWO measures, each with its own
-    valley threshold:
-        • point count           — number of surface points in the region
-        • bbox diagonal (mm)     — 3-D bounding-box diagonal of the region
-                                   (orientation-agnostic physical span; chosen
-                                   over a z-only span, which is biased toward
-                                   circumferential struts and capped by slicing)
-    `small_logic` decides how to combine them ('or' catches more, 'and' is
-    conservative).
+    The stent has a regular axial pattern: the number of surface points per
+    z-slice dips at every crown, where the struts converge. find_crowns finds
+    those dips, cuts the stent DIRECTLY at the dip z-positions (n_dips interior
+    cuts -> n_dips + 1 bands), labels the connected pieces within each band, and
+    stores the resulting crown number in stent_df['crown_id'].
+
+    A crown cut at a dip z-value can leave a few strut points stranded on the
+    wrong side of the cut; those points form their own under-sized connected
+    component (a spurious extra crown). After labelling, any crown whose point
+    count is far below a GENUINE crown size (< `min_crown_frac` x the 90th-pct
+    crown point-count) is absorbed — as a whole — into the normal crown holding
+    its nearest 3-D point, so only genuine crown-to-crown bands survive.
 
     Returns:
-        stent_df       — with merged, compactly renumbered 'region' column
-        region_allowed — (R+1 x R+1) bool adjacency matrix for merged regions
+        stent_df          — with the crown-number 'crown_id' column
+        crown_edges       — (n_bands + 1,) the dip-cut z-values bracketed by
+                            z_min/z_max; band k spans [crown_edges[k], crown_edges[k+1]].
+                            These exact ownership boundaries are what the per-crown
+                            skeletoniser uses for its halo window + trim.
+        n_crowns          — number of crowns
+        conn_radius_3d    — the derived connection radius
+    """
+
+    pts3d     = stent_df[['x', 'y', 'z']].values
+    z_vals    = stent_df['z_cylindrical'].values
+    n_samples = len(pts3d)
+
+    # conn_radius_3d: min of density-based and strut-based estimates
+    r_mean         = stent_df['r'].values.mean()
+    z_range        = z_vals.max() - z_vals.min()
+    surface_area   = 2 * np.pi * r_mean * z_range
+    avg_spacing    = np.sqrt(surface_area / n_samples)
+    conn_radius_3d = min(3.0 * avg_spacing, strut_thickness)
+    print(f"[crown] conn_radius_3d={conn_radius_3d:.4f}  (density-based={3*avg_spacing:.4f}, strut-based={strut_thickness:.4f})")
+
+    # ── Crown-dip detection ───────────────────────────────────────────────────
+    # points/slice dips at each crown where the struts converge; each dip is a cut.
+    n_diag  = 200
+    edges_d = np.linspace(z_vals.min(), z_vals.max(), n_diag + 1)
+    sid_d   = np.clip(np.digitize(z_vals, edges_d) - 1, 0, n_diag - 1)
+    npts_d  = np.bincount(sid_d, minlength=n_diag).astype(float)
+    npts_s  = uniform_filter1d(npts_d, size=5)
+
+    # Keep only the DEEPEST dips (true crowns): require the dip value to sit in
+    # the lower band, not just be a local notch. depth_frac=0 -> only the global
+    # minimum level; ->1 -> any dip below the median.
+    depth_frac   = 0.4
+    prom         = 0.25 * (npts_s.max() - npts_s.min())
+    depth_thresh = npts_s.min() + depth_frac * (np.median(npts_s) - npts_s.min())
+    dips, _      = find_peaks(-npts_s, prominence=prom, distance=3,
+                              height=-depth_thresh)        # dip value <= depth_thresh
+    n_dips       = len(dips)
+
+    # Cut the stent DIRECTLY at the crown dip z-positions: one band per
+    # crown-to-crown segment (n_dips interior cuts -> n_dips + 1 bands).
+    dip_z   = np.sort((0.5 * (edges_d[:-1] + edges_d[1:]))[dips])
+    z_edges = np.concatenate([[z_vals.min()], dip_z, [z_vals.max()]])
+    n_bands = len(z_edges) - 1
+    print(f"[crown] crown dips={n_dips} -> cutting at {len(dip_z)} z-values "
+          f"-> {n_bands} bands")
+
+    if show_plots:
+        zc_d = 0.5 * (edges_d[:-1] + edges_d[1:])
+        fig, axd = plt.subplots(figsize=(11, 3))
+        axd.plot(zc_d, npts_s, color='gray', label='points/slice (smoothed)')
+        axd.plot(zc_d[dips], npts_s[dips], 'rv', ms=9, label=f'{n_dips} crown dips')
+        axd.axhline(depth_thresh, color='red', ls=':', lw=1,
+                    label=f'depth cutoff ({depth_frac:.2f})')
+        axd.set_xlabel('z_cylindrical'); axd.set_ylabel('points / slice')
+        axd.set_title(f'Crown dips -> {n_bands} crown-to-crown bands')
+        axd.legend(); axd.grid(True, alpha=0.3)
+        plt.tight_layout(); plt.show()
+
+    # ── Label connected pieces within each band ───────────────────────────────
+    slc   = np.clip(np.digitize(z_vals, z_edges) - 1, 0, n_bands - 1)
+
+    tree  = cKDTree(pts3d)
+    all_p = tree.query_pairs(r=conn_radius_3d, output_type='ndarray')
+
+    same  = slc[all_p[:, 0]] == slc[all_p[:, 1]]
+    pairs = all_p[same]
+
+    adj = csr_matrix(
+        (np.ones(2 * len(pairs), np.uint8),
+         (np.concatenate([pairs[:, 0], pairs[:, 1]]),
+          np.concatenate([pairs[:, 1], pairs[:, 0]]))),
+        shape=(n_samples, n_samples))
+    _, crown_id = connected_components(adj, directed=False)
+
+    # ── Absorb spurious tiny crowns into the nearest real crown ───────────────
+    # A crown is "tiny" if its point count is far below a GENUINE crown size —
+    # these are the few strut points that fell on the wrong side of a dip cut and
+    # spun off their own component. We size against the largest crowns (90th
+    # percentile of counts), NOT the median: spurious fragments often OUTNUMBER
+    # real crowns, which drags the median down so a median-based cutoff lets them
+    # survive (the "48 crowns but only 10 visible" case). Each tiny crown is
+    # merged, in one piece, into the NORMAL crown that holds its nearest 3-D
+    # point — assigned as a whole so a fragment is never split across neighbours.
+    ids, counts = np.unique(crown_id, return_counts=True)
+    size_thresh = max(min_crown_frac * float(np.percentile(counts, 90)), 1.0)
+    small_ids   = ids[counts <  size_thresh]
+    normal_ids  = ids[counts >= size_thresh]
+
+    if len(small_ids) and len(normal_ids):
+        s_mask = np.isin(crown_id, small_ids)
+        s_idx  = np.where(s_mask)[0]
+        n_idx  = np.where(~s_mask)[0]
+
+        # nearest normal point (-> its crown) and its distance, per tiny point
+        s_dist, nn = cKDTree(pts3d[n_idx]).query(pts3d[s_idx])
+        s_ncrown   = crown_id[n_idx][nn]
+        s_crown    = crown_id[s_idx]
+
+        # one target per tiny crown = crown of its single closest normal point
+        pick   = (pd.DataFrame({'scrown': s_crown, 'dist': s_dist})
+                    .groupby('scrown')['dist'].idxmin())          # position in s_* arrays
+        target = dict(zip(pick.index.to_numpy(), s_ncrown[pick.to_numpy()]))
+
+        crown_id        = crown_id.copy()
+        crown_id[s_idx] = np.array([target[c] for c in s_crown], dtype=crown_id.dtype)
+        print(f"[crown] absorbed {len(small_ids)} tiny crowns "
+              f"(<{size_thresh:.0f} pts) into nearest normal crowns")
+    else:
+        print(f"[crown] no tiny crowns to absorb (threshold {size_thresh:.0f} pts)")
+
+    # ── Renumber 1-based, ORDERED BY AXIAL POSITION ───────────────────────────
+    # The crown with the smallest mean z becomes crown_id 1, the next 2, ... so
+    # the id reflects the physical order along the stent and can be read straight
+    # off a visualization (lowest-z crown = 1, highest = n_crowns).
+    labels  = np.unique(crown_id)
+    mean_z  = np.array([z_vals[crown_id == lbl].mean() for lbl in labels])
+    order   = labels[np.argsort(mean_z)]                     # labels low-z -> high-z
+    relabel = {int(lbl): i + 1 for i, lbl in enumerate(order)}
+    crown_f = np.array([relabel[int(c)] for c in crown_id], dtype=np.int32)
+    C       = int(crown_f.max())
+
+    stent_df['crown_id'] = crown_f
+
+    return {
+        'stent_df'          : stent_df,
+        'crown_edges'       : z_edges,
+        'n_crowns'          : C,
+        'conn_radius_3d'    : conn_radius_3d,
+    }
+
+def segment_stent(
+    stent_df: pd.DataFrame,
+    segmentation_wanted: bool,
+    strut_thickness: float,
+    n_sub_per_crown: int = 3,         # cut each crown into this many equal z-pieces
+    min_region_frac: float = 0.2,     # region < frac * median point-count = "tiny"
+) -> dict:
+    """
+    Crown-based slicing + connected components + tiny-region cleanup.
+
+    Slicing no longer uses a uniform `n_long_slices` grid over the whole stent.
+    Instead, each crown (the 'crown_id' column produced by crown_stent) owns a
+    z-band, and that band is cut into `n_sub_per_crown` (default 3) EQUAL z-pieces.
+    Every (crown, sub-piece) pair becomes one slice; connected components are then
+    computed within each slice.
+
+    Crown slicing occasionally leaves tiny non-pipe-like fragments (small blobs
+    where struts graze a slice cut). After labelling, any region whose point count
+    is far below the typical region size (< `min_region_frac` x the median region
+    point-count) is absorbed — as a whole — into the normal region containing its
+    nearest point, so every surviving region is pipe-like.
+
+    Returns:
+        stent_df       — with compactly renumbered 'region' column
+        region_allowed — (R+1 x R+1) bool adjacency matrix for regions
         whole_stent_region — trivial (1x1) adjacency for the un-segmented case
-        n_regions      — number of regions after merge
+        n_regions      — number of regions
         conn_radius_3d — the derived connection radius
     """
     if not segmentation_wanted:
@@ -258,10 +494,15 @@ def segment_stent(
             'conn_radius_3d'    : 0.0,
         }
 
+    if 'crown_id' not in stent_df.columns:
+        raise KeyError("segment_stent now slices per crown — run crown_stent first "
+                       "so stent_df has a 'crown_id' column.")
+
     whole_stent_region = np.array([[True]])  # all points belong to the same whole-stent region
 
     pts3d     = stent_df[['x', 'y', 'z']].values
     z_vals    = stent_df['z_cylindrical'].values
+    crowns    = stent_df['crown_id'].values
     n_samples = len(pts3d)
 
     # conn_radius_3d: min of density-based and strut-based estimates
@@ -272,10 +513,27 @@ def segment_stent(
     conn_radius_3d = min(3.0 * avg_spacing, strut_thickness)
     print(f"[6.1.5] conn_radius_3d={conn_radius_3d:.4f}  (density-based={3*avg_spacing:.4f}, strut-based={strut_thickness:.4f})")
 
-    # ── Initial segmentation: slice + connected components ────────────────────
-    z_edges = np.linspace(z_vals.min(), z_vals.max(), n_long_slices + 1)
-    slc     = np.clip(np.digitize(z_vals, z_edges) - 1, 0, n_long_slices - 1)
+    # ── Crown-based slicing: cut each crown into n_sub_per_crown equal z-pieces ─
+    # Each crown owns a z-band [z_min, z_max] of its own points; we subdivide that
+    # band into equal pieces and give every (crown, piece) a unique slice id. This
+    # replaces the old uniform `np.linspace(z_min, z_max, n_long_slices + 1)` grid.
+    slc      = np.empty(n_samples, dtype=np.int64)
+    next_id  = 0
+    for c in np.unique(crowns):
+        m  = crowns == c
+        zc = z_vals[m]
+        if zc.max() > zc.min():
+            edges = np.linspace(zc.min(), zc.max(), n_sub_per_crown + 1)
+            sub   = np.clip(np.digitize(zc, edges) - 1, 0, n_sub_per_crown - 1)
+        else:
+            sub   = np.zeros(m.sum(), dtype=np.int64)   # degenerate crown -> single piece
+        slc[m]  = next_id + sub
+        next_id += n_sub_per_crown
+    n_slices = len(np.unique(slc))
+    print(f"[6.1.5] {len(np.unique(crowns))} crowns x {n_sub_per_crown} pieces "
+          f"-> {n_slices} z-slices")
 
+    # ── Connected components within each slice ────────────────────────────────
     tree  = cKDTree(pts3d)
     all_p = tree.query_pairs(r=conn_radius_3d, output_type='ndarray')
 
@@ -290,109 +548,44 @@ def segment_stent(
         shape=(n_samples, n_samples))
     _, region = connected_components(adj, directed=False)
 
-    # ── Valley-threshold helper ───────────────────────────────────────────────
-    def _valley_thresholds(sizes, near_zero_frac=0.4, n_bins=50):
-        s           = sizes[sizes > 0]
-        hist, edges = np.histogram(s, bins=n_bins)
-        smooth      = uniform_filter1d(hist.astype(float), size=3)
-        centers     = 0.5 * (edges[:-1] + edges[1:])
-        peak_idx    = int(np.argmax(smooth))
-        near_zero   = near_zero_frac * smooth[peak_idx]
-        mode        = float(centers[peak_idx])
-        small_thresh = None
-        for i in range(peak_idx - 1, -1, -1):
-            if smooth[i] <= near_zero:
-                small_thresh = float(centers[i]); break
-        large_thresh = None
-        for i in range(peak_idx + 1, len(smooth)):
-            if smooth[i] <= near_zero:
-                large_thresh = float(centers[i]); break
-        return mode, small_thresh, large_thresh, smooth, centers, edges
-
-    # ── Per-region size measures: point count + 3-D bounding-box diagonal ─────
+    # ── Absorb extremely small (non-pipe-like) regions ────────────────────────
+    # A region is "tiny" if its point count is far below the typical region size.
+    # Each tiny region is merged, in one piece, into the NORMAL region that holds
+    # its nearest 3-D point — guaranteeing the result is pipe-like. We assign the
+    # whole tiny region to a single target (rather than per-point) so a fragment
+    # is never split across several neighbours.
     ids, counts = np.unique(region, return_counts=True)
-
-    geom = pd.DataFrame({'region': region,
-                         'x': pts3d[:, 0], 'y': pts3d[:, 1], 'z': pts3d[:, 2]})
-    agg  = geom.groupby('region').agg(['min', 'max'])
-    span = np.sqrt(sum((agg[(c, 'max')] - agg[(c, 'min')]) ** 2 for c in ('x', 'y', 'z')))
-    diag = span.loc[ids].to_numpy()              # bbox diagonal aligned to `ids`
-
-    mode_c, small_c, large_c, sm_c, ct_c, ed_c = _valley_thresholds(counts)
-    mode_d, small_d, large_d, sm_d, ct_d, ed_d = _valley_thresholds(diag)
-
-    if show_plots:
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 3.4))
-        for ax, centers, smooth, edges, mode, small_t, xlabel, fmt in (
-            (ax1, ct_c, sm_c, ed_c, mode_c, small_c, 'region point-count',        '.0f'),
-            (ax2, ct_d, sm_d, ed_d, mode_d, small_d, 'region bbox diagonal (mm)', '.3g'),
-        ):
-            ax.bar(centers, smooth, width=np.diff(edges) * 0.85, color='steelblue', align='center')
-            ax.axvline(mode, color='orange', ls='--', lw=2, label=f'mode={mode:{fmt}}')
-            if small_t is not None:
-                ax.axvline(small_t, color='red', ls='--', lw=2, label=f'small<{small_t:{fmt}}')
-            ax.set_xlabel(xlabel); ax.set_ylabel('# regions'); ax.legend()
-        fig.suptitle('region-size distributions — valley thresholds')
-        plt.tight_layout(); plt.show()
-
-    # ── Combine the two "small" criteria ──────────────────────────────────────
-    small_by_count = counts < small_c if small_c is not None else np.zeros(len(ids), bool)
-    small_by_diag  = diag   < small_d if small_d is not None else np.zeros(len(ids), bool)
-    small_mask     = (small_by_count & small_by_diag) if small_logic == 'and' \
-                     else (small_by_count | small_by_diag)
-
-    n_raw   = len(ids)
-    ct_txt  = f"{small_c:.0f}" if small_c is not None else "—"
-    dg_txt  = f"{small_d:.3g}" if small_d is not None else "—"
-    small_ids  = ids[small_mask]
-    normal_ids = ids[~small_mask]
+    size_thresh = max(min_region_frac * float(np.median(counts)), 1.0)
+    small_ids   = ids[counts <  size_thresh]
+    normal_ids  = ids[counts >= size_thresh]
 
     if len(small_ids) and len(normal_ids):
-        print(f"[6.1.5] {n_raw} raw regions | small if count<{ct_txt} {small_logic.upper()} "
-              f"diag<{dg_txt} mm | merging {len(small_ids)} "
-              f"(count-only={small_by_count.sum()}, diag-only={small_by_diag.sum()})")
+        s_mask = np.isin(region, small_ids)
+        s_idx  = np.where(s_mask)[0]
+        n_idx  = np.where(~s_mask)[0]
 
-        s_idx = np.where(np.isin(region, small_ids))[0]
-        n_idx = np.where(~np.isin(region, small_ids))[0]
+        # nearest normal point (-> its region) and its distance, per tiny point
+        s_dist, nn = cKDTree(pts3d[n_idx]).query(pts3d[s_idx])
+        s_nreg     = region[n_idx][nn]
+        s_reg      = region[s_idx]
 
-        # Group touching small fragments into connected groups
-        k        = len(small_ids)
-        sid_to_i = {sid: i for i, sid in enumerate(small_ids)}
-        s_node   = np.array([sid_to_i[region[i]] for i in s_idx])
-
-        sp = cKDTree(pts3d[s_idx]).query_pairs(r=conn_radius_3d, output_type='ndarray')
-        if len(sp):
-            a, b = s_node[sp[:, 0]], s_node[sp[:, 1]]
-            m    = a != b
-            g    = csr_matrix((np.ones(m.sum()), (a[m], b[m])), shape=(k, k))
-            g    = g + g.T
-        else:
-            g = csr_matrix((k, k))
-        _, grp_label = connected_components(g, directed=False)
-        s_grp = grp_label[s_node]
-
-        # Absorb each group into the nearest normal/large region
-        n_tree       = cKDTree(pts3d[n_idx])
-        n_reg        = region[n_idx]
-        s_dist, s_nn = n_tree.query(pts3d[s_idx])
-        s_nreg       = n_reg[s_nn]
-
-        pick   = (pd.DataFrame({'grp': s_grp, 'dist': s_dist, 'nreg': s_nreg})
-                    .groupby('grp')['dist'].idxmin())
-        n_grps        = int(grp_label.max()) + 1
-        target        = np.empty(n_grps, dtype=region.dtype)
-        target[s_grp[pick.to_numpy()]] = s_nreg[pick.to_numpy()]
+        # one target per tiny region = region of its single closest normal point
+        pick   = (pd.DataFrame({'sreg': s_reg, 'dist': s_dist})
+                    .groupby('sreg')['dist'].idxmin())          # position in s_* arrays
+        target = dict(zip(pick.index.to_numpy(), s_nreg[pick.to_numpy()]))
 
         region        = region.copy()
-        region[s_idx] = target[s_grp]
-        print(f"[6.1.5] → {len(np.unique(region))} regions after merge")
+        region[s_idx] = np.array([target[r] for r in s_reg], dtype=region.dtype)
+        print(f"[6.1.5] absorbed {len(small_ids)} tiny regions "
+              f"(<{size_thresh:.0f} pts) into nearest normal regions")
     else:
-        print(f"[6.1.5] Nothing to merge (count<{ct_txt} {small_logic.upper()} diag<{dg_txt})")
+        print(f"[6.1.5] no tiny regions to absorb (threshold {size_thresh:.0f} pts)")
 
     # ── Compact renumbering ───────────────────────────────────────────────────
     _, inv   = np.unique(region, return_inverse=True)
     region_f = (inv + 1).astype(np.int32)   # 1-based, dense
     R        = int(region_f.max())
+    print(f"[6.1.5] {R} regions")
 
     stent_df           = stent_df.copy()
     stent_df['region'] = region_f
@@ -401,8 +594,8 @@ def segment_stent(
     # Two different regions are adjacent only across slice boundaries (within a
     # slice, connected components already merged all nearby points into one region).
     # We reuse the cross pairs from the initial query_pairs — no second KDTree
-    # query needed.  Remapping through region_f gives adjacency for the merged,
-    # renumbered regions automatically.
+    # query needed.  Remapping through region_f gives adjacency for the
+    # renumbered regions automatically (absorbed tiny regions fold in for free).
     region_allowed = np.zeros((R + 1, R + 1), dtype=bool)
     np.fill_diagonal(region_allowed, True)
     if len(cross):
@@ -422,6 +615,7 @@ def segment_stent(
         'n_regions'         : R,
         'conn_radius_3d'    : conn_radius_3d,
     }
+
 
 def open_stent_to_plane(stent_df: pd.DataFrame, r_mid: float, pad_fraction: float) -> dict:
     """
@@ -462,6 +656,7 @@ def compute_skeleton_2d(
     dilate_px: int,
     pad_fraction: float,
     plot: bool,
+    seam_tol_frac: float = 0.0,
 ) -> dict:
     """
     Rasterise → dilate → skeletonise → back to physical (arc, z) coords.
@@ -472,6 +667,15 @@ def compute_skeleton_2d(
     kept. The canvas is sized to the *padded* band (so the seam copies are NOT
     clipped onto the boundary columns), then the skeleton is cropped back to the
     real arc window [arc_min_flat, arc_max_flat].
+
+    `seam_tol_frac` widens that crop by `seam_tol_frac * strut_thickness` on BOTH
+    arc edges. A strut crossing the seam (θ = ±π) is skeletonised whole on the
+    padded canvas but a hard crop splits it into two stubs — one on each edge,
+    separated across the wrap by the empty angular wedge the data leaves there.
+    Keeping a tolerance band beyond each edge lets the two stubs reach into that
+    wedge and meet, so the 3D connectivity step links them directly (the same
+    idea as the crown-trim z-tolerance), instead of leaving them for the
+    post-hoc `stitch_seam_endpoints`. `0.0` reproduces the hard crop.
     """
     pixel_size = stent_geometry['strut_thickness'] / pixels_per_strut
 
@@ -503,8 +707,13 @@ def compute_skeleton_2d(
     skel_arc_pad = arc_lo + (sk_cols + 0.5) * pixel_size
     skel_z_pad   = z_lo   + (sk_rows + 0.5) * pixel_size
 
-    # ── Crop the padded skeleton back to the real arc window ──────────────────
-    seam_mask = (skel_arc_pad >= arc_min_flat) & (skel_arc_pad <= arc_max_flat)
+    # ── Crop the padded skeleton back to the real arc window (+ seam tolerance) ──
+    # The tolerance band keeps a sliver of the padded skeleton just past each seam
+    # edge so the two stubs of a seam-crossing strut overlap across the θ=±π wrap
+    # and reconnect in 3D (see seam_tol_frac in the docstring).
+    seam_tol  = seam_tol_frac * stent_geometry['strut_thickness']
+    seam_mask = ((skel_arc_pad >= arc_min_flat - seam_tol) &
+                 (skel_arc_pad <= arc_max_flat + seam_tol))
     skel_arc  = skel_arc_pad[seam_mask]
     skel_z    = skel_z_pad[seam_mask]
 
@@ -574,6 +783,8 @@ def check_skeleton_quality(
     stent_df: pd.DataFrame,
     r_mid: float,
     region_allowed: np.ndarray,
+    strut_thickness: float = None,
+    loop_size_factor: float = 2.0,
     surf_tree: cKDTree = None,
     surf_reg: np.ndarray = None,
     verbose: bool = True,
@@ -582,11 +793,27 @@ def check_skeleton_quality(
     Quality report for a whole-stent skeleton, using the segmented regions only
     as a reference (the skeleton itself is computed without segmentation).
 
-    Reports three issues — it does NOT modify the skeleton:
+    Reports four issues — it does NOT modify the skeleton:
       1. bad_connections : skeleton edges that join two regions which do not
                            actually touch (region_allowed is False).
-      2. region_loops    : regions whose skeleton sub-graph contains a cycle.
-      3. empty_regions   : regions that received no skeleton point at all.
+      2. region_loops    : SMALL loops inside a single region.
+      3. border_loops    : SMALL loops sitting on the seam between two touching
+                           regions. Such a loop is split across both region
+                           sub-graphs, so a naive per-region pass sees only an open
+                           arc in each and misses it; this pass re-checks each
+                           touching pair on the union of the two regions.
+      4. empty_regions   : regions that received no skeleton point at all.
+
+    SMALL vs design loop: the stent's legitimate diamond cells are also cycles in
+    the skeleton, so a loop is only flagged as a defect when it is *small* — i.e.
+    a thinning bubble about as wide as a strut, not an open design cell. A loop is
+    "small" when its (arc, z) bounding-box diagonal is below
+    `loop_size_factor * strut_thickness`. This per-loop test needs no comparison
+    between loops, so it works whether there is one loop or many. When
+    `strut_thickness` is None the size test is disabled and every loop is flagged
+    (legacy behaviour).
+
+    Loops are found as cycles in the per-region / per-border skeleton graph.
 
     Also returns the (arc, z) locations of the offending features so they can
     be drawn on top of the skeleton.
@@ -646,33 +873,82 @@ def check_skeleton_quality(
             bad_connections = [tuple(int(x) for x in p) for p in pairs]
             bad_edge_xy = 0.5 * (skel[edges[bad, 0]] + skel[edges[bad, 1]])   # (arc, z) midpoints
 
-    # ── 2) Loops within a region (cycles in the per-region sub-graph) ─────────
-    region_loops   = {}
-    loop_points    = []
-    for reg in np.unique(skel_region):
-        node_mask = skel_region == reg
-        node_idx  = np.where(node_mask)[0]
+    # ── 2) Loops (small thinning bubbles, inside a region OR on a border) ─────
+    # The stent's legitimate diamond cells are also cycles, so a loop counts as a
+    # defect only when it is SMALL — about as wide as a strut. `loop_max_diag` is
+    # that size limit; when strut_thickness is unknown the limit is +inf, so every
+    # loop is flagged (legacy behaviour).
+    loop_max_diag = (loop_size_factor * strut_thickness
+                     if strut_thickness is not None else np.inf)
+    region_loops = {}      # {region_id: small-loop count}
+    border_loops = {}      # {(A, B): count}
+    loop_points  = []      # (arc, z) markers for every flagged small loop
+
+    def _loop_components(node_mask):
+        """List of the skeleton's individual loops on `node_mask`, each as
+        (set of region labels it spans, (arc, z) points). A loop is one connected
+        component of the sub-graph's 2-core (degree<2 branches stripped). Globally
+        the whole stent is one cyclic blob, so this is only meaningful on a small
+        node set (one region, or a touching pair)."""
+        node_idx = np.where(node_mask)[0]
         V = len(node_idx)
-        if len(edges):
-            e_mask = node_mask[edges[:, 0]] & node_mask[edges[:, 1]]
-            sub    = edges[e_mask]
-        else:
-            sub = edges
+        if V == 0 or not len(edges):
+            return []
+        e_mask = node_mask[edges[:, 0]] & node_mask[edges[:, 1]]
+        sub    = edges[e_mask]
         E = len(sub)
-        if E:
-            remap = {int(g): i for i, g in enumerate(node_idx)}
-            a = np.fromiter((remap[int(x)] for x in sub[:, 0]), dtype=int, count=E)
-            b = np.fromiter((remap[int(x)] for x in sub[:, 1]), dtype=int, count=E)
-            g = csr_matrix((np.ones(E), (a, b)), shape=(V, V))
-            g = g + g.T
-            ncomp, _ = connected_components(g, directed=False)
-        else:
-            ncomp = V
-        n_cycles = E - V + ncomp          # independent loops (Betti-1) of the sub-graph
-        if n_cycles > 0:
-            region_loops[int(reg)] = int(n_cycles)
-            core = _two_core_mask(V, a, b)        # the actual loop structure
-            loop_points.append(skel[node_idx[core]])
+        if not E:
+            return []
+        remap = {int(g): i for i, g in enumerate(node_idx)}
+        a = np.fromiter((remap[int(x)] for x in sub[:, 0]), dtype=int, count=E)
+        b = np.fromiter((remap[int(x)] for x in sub[:, 1]), dtype=int, count=E)
+        core = _two_core_mask(V, a, b)
+        if not core.any():
+            return []
+        # connected components of the 2-core = the separate loops
+        ce = core[a] & core[b]
+        g  = csr_matrix((np.ones(int(ce.sum())), (a[ce], b[ce])), shape=(V, V))
+        g  = g + g.T
+        ncomp, lab = connected_components(g, directed=False)
+        comps = []
+        for c in range(ncomp):
+            sel = (lab == c) & core
+            if sel.sum() < 3:                 # need >=3 nodes to enclose anything
+                continue
+            gidx = node_idx[sel]
+            xy   = skel[gidx]
+            comps.append((set(int(r) for r in np.unique(skel_region[gidx])), xy))
+        return comps
+
+    def _is_small(xy):
+        """A loop is a defect bubble when its (arc, z) bounding box is no wider
+        than a strut (`loop_max_diag`)."""
+        return float(np.hypot(*(xy.max(0) - xy.min(0)))) <= loop_max_diag
+
+    # Cycles in the per-region skeleton graph.
+    for reg in np.unique(skel_region):
+        for _, xy in _loop_components(skel_region == reg):
+            if _is_small(xy):
+                region_loops[int(reg)] = region_loops.get(int(reg), 0) + 1
+                loop_points.append(xy)
+
+    # Border loops: a small loop on the seam between two regions is split across
+    # both per-region sub-graphs above and missed. For every pair of regions that
+    # ACTUALLY touch (region_allowed) and share a skeleton edge, look at loops on
+    # the union of the two; a loop spanning BOTH regions is a border loop. The same
+    # size test excludes any large design cell that happens to live across a seam.
+    if len(edges):
+        ra, rb = skel_region[edges[:, 0]], skel_region[edges[:, 1]]
+        seam   = (ra != rb) & region_allowed[ra, rb]      # touching neighbours only
+        if seam.any():
+            pairs = np.unique(np.sort(np.column_stack([ra[seam], rb[seam]]), axis=1), axis=0)
+            for A, B in pairs:
+                A, B = int(A), int(B)
+                for regs, xy in _loop_components((skel_region == A) | (skel_region == B)):
+                    if regs == {A, B} and _is_small(xy):   # straddles the seam, and small
+                        border_loops[(A, B)] = border_loops.get((A, B), 0) + 1
+                        loop_points.append(xy)
+
     loop_points_xy = np.vstack(loop_points) if loop_points else np.empty((0, 2))
 
     # ── 3) Empty regions (no skeleton point assigned) ────────────────────────
@@ -687,6 +963,7 @@ def check_skeleton_quality(
         'n_skel_points'  : n_sk,
         'bad_connections': bad_connections,
         'region_loops'   : region_loops,
+        'border_loops'   : border_loops,
         'empty_regions'  : empty_regions,
         'skel_region'    : skel_region,
         'bad_edge_xy'    : bad_edge_xy,      # (K, 2) (arc, z) midpoints of bad edges
@@ -710,6 +987,13 @@ def check_skeleton_quality(
                 print(f"        region {reg}: {n} loop(s)")
         else:
             print("[ OK ] no loops inside any region")
+
+        if border_loops:
+            print(f"[FAIL] {len(border_loops)} loop(s) on the border between touching regions:")
+            for (a, b), n in sorted(border_loops.items()):
+                print(f"        region {a} <-> region {b}: {n} loop(s)")
+        else:
+            print("[ OK ] no loops on region borders")
 
         if empty_regions:
             print(f"[FAIL] {len(empty_regions)} empty region(s) (no skeleton point): {empty_regions}")
@@ -822,16 +1106,18 @@ def tune_skeleton_params(
     s_dil_loop: float = 20.0,     # dilate_px push from loops (thicken to fill holes)
     s_dil_conn: float = 8.0,      # dilate_px pull-down from connections (thin)
     w_conn: float = 5.0,
-    w_loop: float = 1.0,
-    w_empty: float = 3.0,
+    w_loop: float = 3.0,
+    w_empty: float = 1.0,
+    loop_size_factor: float = 2.0,  # a loop wider than this x strut_thickness is a design cell, not a defect
     q_eps: float = 1e-3,          # floor on the quality residual so total_error stays > 0
+    quality_gamma: float = 2.0,   # quality_error convexity: 1 = linear, >1 = diminishing returns
     res_no_improve_max: int = 5,  # steps (after the first clean step) with no total_error improvement
-    improve_tol: float = 1e-6,    # defect-bucket width & min total_error gain to reset the no-improve counter
-    target_penalty: float = 0.0,  # defect_error <= this counts as "feasible" (clean)
-    max_repeats: int = 4,        # stop once the SAME (pps, dil) state has been visited this many times
+    target_penalty: float = 0.0,  # defect_error <= this counts as "feasible" (clean) AND gates best selection
+    max_repeats: int = 2,        # stop once the SAME (pps, dil) state has been visited this many times
     pad_fraction: float = 0.20,
+    seam_tol_frac: float = 0.0,   # widen the seam crop so wrap-crossing struts reconnect in 3D
     time_limit: float = 100.0,
-    predictive_stop: bool = False,
+    predictive_stop: bool = True,
     max_iters: int = int(1e3),
     plot: bool = True,
     verbose: bool = True,
@@ -862,9 +1148,17 @@ def tune_skeleton_params(
     SELECTION minimises a single *total error* toward an (unreachable) ideal of 0:
 
         defect_error  = w_conn*conn + w_loop*loop + w_empty*empty    # -> 0 ideal
-        quality_error = clip(1 - (pps/dil - pps_min/dil_max)
-                                / (pps_max/dil_min - pps_min/dil_max), q_eps, 1)
+        f             = clip((pps/dil - pps_min/dil_max)
+                                     / (pps_max/dil_min - pps_min/dil_max), 0, 1)
+        quality_error = 100 * clip((1 - f) ** quality_gamma, q_eps, 1)
         total_error   = defect_error + quality_error
+
+    `quality_error` is reported on a 0-100 percent scale (0 = unreachable ideal,
+    100 = coarsest resolution). `f` is the normalised fineness of the skeleton
+    (0 at the coarsest pps/dil ratio, 1 at the finest), and `quality_gamma` sets
+    the convexity of the residual: gamma=1 is linear (every equal step in the
+    ratio costs the same), while gamma>1 makes it a diminishing-returns curve —
+    coarse improvements drop the error a lot, fine improvements barely move it.
 
     `quality_error` is a strictly-positive residual (a finer skeleton makes it
     smaller but it never reaches 0), so `total_error` can only be driven toward 0.
@@ -872,7 +1166,8 @@ def tune_skeleton_params(
     candidates whose `defect_error` is 0 (a clean skeleton always beats a defective
     one — correctness is a strict gate, resolution only breaks ties between clean
     skeletons). This is implemented as a lexicographic argmin over
-    (defect_bucket, total_error) with defect_bucket = round(defect_error/improve_tol).
+    (dirty_flag, total_error), where dirty_flag is 0 when the skeleton is clean
+    (defect_error <= target_penalty) and 1 otherwise.
 
     Reaching defect_error <= `target_penalty` does NOT stop the search — once clean
     it keeps pushing resolution up (pps += s_pps_explore while dil is held fixed,
@@ -903,7 +1198,8 @@ def tune_skeleton_params(
 
     def _errors(qr):
         n_conn = len(qr['bad_connections'])
-        n_loop = int(sum(qr['region_loops'].values()))
+        n_loop = int(sum(qr['region_loops'].values())) \
+               + int(sum(qr.get('border_loops', {}).values()))
         if qr['empty_regions']:
             e_empty = sum(float(region_sizes.get(er, 0)) for er in qr['empty_regions']) / med_size
         else:
@@ -920,7 +1216,7 @@ def tune_skeleton_params(
     t0 = time.time()
     durs = []                     # per-iteration wall times -> predict the next step's cost
 
-    # Constant span used to normalise pps/dil into the quality residual [0, 1].
+    # Constant span used to normalise pps/dil into the quality residual [0, 100].
     ratio_span = (pps_max / dil_min) - (pps_min / dil_max)
 
     if verbose:
@@ -949,19 +1245,26 @@ def tune_skeleton_params(
             arc_flat=arc, z_flat=z, arc_min_flat=arc.min(), arc_max_flat=arc.max(),
             circumference=circ, stent_df=stent_df, stent_geometry=stent_features,
             pixels_per_strut=pps, dilate_px=dil, pad_fraction=pad_fraction, plot=False,
+            seam_tol_frac=seam_tol_frac,
         )
         qr = check_skeleton_quality(
             res['df_skeleton_2d'], res['pixel_size'], stent_df, r_mid, region_allowed,
+            strut_thickness=stent_features['strut_thickness'],
+            loop_size_factor=loop_size_factor,
             surf_tree=surf_tree, surf_reg=surf_reg, verbose=False,
         )
         durs.append(time.time() - _it_t0)
         n_conn, n_loop, e_empty = _errors(qr)
         # Single total error, minimised toward an (unreachable) ideal of 0:
         #   defect_error  -> 0 when no connections / loops / empty regions remain
-        #   quality_error -> strictly-positive residual; a finer skeleton (higher
-        #                    pps/dil) shrinks it but it never reaches 0
+        #   quality_error -> strictly-positive residual on a 0-100 percent scale;
+        #                    a finer skeleton (higher pps/dil) shrinks it but it
+        #                    never reaches 0. quality_gamma sets the convexity:
+        #                    1 = linear, >1 = diminishing returns (coarse gains
+        #                    register strongly, fine gains barely move it).
         defect_error  = w_conn * n_conn + w_loop * n_loop + w_empty * e_empty
-        quality_error = float(np.clip(1.0 - (pps/dil - pps_min/dil_max) / ratio_span, q_eps, 1.0))
+        fineness      = float(np.clip((pps/dil - pps_min/dil_max) / ratio_span, 0.0, 1.0))
+        quality_error = 100.0 * float(np.clip((1.0 - fineness) ** quality_gamma, q_eps, 1.0))
         total_error   = defect_error + quality_error
         elapsed = time.time() - t0
         history.append(dict(step=it, pps=round(pps, 2), dil_px=dil, conn=n_conn,
@@ -974,15 +1277,16 @@ def tune_skeleton_params(
                   f"{e_empty:>6.2f} | {defect_error:>8.3f} {quality_error:>6.3f} "
                   f"{total_error:>8.3f} | {elapsed:>5.1f}")
 
-        # Selection: lexicographic argmin over (defect_bucket, total_error). Every
-        # defective candidate has defect_bucket > 0 and every clean one has 0, so a
-        # clean skeleton is always preferred; ties between clean skeletons are then
-        # broken by the lowest total_error (= smallest quality residual = finest
-        # resolution). defect_bucket quantises defect_error by `improve_tol` so a
-        # tiny fractional empty-region error does not flip the gate on noise.
-        defect_bucket = round(defect_error / improve_tol)
-        cand_key      = (defect_bucket, total_error)
-        improved      = best is None or cand_key < best['key']
+        # Selection: lexicographic argmin over (dirty_flag, total_error). The first
+        # key is a STRICT clean/dirty flag — 0 when the skeleton is clean
+        # (defect_error <= target_penalty), 1 otherwise — so a clean skeleton ALWAYS
+        # beats a defective one and ties between clean skeletons are broken by the
+        # lowest total_error (= finest resolution). This is a hard gate, not a
+        # quantised/rounded bucket: a single loop (defect_error >= w_loop) can never
+        # be rounded down into the "clean" flag.
+        clean    = defect_error <= target_penalty
+        cand_key = (0 if clean else 1, total_error)
+        improved = best is None or cand_key < best['key']
         if improved:
             best = dict(key=cand_key, total_error=total_error, defect_error=defect_error,
                         quality_error=quality_error, pps=pps, dil=dil,
@@ -1032,9 +1336,14 @@ def tune_skeleton_params(
             e_empty_n = min(1.0, e_empty / max(1, n_regions))
             dil_cap   = min(dil_max, int(pps))            # hard cap AND strut spacing
             pps_new = pps + s_pps_conn * e_conn_n + s_pps_empty * e_empty_n      # sharpen
-            # Thicken to close loops, thin to break bad connections.
-            dil_new = dil + int(round(s_dil_loop * e_loop_n)) \
-                          - int(round(s_dil_conn * e_conn_n))
+            # Thicken to close loops, thin to break bad connections. Use ceil with a
+            # guaranteed minimum move of 1 whenever the defect is present: a single
+            # loop/connection in a many-region stent gives a tiny region-normalised
+            # error whose proportional step would otherwise round to 0, freezing the
+            # parameter and stalling the search in a cycle.
+            d_loop = max(1, int(np.ceil(s_dil_loop * e_loop_n))) if n_loop > 0 else 0
+            d_conn = max(1, int(np.ceil(s_dil_conn * e_conn_n))) if n_conn > 0 else 0
+            dil_new = dil + d_loop - d_conn
             if n_loop > 0 and dil >= dil_cap:     # dilation capped but holes remain -> coarsen pps
                 pps_new -= s_pps_loop * e_loop_n
 
@@ -1056,14 +1365,12 @@ def tune_skeleton_params(
                 label='total_error', linewidth=2)
         ax.plot(hist_df['step'], hist_df['defect_error'], '-', color='steelblue',
                 label='defect_error')
+        ax.plot(hist_df['step'], hist_df['quality_error'], '-', color='darkorange',
+                label='quality_error')
         ax.axhline(0, color='grey', lw=0.8, ls=':')   # ideal (unreachable) total_error = 0
         ax.set_ylim(bottom=0)
         ax.set_xlabel('step'); ax.set_ylabel('error'); ax.set_title('tuning trajectory (minimise total_error)')
-        ax2 = ax.twinx()
-        ax2.plot(hist_df['step'], hist_df['pps'],    '--', color='darkorange', label='pps')
-        ax2.plot(hist_df['step'], hist_df['dil_px'], '--', color='seagreen',   label='dilate_px')
-        ax2.set_ylabel('pps / dilate_px')
-        ax.legend(loc='upper right'); ax2.legend(loc='center right')
+        ax.legend(loc='upper right')
         plt.tight_layout(); plt.show()
 
     return {
@@ -1130,9 +1437,11 @@ def plot_skeleton_quality(
                    linewidths=2.5, zorder=5,
                    label=f'bad connection ({len(quality_report["bad_connections"])} pair(s))')
     if len(loop_xy):
+        n_reg_loops    = len(quality_report['region_loops'])
+        n_border_loops = len(quality_report.get('border_loops', {}))
         ax.scatter(loop_xy[:, 1], loop_xy[:, 0], s=40, marker='o',
                    facecolors='none', edgecolors='magenta', linewidths=1.4, zorder=4,
-                   label=f'loop ({len(quality_report["region_loops"])} region(s))')
+                   label=f'loop ({n_reg_loops} region, {n_border_loops} border)')
     if len(empty_xy):
         ax.scatter(empty_xy[:, 1], empty_xy[:, 0], s=220, marker='s',
                    facecolors='none', edgecolors='black', linewidths=2.0, zorder=6,
@@ -1194,20 +1503,36 @@ def adjust_skeleton_to_local_midsurface(
 
 def analyze_skeleton_connectivity(
     df_skeleton_3d: pd.DataFrame,
-    pixel_size: float,
+    pixel_size,                              # scalar, OR a per-point array (len N)
     neighbor_radius_factor: float = 1.8,
 ) -> pd.DataFrame:
     """
     Classify each skeleton point by its connectivity degree.
     node_type: 'isolated' (0), 'endpoint' (1), 'line' (2), 'junction' (3+).
+
+    `pixel_size` may be a single value (uniform skeleton) OR a per-point array of
+    length N. The per-point form is for a skeleton assembled from pieces tuned to
+    DIFFERENT resolutions (e.g. the per-crown skeletoniser, where each crown keeps
+    its own pixels_per_strut): two points i, j are linked only when their distance
+    is within neighbor_radius_factor * max(px_i, px_j). Using the COARSER of the
+    two points' pixel sizes means a fine piece is never over-connected by a coarse
+    piece's radius, while a coarse piece still connects along its own spacing.
     """
-    pts    = df_skeleton_3d[['x', 'y', 'z']].values
-    radius = neighbor_radius_factor * pixel_size
+    pts = df_skeleton_3d[['x', 'y', 'z']].values
+    N   = len(pts)
+    px  = np.asarray(pixel_size, dtype=float)
 
-    tree  = cKDTree(pts)
-    pairs = tree.query_pairs(r=radius, output_type='ndarray')
+    tree = cKDTree(pts)
+    # Query at the largest neighbour radius any point could use, then (per-point
+    # case) keep only pairs within the local radius set by the COARSER of the two.
+    radius = neighbor_radius_factor * float(px.max())
+    pairs  = tree.query_pairs(r=radius, output_type='ndarray')
+    if px.ndim and len(pairs):
+        d   = np.linalg.norm(pts[pairs[:, 0]] - pts[pairs[:, 1]], axis=1)
+        thr = neighbor_radius_factor * np.maximum(px[pairs[:, 0]], px[pairs[:, 1]])
+        pairs = pairs[d <= thr]
 
-    neighbors = [[] for _ in range(len(pts))]
+    neighbors = [[] for _ in range(N)]
     for i, j in pairs:
         neighbors[i].append(int(j))
         neighbors[j].append(int(i))
@@ -1353,10 +1678,109 @@ def reconnect_skeleton_endpoints(
     return df
 
 
+def stitch_seam_endpoints(
+    df_connectivity: pd.DataFrame,
+    r_mid: float,
+    strut_thickness: float,
+    z_tol_frac: float = 0.5,
+    verbose: bool = True,
+) -> pd.DataFrame:
+    """
+    Reconnect strut pieces cut by the UNROLL SEAM (the θ = ±π wrap).
+
+    Opening the cylinder to the (arc, z) plane and cropping the skeleton back to
+    the data arc-window cuts every strut that crosses the seam into two stubs —
+    one ending on the low arc-edge (θ_min), one on the high arc-edge (θ_max) at
+    the same z. The 3D wrap places the two stubs at (almost) the same physical
+    point across the seam, but they stay TWO separate degree-1 endpoints, so they
+    look like spurs and get pruned. This step joins them back.
+
+    The rule is purely geometric — no pixel-size or tuned-gap parameter. Two
+    degree-1 endpoints are joined when ALL three hold:
+
+        1. they sit on OPPOSITE seam edges (one near θ_min, one near θ_max),
+        2. they are at the SAME height z (within `z_tol_frac` strut thicknesses),
+        3. they are CLOSER than one strut thickness in 3D.
+
+    The single physical scale is `strut_thickness`: it is both the seam-edge band
+    (how close to an edge counts as a seam stub) and the 3D join distance. Because
+    a real seam-crossing strut keeps the same z and closes to ~0 gap once wrapped,
+    these conditions catch it while leaving real tips and mid-strut breaks — which
+    have no opposite-edge partner within a strut thickness — untouched.
+
+    Returns a copy of `df_connectivity` with `neighbor_ids`, `degree` and
+    `node_type` recomputed after the seam bridges are inserted.
+    """
+    df  = df_connectivity.reset_index(drop=True).copy()
+    pts = df[['x', 'y', 'z']].values
+    N   = len(pts)
+
+    max_gap   = strut_thickness                 # 3D join distance (condition 3)
+    z_tol     = z_tol_frac * strut_thickness    # same-height tolerance (condition 2)
+    seam_band = strut_thickness / r_mid         # seam-edge band in θ (= one strut thickness of arc)
+
+    adj = [set() for _ in range(N)]
+    for i, nbrs in enumerate(df['neighbor_ids']):
+        if isinstance(nbrs, str):
+            nbrs = ast.literal_eval(nbrs)
+        for j in nbrs:
+            j = int(j)
+            adj[i].add(j); adj[j].add(i)
+    deg = np.array([len(a) for a in adj])
+
+    theta     = df['theta'].values
+    th_min, th_max = theta.min(), theta.max()
+    endpoints = np.where(deg == 1)[0]
+
+    low  = [e for e in endpoints if theta[e] <= th_min + seam_band]   # on θ_min edge
+    high = [e for e in endpoints if theta[e] >= th_max - seam_band]   # on θ_max edge
+
+    # All low/high pairs that satisfy conditions 2 and 3, shortest 3D gap first so
+    # each stub greedily takes its true partner; every endpoint is used at most once.
+    cands = []
+    for e in low:
+        for h in high:
+            if h == e:
+                continue
+            if abs(pts[e, 2] - pts[h, 2]) > z_tol:          # condition 2: same height
+                continue
+            d = float(np.linalg.norm(pts[e] - pts[h]))
+            if d <= max_gap:                                # condition 3: within a strut thickness
+                cands.append((d, e, h))
+    cands.sort()
+
+    new_edges = []
+    used = set()
+    for d, e, h in cands:
+        if e in used or h in used:
+            continue
+        adj[e].add(h); adj[h].add(e)
+        used.add(e); used.add(h)
+        new_edges.append((e, h))
+
+    neighbors = [sorted(adj[i]) for i in range(N)]
+    degrees   = np.array([len(a) for a in neighbors])
+    node_type = np.select(
+        [degrees == 0, degrees == 1, degrees == 2],
+        ['isolated',   'endpoint',   'line'],
+        default='junction',
+    )
+    df['neighbor_ids'] = neighbors
+    df['degree']       = degrees
+    df['node_type']    = node_type
+
+    if verbose:
+        print(f"[seam-stitch] seam endpoints: {len(low)} low / {len(high)} high "
+              f"→ {len(new_edges)} bridge(s) added "
+              f"(join < {max_gap:.4f} mm = 1 strut thickness, z_tol = {z_tol:.4f} mm)")
+
+    return df
+
+
 def prune_skeleton_spurs(
     df_connectivity: pd.DataFrame,
     pixel_size: float,
-    tip_frac: float = 0.05,
+    tip_frac: float = 0,
     max_spur_len: float = None,
     max_iter: int = 10,
     verbose: bool = True,
@@ -1394,6 +1818,12 @@ def prune_skeleton_spurs(
     tip_band = tip_frac * (z_max - z_min)
 
     def _is_tip(i):
+        # tip_band <= 0 means "protect no tips": every dead-end (including the
+        # ones sitting on the exact z_min/z_max extreme) is treated as a prunable
+        # spur and walked back to its junction. Use a strict band so tip_frac=0
+        # disables protection entirely instead of still shielding the extreme node.
+        if tip_band <= 0:
+            return False
         return (z[i] - z_min) <= tip_band or (z_max - z[i]) <= tip_band
 
     adj = [set() for _ in range(N)]
@@ -1485,6 +1915,252 @@ def prune_skeleton_spurs(
         if skipped_long:
             msg += f"; {skipped_long} dead-end(s) kept (> max_spur_len)"
         print(msg)
+
+    return new
+
+def merge_seam_duplicates(
+    df_connectivity: pd.DataFrame,
+    r_mid: float,
+    strut_thickness: float,
+    seam_band_frac: float = 3.0,
+    z_tol_frac: float = 0.5,
+    verbose: bool = True,
+) -> pd.DataFrame:
+    """
+    Fold the doubled UNROLL-SEAM truss into a single centerline.
+
+    Unrolling the tube replicates surface points ±circumference so the skeleton can
+    be thinned continuously across the seam (theta=±pi). The side effect is that a
+    seam-crossing strut is skeletonised TWICE — once near the low arc-edge
+    (theta≈theta_min) and once near the high arc-edge (theta≈theta_max). Wrapped
+    back to 3D the two copies form two near-parallel rails with a VARYING gap (≈0
+    where the strut actually crosses the meridian, widening away from it), and
+    analyze_skeleton_connectivity cross-links them into a dense ribbon ("truss").
+    collapse_junction_clusters would squash that whole ribbon to one wrong point,
+    so we fold it FIRST.
+
+    A low-rail node and its high-rail partner are the SAME physical strut seen from
+    the two seam edges, so they sit at the same height z — the gap-tolerant
+    invariant used by stitch_seam_endpoints (opposite edge + same z). Each low/high
+    pair within `z_tol` is merged to its MIDPOINT (neighbours unioned), collapsing
+    the two rails to one line. There is deliberately NO 3D-distance cap: the
+    horizontal gap can be large at the wide end of the truss.
+
+    Parameters
+    ----------
+    seam_band_frac : seam-edge band width in strut thicknesses (arc length). Must be
+                     wide enough to contain the truss where it diverges — the key knob.
+    z_tol_frac     : same-height tolerance in strut thicknesses.
+
+    Returns a re-indexed copy of `df_connectivity` (contiguous skeleton_point_id,
+    remapped neighbor_ids, recomputed degree / node_type).
+    """
+    df  = df_connectivity.reset_index(drop=True).copy()
+    pts = df[['x', 'y', 'z']].values.copy()   # writable (the merge overwrites survivor coords)
+    N   = len(pts)
+
+    # Symmetric adjacency from neighbor_ids
+    adj = [set() for _ in range(N)]
+    for i, nbrs in enumerate(df['neighbor_ids']):
+        if isinstance(nbrs, str):
+            nbrs = ast.literal_eval(nbrs)
+        for j in nbrs:
+            j = int(j)
+            adj[i].add(j); adj[j].add(i)
+
+    theta          = df['theta'].values
+    z              = pts[:, 2]
+    th_min, th_max = theta.min(), theta.max()
+    band           = seam_band_frac * strut_thickness / r_mid   # seam-edge band in theta
+    z_tol          = z_tol_frac * strut_thickness
+
+    low  = np.where(theta <= th_min + band)[0]
+    high = np.where(theta >= th_max - band)[0]
+
+    # Candidate low/high pairs at the SAME height (no 3D-distance cap). Shortest
+    # |Δz| (then 3D distance) first so each rail node greedily takes its true
+    # partner directly across the truss; every node is used at most once.
+    cands = []
+    for e in low:
+        for h in high:
+            if h == e:
+                continue
+            dz = abs(z[e] - z[h])
+            if dz <= z_tol:
+                d3 = float(np.linalg.norm(pts[e] - pts[h]))
+                cands.append((dz, d3, int(e), int(h)))
+    cands.sort()
+
+    alive   = np.ones(N, dtype=bool)
+    used    = set()
+    n_pairs = 0
+    for dz, d3, e, h in cands:
+        if e in used or h in used:
+            continue
+
+        # Merge h into survivor e at the midpoint; union neighbours, drop h.
+        mid    = 0.5 * (pts[e] + pts[h])
+        pts[e] = mid
+        df.at[e, 'x'] = mid[0]
+        df.at[e, 'y'] = mid[1]
+        df.at[e, 'z'] = mid[2]
+        df.at[e, 'r'] = float(np.hypot(mid[0], mid[1]))
+        df.at[e, 'theta'] = float(np.arctan2(mid[1], mid[0]))
+
+        for nb in list(adj[h]):
+            adj[nb].discard(h)
+            if nb != e:
+                adj[e].add(nb); adj[nb].add(e)
+        adj[h] = set()
+        adj[e].discard(e)
+        alive[h] = False
+        used.add(e); used.add(h)
+        n_pairs += 1
+
+    # Re-index surviving nodes and remap neighbours
+    keep       = np.where(alive)[0]
+    old_to_new = {int(o): i for i, o in enumerate(keep)}
+    new        = df.iloc[keep].reset_index(drop=True).copy()
+
+    new_neighbors = [sorted(old_to_new[n] for n in adj[o] if alive[n]) for o in keep]
+    degrees       = np.array([len(n) for n in new_neighbors])
+    node_type     = np.select(
+        [degrees == 0, degrees == 1, degrees == 2],
+        ['isolated',   'endpoint',   'line'],
+        default='junction',
+    )
+
+    new['skeleton_point_id'] = np.arange(len(new))
+    new['neighbor_ids']      = new_neighbors
+    new['degree']            = degrees
+    new['node_type']         = node_type
+
+    if verbose:
+        print(f"[seam-merge] rails: {len(low)} low / {len(high)} high → "
+              f"{n_pairs} pair(s) merged to midpoint; "
+              f"total nodes {N} → {len(new)} "
+              f"(band={seam_band_frac}×t, z_tol={z_tol:.4f} mm)")
+
+    return new
+
+
+def collapse_junction_clusters(
+    df_connectivity: pd.DataFrame,
+    verbose: bool = True,
+) -> pd.DataFrame:
+    """
+    Collapse each connected blob of junction nodes into a single centroid node.
+
+    The skeleton is pixel-based, so morphological thinning leaves a small blob of
+    several degree>=3 pixels at every physical strut crossing rather than one
+    clean junction. Those blob pixels are mutually adjacent in the graph, so this
+    step is purely topological: it takes the junction-only subgraph (edges whose
+    *both* endpoints are junctions, degree>=3), finds its connected components,
+    and replaces each component of two or more junctions with a single node at
+    their mean (centroid) position, rewiring every strut that met the blob so it
+    connects to that single node. Genuine separate crossings are not edge-
+    connected to one another, so they stay distinct — no length scale needed.
+
+    Returns a re-indexed copy of `df_connectivity` (contiguous
+    skeleton_point_id, remapped neighbor_ids, recomputed degree / node_type).
+    """
+    df  = df_connectivity.reset_index(drop=True).copy()
+    pts = df[['x', 'y', 'z']].values
+    N   = len(pts)
+
+    # Symmetric adjacency from neighbor_ids
+    adj = [set() for _ in range(N)]
+    for i, nbrs in enumerate(df['neighbor_ids']):
+        if isinstance(nbrs, str):
+            nbrs = ast.literal_eval(nbrs)
+        for j in nbrs:
+            j = int(j)
+            adj[i].add(j); adj[j].add(i)
+
+    deg          = np.array([len(a) for a in adj])
+    junctions    = np.where(deg >= 3)[0]
+    junction_set = {int(j) for j in junctions}
+
+    # ── Group directly edge-connected junction nodes into clusters ────────────
+    # Connected components of the junction-only subgraph (edges where both
+    # endpoints are junctions). A blob of mutually adjacent crossing pixels
+    # forms one component; genuinely separate crossings are not edge-connected.
+    clusters = []
+    visited  = set()
+    for j in junction_set:
+        if j in visited:
+            continue
+        comp  = []
+        stack = [j]
+        visited.add(j)
+        while stack:
+            u = stack.pop()
+            comp.append(u)
+            for nb in adj[u]:
+                if nb in junction_set and nb not in visited:
+                    visited.add(nb)
+                    stack.append(nb)
+        if len(comp) >= 2:
+            clusters.append(np.array(sorted(comp)))
+
+    alive = np.ones(N, dtype=bool)
+    n_clusters = 0
+
+    for members in clusters:
+        members = sorted(int(m) for m in members)
+        survivor = members[0]
+        member_set = set(members)
+
+        # Centroid of the cluster → overwrite survivor's coordinates
+        centroid = pts[members].mean(axis=0)
+        df.at[survivor, 'x'] = centroid[0]
+        df.at[survivor, 'y'] = centroid[1]
+        df.at[survivor, 'z'] = centroid[2]
+        df.at[survivor, 'r'] = float(np.hypot(centroid[0], centroid[1]))
+        df.at[survivor, 'theta'] = float(np.arctan2(centroid[1], centroid[0]))
+
+        # Rewire: external neighbours of any member attach to the survivor
+        external = set()
+        for m in members:
+            for nb in adj[m]:
+                if nb not in member_set:
+                    external.add(nb)
+        # Drop old member↔external edges, then connect survivor↔external
+        for m in members:
+            for nb in list(adj[m]):
+                adj[nb].discard(m)
+            adj[m] = set()
+        for nb in external:
+            adj[survivor].add(nb); adj[nb].add(survivor)
+
+        # Keep only the survivor; delete the rest of the cluster
+        for m in members[1:]:
+            alive[m] = False
+        n_clusters += 1
+
+    # Re-index surviving nodes and remap neighbours
+    keep       = np.where(alive)[0]
+    old_to_new = {int(o): i for i, o in enumerate(keep)}
+    new        = df.iloc[keep].reset_index(drop=True).copy()
+
+    new_neighbors = [sorted(old_to_new[n] for n in adj[o] if alive[n]) for o in keep]
+    degrees       = np.array([len(n) for n in new_neighbors])
+    node_type     = np.select(
+        [degrees == 0, degrees == 1, degrees == 2],
+        ['isolated',   'endpoint',   'line'],
+        default='junction',
+    )
+
+    new['skeleton_point_id'] = np.arange(len(new))
+    new['neighbor_ids']      = new_neighbors
+    new['degree']            = degrees
+    new['node_type']         = node_type
+
+    if verbose:
+        n_junc_after = int((degrees >= 3).sum())
+        print(f"[collapse_junctions] collapsed {n_clusters} cluster(s); "
+              f"junction nodes {len(junctions)} → {n_junc_after}; "
+              f"total nodes {N} → {len(new)} (edge-connected contraction)")
 
     return new
 
