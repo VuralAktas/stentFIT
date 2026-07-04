@@ -16,7 +16,12 @@ from scipy.sparse.csgraph import connected_components
 from scipy.spatial import cKDTree
 from scipy.ndimage import uniform_filter1d
 from scipy.signal import find_peaks
+from scipy.interpolate import splprep, splev
 from skimage.morphology import skeletonize, dilation, closing, disk
+
+import plotly.graph_objects as go
+import plotly.io as pio
+import plotly.colors as pcolors
 
 REPO_ROOT = pathlib.Path(__file__).parent.parent.parent.absolute()
 
@@ -61,6 +66,9 @@ def preprocess_stent(
     """
 
     # Step 1: sample the surface (random_seed=None draws fresh; int = reproducible)
+
+    if n_samples is None:
+        n_samples = len(mesh.faces) * samples_per_face
     pts, face_idx = trimesh.sample.sample_surface(mesh, n_samples, seed=random_seed)
 
     # Step 2: PCA centroid and main axis
@@ -101,7 +109,7 @@ def preprocess_stent(
         r_inner_mid  = np.percentile(r[middle_band], 1)
         radial_keep  = r >= r_inner_mid * 0.8
 
-        # Step 4b: drop the +z support by keeping only the largest DBSCAN cluster
+        '''# Step 4b: drop the +z support by keeping only the largest DBSCAN cluster
         strut_est = np.percentile(r, 98) - r_inner_mid
 
         kept_idx = np.flatnonzero(radial_keep)
@@ -153,7 +161,7 @@ def preprocess_stent(
         shifted = shifted[band_keep]
         r       = r[band_keep]
         theta   = theta[band_keep]
-        z_cyl   = z_cyl[band_keep]
+        z_cyl   = z_cyl[band_keep]'''
 
         # Step 4d: hard axial clamp for this stent
         pts     = pts[z_cyl > -9.8]
@@ -277,6 +285,7 @@ def find_crowns(
     strut_thickness: float,
     min_crown_frac: float = 0.2,      # crown < frac * (90th-pct point-count) = "tiny"
     show_plots: bool = False,
+    out_path: str = None,             # if set, save the dip-detection plot here (PNG)
 ) -> dict:
     """Split the stent into crown-to-crown bands and number them.
 
@@ -322,7 +331,7 @@ def find_crowns(
     '''print(f"[crown] crown dips={n_dips} -> cutting at {len(dip_z)} z-values "
           f"-> {n_bands} bands")'''
 
-    if show_plots:
+    if show_plots or out_path is not None:
         zc_d = 0.5 * (edges_d[:-1] + edges_d[1:])
         fig, axd = plt.subplots(figsize=(11, 3))
         axd.plot(zc_d, npts_s, color='gray', label='points/slice (smoothed)')
@@ -332,7 +341,13 @@ def find_crowns(
         axd.set_xlabel('z_cylindrical'); axd.set_ylabel('points / slice')
         axd.set_title(f'Crown dips -> {n_bands} crown-to-crown bands')
         axd.legend(); axd.grid(True, alpha=0.3)
-        plt.tight_layout(); plt.show()
+        plt.tight_layout()
+        if out_path is not None:
+            fig.savefig(out_path, dpi=120, bbox_inches='tight')
+        if show_plots:
+            plt.show()
+        else:
+            plt.close(fig)
 
     # Step 3: label connected pieces within each band
     slc   = np.clip(np.digitize(z_vals, z_edges) - 1, 0, n_bands - 1)
@@ -394,6 +409,12 @@ def find_crowns(
         'crown_edges'       : z_edges,
         'n_crowns'          : C,
         'conn_radius_3d'    : conn_radius_3d,
+        # dip-detection diagnostic data (for interactive HTML plot)
+        'dip_z_centers'     : 0.5 * (edges_d[:-1] + edges_d[1:]),
+        'dip_counts_smoothed': npts_s,
+        'dip_indices'       : dips,
+        'dip_depth_thresh'  : depth_thresh,
+        'n_bands'           : n_bands,
     }
 
 def segment_stent(
@@ -955,8 +976,8 @@ def tune_skeleton_params(
     s_pps_explore: float = 5.0,   # when defect-free, step pps up by this to shrink the quality residual
     s_dil_loop: float = 20.0,     # dilate_px push from loops (thicken to fill holes)
     s_dil_conn: float = 8.0,      # dilate_px pull-down from connections (thin)
-    w_conn: float = 5.0,
-    w_loop: float = 3.0,
+    w_conn: float = 2.0,
+    w_loop: float = 10.0,
     w_empty: float = 1.0,
     loop_size_factor: float = 2.0,  # a loop wider than this x strut_thickness is a design cell, not a defect
     q_eps: float = 1e-3,          # floor on the quality residual so total_error stays > 0
@@ -1645,6 +1666,109 @@ def prune_skeleton_spurs(
 
     return new
 
+
+def collapse_tiny_loops(df_connectivity: pd.DataFrame, strut_thickness: float,
+                        max_diag_factor: float = 2.0, verbose: bool = True) -> pd.DataFrame:
+    """Remove tiny spurious loops (small closed cycles / lasso hooks).
+
+    A stray little loop makes an otherwise-normal strut point look like a junction
+    (it gains a 3rd neighbour), and the spur-pruner can't touch it because it is not
+    a loose end. This targets two clearly-artifact shapes and leaves genuine large
+    design cells alone:
+      * lasso self-loop: a degree-2 chain that leaves a junction and returns to the
+        SAME junction — its interior is deleted, demoting the false junction back to
+        a normal point / tip.
+      * isolated tiny cycle: a free-floating small degree-2 loop — deleted whole.
+    A loop counts as tiny when its bounding-box diagonal is <=
+    max_diag_factor * strut_thickness (design cells are much larger). Curves running
+    between two DIFFERENT junctions are never touched (they may be real connectors).
+
+    Returns a re-indexed copy (contiguous skeleton_point_id, remapped neighbor_ids,
+    recomputed degree / node_type).
+    """
+    df  = df_connectivity.reset_index(drop=True).copy()
+    N   = len(df)
+    pts = df[['x', 'y', 'z']].values
+
+    adj = [set() for _ in range(N)]
+    for i, nbrs in enumerate(df['neighbor_ids']):
+        if isinstance(nbrs, str):
+            nbrs = ast.literal_eval(nbrs)
+        for j in nbrs:
+            j = int(j)
+            adj[i].add(j); adj[j].add(i)
+    deg      = np.array([len(a) for a in adj])
+    specials = set(np.where(deg != 2)[0].tolist())
+
+    # group the graph into curves (degree-2 chains bounded by specials, or closed
+    # degree-2 loops), tracing each undirected edge once
+    visited = set()
+
+    def walk(s, nxt):
+        path = [s, nxt]
+        visited.add(frozenset((s, nxt)))
+        prev, cur = s, nxt
+        while cur not in specials:
+            others = [n for n in adj[cur] if n != prev]
+            if not others:
+                break
+            nb = others[0]
+            visited.add(frozenset((cur, nb)))
+            path.append(nb)
+            prev, cur = cur, nb
+            if cur == s:
+                break
+        return path
+
+    curves = []
+    for s in specials:
+        for nb in adj[s]:
+            if frozenset((s, nb)) not in visited:
+                curves.append(walk(s, nb))
+    for i in range(N):
+        for nb in adj[i]:
+            if frozenset((i, nb)) not in visited:
+                curves.append(walk(i, nb))
+
+    max_diag = max_diag_factor * strut_thickness
+    remove, n_loops = set(), 0
+    for c in curves:
+        cp   = pts[c]
+        diag = float(np.linalg.norm(cp.max(0) - cp.min(0)))
+        if diag > max_diag:
+            continue
+        if c[0] == c[-1] and c[0] in specials:          # lasso self-loop at a junction
+            remove.update(n for n in c if n != c[0])
+            n_loops += 1
+        elif c[0] == c[-1]:                             # isolated tiny cycle
+            remove.update(c)
+            n_loops += 1
+
+    alive = np.ones(N, dtype=bool)
+    alive[list(remove)] = False
+    keep       = np.where(alive)[0]
+    old_to_new = {int(o): i for i, o in enumerate(keep)}
+    new        = df.iloc[keep].reset_index(drop=True).copy()
+
+    new_neighbors = [sorted(old_to_new[n] for n in adj[o] if alive[n]) for o in keep]
+    degrees       = np.array([len(n) for n in new_neighbors])
+    node_type     = np.select(
+        [degrees == 0, degrees == 1, degrees == 2],
+        ['isolated',   'endpoint',   'line'],
+        default='junction',
+    )
+    new['skeleton_point_id'] = np.arange(len(new))
+    new['neighbor_ids']      = new_neighbors
+    new['degree']            = degrees
+    new['node_type']         = node_type
+
+    if verbose:
+        print(f"[collapse_tiny_loops] removed {n_loops} tiny loop(s) "
+              f"(<= {max_diag:.4f} mm diag), {len(remove)} points; "
+              f"total nodes {N} -> {len(new)}")
+    return new
+
+
 def merge_seam_duplicates(
     df_connectivity: pd.DataFrame,
     r_mid: float,
@@ -2058,3 +2182,709 @@ def load_update_stent_data(stent_name, material_name, youngs_modulus, poissons_r
 
     return feats, cl_dir, sk
 
+
+# ---------------------------------------------------------------------------
+# Interactive-pipeline helpers: outlier removal, Plotly HTML views,
+# per-crown diagnostics, and manual skeleton edits.
+# ---------------------------------------------------------------------------
+
+def drop_points(stent_df: pd.DataFrame, point_ids) -> pd.DataFrame:
+    """Remove rows from the point cloud by ``point_id``.
+
+    ``point_ids`` is any iterable of ids (empty / None -> no-op). The original
+    ``point_id`` values are preserved (no renumbering) so ids the user reads off
+    an earlier HTML view stay valid across rounds. Returns a new DataFrame.
+    """
+    if point_ids is None:
+        return stent_df
+    ids = [int(p) for p in point_ids]
+    if not ids:
+        return stent_df
+    keep = ~stent_df['point_id'].isin(ids)
+    return stent_df[keep].reset_index(drop=True)
+
+
+def _downsample_df(df: pd.DataFrame, max_display: int, random_state: int = 0) -> pd.DataFrame:
+    """Return df unchanged if small, else a random subset of ``max_display`` rows
+    (ids preserved). Display-only — never used for processing."""
+    if max_display is None or len(df) <= max_display:
+        return df
+    return df.sample(max_display, random_state=random_state)
+
+
+def plot_points_3d_html(
+    df: pd.DataFrame,
+    id_col: str,
+    out_path: str,
+    color_col: str = None,
+    max_display: int = 40000,
+    title: str = "",
+    point_size: float = 1,
+    categorical: bool = False,
+) -> str:
+    """Write an interactive Plotly 3D scatter of a point cloud to ``out_path`` (HTML).
+
+    Hovering a point shows its ``id_col`` (e.g. point_id / skeleton_point_id) and,
+    when ``color_col`` is given, that value too (e.g. crown_id, used for colour).
+    The view is downsampled to ``max_display`` points for browser performance, but
+    every displayed point keeps its true id so outlier removal stays valid.
+
+    ``categorical=True`` treats ``color_col`` as discrete labels (e.g. crown_id):
+    each label gets its own high-contrast qualitative colour and legend entry, so
+    neighbouring groups are easy to tell apart (a continuous scale like Turbo makes
+    adjacent crowns look nearly identical). ``categorical=False`` keeps the
+    continuous colour scale.
+    """
+
+    disp = _downsample_df(df, max_display)
+    ids  = disp[id_col].to_numpy()
+    xyz  = disp[['x', 'y', 'z']].to_numpy()
+    note = f"  ({len(disp):,}/{len(df):,} shown)" if len(disp) < len(df) else ""
+
+    if color_col is not None and color_col in disp.columns and categorical:
+        # one trace per label with a distinct qualitative colour + legend
+        palette = (pcolors.qualitative.Dark24 + pcolors.qualitative.Light24)
+        labels  = sorted(disp[color_col].unique())
+        fig = go.Figure()
+        for i, lab in enumerate(labels):
+            sub  = disp[disp[color_col] == lab]
+            cdat = np.column_stack([sub[id_col].to_numpy(),
+                                    sub[color_col].to_numpy()])
+            fig.add_trace(go.Scatter3d(
+                x=sub['x'], y=sub['y'], z=sub['z'], mode='markers',
+                marker=dict(size=point_size, color=palette[i % len(palette)]),
+                name=f'{color_col}={lab}', customdata=cdat,
+                hovertemplate=(f"{id_col}=%{{customdata[0]}}<br>"
+                               f"{color_col}=%{{customdata[1]}}<extra></extra>")))
+        fig.update_layout(
+            template='plotly_dark', height=800, margin=dict(l=0, r=0, t=40, b=0),
+            title=(title + note), legend=dict(itemsizing='constant'),
+            scene=dict(aspectmode='data', xaxis_title='x', yaxis_title='y',
+                       zaxis_title='z'))
+        pio.write_html(fig, out_path, auto_open=False)
+        return out_path
+
+    if color_col is not None and color_col in disp.columns:
+        cval       = disp[color_col].to_numpy()
+        customdata = np.column_stack([ids, cval])
+        hovertemplate = (f"{id_col}=%{{customdata[0]}}<br>"
+                         f"{color_col}=%{{customdata[1]}}<extra></extra>")
+        marker = dict(size=point_size, color=cval, colorscale='Turbo',
+                      showscale=True, colorbar=dict(title=color_col))
+    else:
+        customdata    = ids[:, None]
+        hovertemplate = f"{id_col}=%{{customdata[0]}}<extra></extra>"
+        marker        = dict(size=point_size, color='royalblue')
+
+    fig = go.Figure(go.Scatter3d(
+        x=xyz[:, 0], y=xyz[:, 1], z=xyz[:, 2], mode='markers',
+        marker=marker, customdata=customdata, hovertemplate=hovertemplate))
+    fig.update_layout(
+        template='plotly_dark', height=800, margin=dict(l=0, r=0, t=40, b=0),
+        title=(title + note),
+        scene=dict(aspectmode='data', xaxis_title='x', yaxis_title='y', zaxis_title='z'))
+    pio.write_html(fig, out_path, auto_open=False)
+    return out_path
+
+
+def _skeleton_edge_segments(skeleton_df: pd.DataFrame):
+    """Return (xe, ye, ze) line arrays with NaN separators for all unique edges,
+    built from the explicit ``neighbor_ids`` graph (ids = skeleton_point_id)."""
+    coords = skeleton_df.set_index('skeleton_point_id')[['x', 'y', 'z']]
+    xe, ye, ze = [], [], []
+    seen = set()
+    for _, row in skeleton_df.iterrows():
+        pid  = int(row['skeleton_point_id'])
+        nbrs = row['neighbor_ids']
+        if isinstance(nbrs, str):
+            nbrs = ast.literal_eval(nbrs)
+        for nid in nbrs:
+            nid = int(nid)
+            key = (min(pid, nid), max(pid, nid))
+            if key in seen or nid not in coords.index:
+                continue
+            seen.add(key)
+            p0 = coords.loc[pid].to_numpy()
+            p1 = coords.loc[nid].to_numpy()
+            xe += [p0[0], p1[0], np.nan]
+            ye += [p0[1], p1[1], np.nan]
+            ze += [p0[2], p1[2], np.nan]
+    return np.array(xe), np.array(ye), np.array(ze)
+
+
+def plot_skeleton_html(
+    skeleton_df: pd.DataFrame,
+    out_path: str,
+    title: str = "Skeleton",
+    max_display: int = 40000,
+) -> str:
+    """Write an interactive Plotly 3D view of the skeleton alone to ``out_path``.
+
+    Draws every edge as grey lines (from ``neighbor_ids``) and overlays the nodes
+    as markers grouped/coloured by ``node_type``; hovering a node shows its
+    ``skeleton_point_id``, ``node_type`` and ``degree`` so the user can name the
+    points involved in any loop / wrong-connection error.
+    """
+    fig = go.Figure()
+
+    xe, ye, ze = _skeleton_edge_segments(skeleton_df)
+    if len(xe):
+        fig.add_trace(go.Scatter3d(
+            x=xe, y=ye, z=ze, mode='lines',
+            line=dict(width=3, color='rgba(150,150,150,0.6)'),
+            name='edges', hoverinfo='skip', showlegend=False))
+
+    colors = {'line': 'royalblue', 'junction': 'limegreen',
+              'endpoint': 'red', 'isolated': 'orange'}
+    disp = _downsample_df(skeleton_df, max_display)
+    for ntype, col in colors.items():
+        sub = disp[disp['node_type'] == ntype]
+        if not len(sub):
+            continue
+        cdata = np.column_stack([sub['skeleton_point_id'].to_numpy(),
+                                 sub['degree'].to_numpy()])
+        fig.add_trace(go.Scatter3d(
+            x=sub['x'], y=sub['y'], z=sub['z'], mode='markers',
+            marker=dict(size=3, color=col), name=ntype, customdata=cdata,
+            hovertemplate=("skeleton_point_id=%{customdata[0]}<br>"
+                           f"node_type={ntype}<br>"
+                           "degree=%{customdata[1]}<extra></extra>")))
+
+    fig.update_layout(
+        template='plotly_dark', height=800, margin=dict(l=0, r=0, t=40, b=0),
+        title=title,
+        scene=dict(aspectmode='data', xaxis_title='x', yaxis_title='y', zaxis_title='z'))
+    pio.write_html(fig, out_path, auto_open=False)
+    return out_path
+
+
+def plot_skeleton_with_cloud_html(
+    skeleton_df: pd.DataFrame,
+    stent_df: pd.DataFrame,
+    out_path: str,
+    max_cloud: int = 40000,
+) -> str:
+    """Write the final combined 3D view (skeleton edges + nodes over a faint,
+    downsampled point cloud) to ``out_path``. Hovering a skeleton node shows its
+    ``skeleton_point_id``; hovering a cloud point shows its ``point_id``."""
+    cloud = _downsample_df(stent_df, max_cloud)
+    fig = go.Figure()
+
+    fig.add_trace(go.Scatter3d(
+        x=cloud['x'], y=cloud['y'], z=cloud['z'], mode='markers',
+        marker=dict(size=1.5, color='rgba(180,180,180,0.25)'),
+        name='point cloud', customdata=cloud['point_id'].to_numpy()[:, None],
+        hovertemplate="point_id=%{customdata}<extra></extra>"))
+
+    xe, ye, ze = _skeleton_edge_segments(skeleton_df)
+    if len(xe):
+        fig.add_trace(go.Scatter3d(
+            x=xe, y=ye, z=ze, mode='lines',
+            line=dict(width=4, color='rgba(255,80,80,0.9)'),
+            name='skeleton', hoverinfo='skip', showlegend=True))
+
+    sk = _downsample_df(skeleton_df, max_cloud)
+    fig.add_trace(go.Scatter3d(
+        x=sk['x'], y=sk['y'], z=sk['z'], mode='markers',
+        marker=dict(size=2.5, color='red'), name='skeleton nodes',
+        customdata=sk['skeleton_point_id'].to_numpy()[:, None],
+        hovertemplate="skeleton_point_id=%{customdata}<extra></extra>"))
+
+    fig.update_layout(
+        template='plotly_dark', height=800, margin=dict(l=0, r=0, t=40, b=0),
+        title="Final skeleton over stent point cloud",
+        scene=dict(aspectmode='data', xaxis_title='x', yaxis_title='y', zaxis_title='z'))
+    pio.write_html(fig, out_path, auto_open=False)
+    return out_path
+
+
+def plot_splines_html(splines: list, out_path: str, n_eval: int = 100) -> str:
+    """Write an interactive Plotly 3D view of the fitted skeleton splines.
+
+    ``splines`` is the list returned by the notebook's spline fitter (each item a
+    dict with a ``tck`` and ``ctrl`` polyline fallback, or None). Evaluates each
+    spline at ``n_eval`` samples and renders one coloured curve per spline.
+    """
+    cmap    = plt.get_cmap('tab20')
+    palette = [f"rgb({int(r*255)},{int(g*255)},{int(b*255)})"
+               for r, g, b, _ in (cmap(i % 20) for i in range(len(splines)))]
+    fig = go.Figure()
+    n_drawn = 0
+    for i, (spl, color) in enumerate(zip(splines, palette), start=1):
+        if spl is None:
+            continue
+        if spl.get('tck') is None:
+            sp = np.asarray(spl['ctrl'])
+        else:
+            uu = np.linspace(0.0, 1.0, n_eval)
+            x, y, z = splev(uu, spl['tck'])
+            sp = np.column_stack([x, y, z])
+        fig.add_trace(go.Scatter3d(
+            x=sp[:, 0], y=sp[:, 1], z=sp[:, 2], mode='lines',
+            line=dict(width=5, color=color), name=f"curve {i}", hoverinfo='name',
+            showlegend=False))
+        n_drawn += 1
+    fig.update_layout(
+        template='plotly_dark', height=800, margin=dict(l=0, r=0, t=40, b=0),
+        title=f"{n_drawn} fitted spline curves",
+        scene=dict(aspectmode='data', xaxis_title='x', yaxis_title='y', zaxis_title='z'))
+    pio.write_html(fig, out_path, auto_open=False)
+    return out_path
+
+
+def plot_crown_dips_html(crown_res: dict, out_path: str) -> str:
+    """Write the interactive crown dip-detection plot (HTML) from a find_crowns result.
+
+    Plots smoothed points/slice vs z; hovering any point shows its z and count.
+    Detected crown dips are marked, and the depth-cutoff threshold is drawn as a
+    horizontal line. Uses the diagnostic arrays returned by find_crowns
+    (dip_z_centers, dip_counts_smoothed, dip_indices, dip_depth_thresh, n_bands).
+    """
+    zc     = np.asarray(crown_res['dip_z_centers'])
+    cnt    = np.asarray(crown_res['dip_counts_smoothed'])
+    dips   = np.asarray(crown_res['dip_indices'], dtype=int)
+    thresh = float(crown_res['dip_depth_thresh'])
+    n_bands = crown_res.get('n_bands', '?')
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=zc, y=cnt, mode='lines+markers', name='points / slice',
+        line=dict(color='gray'), marker=dict(size=4, color='gray'),
+        hovertemplate="z=%{x:.4f}<br>points/slice=%{y:.1f}<extra></extra>"))
+    if len(dips):
+        fig.add_trace(go.Scatter(
+            x=zc[dips], y=cnt[dips], mode='markers', name='crown dips',
+            marker=dict(size=12, color='red', symbol='triangle-down'),
+            hovertemplate="DIP<br>z=%{x:.4f}<br>points/slice=%{y:.1f}<extra></extra>"))
+    fig.add_hline(y=thresh, line=dict(color='red', dash='dot', width=1),
+                  annotation_text='depth cutoff', annotation_position='top left')
+    fig.update_layout(
+        template='plotly_white', height=420, margin=dict(l=40, r=20, t=50, b=40),
+        title=f"Crown dips -> {n_bands} crown-to-crown bands  ({len(dips)} dips)",
+        xaxis_title='z_cylindrical', yaxis_title='points / slice')
+    pio.write_html(fig, out_path, auto_open=False, config={'scrollZoom': True})
+    return out_path
+
+
+def plot_crown_convergence_html(history, out_path, crown_id,
+                                quality_report=None, pps=None, dil_px=None):
+    """Save the per-crown tuning diagnostic (separate from the skeleton plot).
+
+    * auto-tune ON  (``history`` given): the tuning error convergence line plot;
+      hovering a step shows defect/quality/total error and the pps / dil_px tried.
+    * auto-tune OFF (``history`` None but ``quality_report`` given): a quality
+      summary bar chart — the count of each issue type (green when 0, red when >0)
+      for the fixed ``pps`` / ``dil_px`` used.
+    * neither available: a plain annotation.
+    """
+    fig = go.Figure()
+
+    if history is not None and len(history):
+        step    = np.asarray(history['step'])
+        total   = np.asarray(history['total_error'])
+        defect  = np.asarray(history['defect_error'])
+        quality = np.asarray(history['quality_error'])
+        pps_a   = np.asarray(history['pps']) if 'pps' in history else np.full_like(step, np.nan, float)
+        dil_a   = np.asarray(history['dil_px']) if 'dil_px' in history else np.full_like(step, np.nan, float)
+        cdata   = np.column_stack([pps_a, dil_a, defect, quality, total])
+        htmpl   = ("step=%{x}<br>pps=%{customdata[0]:.2f}<br>"
+                   "dil_px=%{customdata[1]:.0f}<br>defect=%{customdata[2]:.4f}<br>"
+                   "quality=%{customdata[3]:.4f}<br>total=%{customdata[4]:.4f}<extra></extra>")
+        for name, yv, col in (('total', total, 'black'),
+                              ('defect', defect, 'royalblue'),
+                              ('quality', quality, 'orange')):
+            fig.add_trace(go.Scatter(
+                x=step, y=yv, mode='lines+markers', name=name,
+                line=dict(color=col), marker=dict(size=5, color=col),
+                customdata=cdata, hovertemplate=htmpl))
+        fig.update_layout(title=f'Crown {crown_id} — error convergence',
+                          xaxis_title='tuning step', yaxis_title='error')
+    elif quality_report is not None:
+        cats = ['bad connections', 'region loops', 'border loops', 'empty regions']
+        vals = [len(quality_report.get('bad_connections', [])),
+                len(quality_report.get('region_loops', {})),
+                len(quality_report.get('border_loops', {})),
+                len(quality_report.get('empty_regions', []))]
+        colors = ['crimson' if v > 0 else 'seagreen' for v in vals]
+        fig.add_trace(go.Bar(
+            x=cats, y=vals, marker_color=colors, text=vals, textposition='outside',
+            hovertemplate="%{x}: %{y}<extra></extra>", showlegend=False))
+        ptag = f' (pps={pps}, dil_px={dil_px})' if pps is not None else ''
+        fig.update_layout(title=f'Crown {crown_id} — quality summary{ptag}',
+                          yaxis=dict(title='count', rangemode='tozero'))
+    else:
+        fig.add_annotation(text='no tuning history (auto-tune off)',
+                           xref='paper', yref='paper', x=0.5, y=0.5, showarrow=False)
+        fig.update_layout(title=f'Crown {crown_id} — tuning')
+
+    fig.update_layout(template='plotly_white', height=450,
+                      margin=dict(l=50, r=20, t=50, b=40))
+    pio.write_html(fig, out_path, auto_open=False, config={'scrollZoom': True})
+    return out_path
+
+
+# ---------------------------------------------------------------------------
+# 2D per-crown manual edits (Step 5.5). The user fixes errors on the flat
+# (arc, z) crown skeleton BEFORE the 3D wrap, pointing at a problem with two
+# anchor indices; the tool auto-removes what's between them. Edits touch only
+# the targeted bubble/bridge (everything else in the crown is untouched) and
+# keep ~pixel_size spacing. Connectivity is rebuilt later in 3D (Step 6).
+# ---------------------------------------------------------------------------
+
+def _grid_adjacency(arc, z, pixel_size):
+    """8-neighbour pixel-grid graph for a 2D skeleton (arc, z).
+
+    Returns (edges, adj): edges is an (K, 2) int array of index pairs, adj a list
+    of neighbour-index lists. Same rule as remove_bad_connections /
+    check_skeleton_quality (a diagonal is dropped when it short-cuts a
+    4-connected corner).
+    """
+    arc = np.asarray(arc, float)
+    z   = np.asarray(z, float)
+    n   = len(arc)
+    if n == 0:
+        return np.empty((0, 2), int), []
+    gi = np.round((arc - arc.min()) / pixel_size).astype(int)
+    gj = np.round((z   - z.min())   / pixel_size).astype(int)
+    coord_set = set(zip(gi.tolist(), gj.tolist()))
+    coord_idx = {(int(gi[k]), int(gj[k])): k for k in range(n)}
+    edges = []
+    for k in range(n):
+        ci, cj = int(gi[k]), int(gj[k])
+        for di, dj in ((1, 0), (0, 1)):
+            nb = coord_idx.get((ci + di, cj + dj))
+            if nb is not None:
+                edges.append((k, nb))
+        for di, dj in ((1, 1), (1, -1)):
+            nb = coord_idx.get((ci + di, cj + dj))
+            if nb is not None:
+                corner = ((ci + di, cj) in coord_set) or ((ci, cj + dj) in coord_set)
+                if not corner:
+                    edges.append((k, nb))
+    edges = np.array(edges, dtype=int) if edges else np.empty((0, 2), dtype=int)
+    adj = [[] for _ in range(n)]
+    for u, v in edges:
+        adj[int(u)].append(int(v))
+        adj[int(v)].append(int(u))
+    return edges, adj
+
+
+def _interp_2d(a, b, spacing):
+    """Evenly-spaced interior points (~spacing apart) on the segment a->b,
+    exclusive of the endpoints. a, b are (arc, z). Returns (M, 2)."""
+    a = np.asarray(a, float)
+    b = np.asarray(b, float)
+    dist = float(np.hypot(*(b - a)))
+    n_mid = max(int(round(dist / spacing)) - 1, 0) if spacing > 0 else 0
+    if n_mid == 0:
+        return np.empty((0, 2), float)
+    ts = (np.arange(1, n_mid + 1) / (n_mid + 1))[:, None]
+    return a + ts * (b - a)
+
+
+def fix_crown_loop_2d(arc, z, pixel_size, anchor_a, anchor_b, verbose=True):
+    """Collapse a loop (bubble) on the 2D crown skeleton into a single path.
+
+    ``anchor_a`` / ``anchor_b`` are the two point indices (the plot's hover ``i``)
+    where the loop attaches. The loop is the 2-core connected component containing
+    both anchors; its points are deleted except the two anchors, and an
+    evenly-spaced straight segment is inserted between them. All other points are
+    left unchanged. Returns (new_arc, new_z, changed_idx) where changed_idx marks
+    the inserted points; a no-op returns the inputs and an empty changed_idx.
+    """
+    arc = np.asarray(arc, float)
+    z   = np.asarray(z, float)
+    n   = len(arc)
+    a, b = int(anchor_a), int(anchor_b)
+
+    edges, _ = _grid_adjacency(arc, z, pixel_size)
+    core = (_two_core_mask(n, edges[:, 0], edges[:, 1]) if len(edges)
+            else np.zeros(n, bool))
+    if not (core[a] and core[b]):
+        if verbose:
+            print(f"[fix loop 2d] anchors {a}, {b} are not both on a loop "
+                  f"(2-core) — no change")
+        return arc, z, np.array([], int)
+
+    e_core = edges[core[edges[:, 0]] & core[edges[:, 1]]]
+    g = csr_matrix((np.ones(len(e_core)), (e_core[:, 0], e_core[:, 1])), shape=(n, n))
+    g = g + g.T
+    _, lab = connected_components(g, directed=False)
+    if lab[a] != lab[b]:
+        if verbose:
+            print(f"[fix loop 2d] anchors {a}, {b} are on different loops — no change")
+        return arc, z, np.array([], int)
+
+    comp = lab == lab[a]                 # the loop's nodes (all in the 2-core)
+    delete = comp.copy()
+    delete[a] = False
+    delete[b] = False
+
+    keep = ~delete
+    new_arc = arc[keep]
+    new_z   = z[keep]
+    mids = _interp_2d((arc[a], z[a]), (arc[b], z[b]), pixel_size)
+    if len(mids):
+        new_arc = np.concatenate([new_arc, mids[:, 0]])
+        new_z   = np.concatenate([new_z,   mids[:, 1]])
+    changed_idx = (np.arange(len(new_arc) - len(mids), len(new_arc))
+                   if len(mids) else np.array([], int))
+    if verbose:
+        print(f"[fix loop 2d] removed {int(delete.sum())} loop point(s), inserted "
+              f"{len(mids)} between anchors {a} and {b}")
+    return new_arc, new_z, changed_idx
+
+
+def fix_crown_connection_2d(arc, z, pixel_size, point_a, point_b, verbose=True):
+    """Cut a wrong connection on the 2D crown skeleton by removing the whole bridge.
+
+    Pick two points ON the wrong link (the little bridge between two struts). The
+    shortest graph path between them identifies the bridge; the removal is then
+    extended along the thin (degree-2) chain in both directions up to the junctions
+    where the bridge meets the real struts, so the ENTIRE bridge is deleted (not
+    just the piece between your two clicks — that would leave two stubs). The
+    bounding junctions and everything else are kept, opening a clean gap. Returns
+    (new_arc, new_z, changed_idx=empty); a no-op returns the inputs.
+    """
+    arc = np.asarray(arc, float)
+    z   = np.asarray(z, float)
+    n   = len(arc)
+    a, b = int(point_a), int(point_b)
+
+    _, adj = _grid_adjacency(arc, z, pixel_size)
+    deg = [len(adj[i]) for i in range(n)]
+
+    # shortest path a -> b
+    prev = {a: -1}
+    dq = deque([a])
+    while dq:
+        u = dq.popleft()
+        if u == b:
+            break
+        for w in adj[u]:
+            if w not in prev:
+                prev[w] = u
+                dq.append(w)
+    if b not in prev:
+        if verbose:
+            print(f"[fix connection 2d] no path between {a} and {b} — no change")
+        return arc, z, np.array([], int)
+    path = []
+    cur = b
+    while cur != -1:
+        path.append(cur)
+        cur = prev[cur]
+    path = path[::-1]
+
+    # the bridge = the maximal thin (degree-2) chain covering the path; keep the
+    # bounding junctions (degree != 2) that attach it to the struts
+    remove = set(p for p in path if deg[p] == 2)
+
+    def _walk_out(start, inside, max_steps=400):
+        """From a path end, walk AWAY from the path through degree-2 nodes, adding
+        them to `remove`, stopping at the first junction/endpoint (kept)."""
+        prev_n, curn = inside, start
+        for _ in range(max_steps):
+            nbrs = [w for w in adj[curn] if w != prev_n]
+            if not nbrs:
+                return
+            prev_n, curn = curn, nbrs[0]
+            if deg[curn] != 2:          # junction/endpoint -> boundary, keep it
+                return
+            remove.add(curn)
+
+    if deg[a] == 2:
+        _walk_out(a, path[1] if len(path) > 1 else -1)
+    if deg[b] == 2:
+        _walk_out(b, path[-2] if len(path) > 1 else -1)
+
+    if not remove:
+        if verbose:
+            print(f"[fix connection 2d] nothing to remove between {a} and {b} "
+                  f"(both look like junctions) — pick points on the bridge itself; "
+                  f"no change")
+        return arc, z, np.array([], int)
+
+    keep = np.ones(n, bool)
+    keep[list(remove)] = False
+    if verbose:
+        print(f"[fix connection 2d] removed the {len(remove)}-point bridge between "
+              f"{a} and {b} (up to the bounding junctions) to open a clean gap")
+    return arc[keep], z[keep], np.array([], int)
+
+
+def auto_clean_bad_connections_2d(arc, z, pixel_size, bad_edge_xy, verbose=True):
+    """Auto-remove the detected bad connections the same way the manual fix does.
+
+    For each flagged bad-edge location in ``bad_edge_xy`` (the (arc, z) midpoints
+    from check_skeleton_quality), find the nearest skeleton point and delete the
+    entire thin (degree-2) bridge chain it lies on, up to the bounding junctions —
+    identical to ``fix_crown_connection_2d`` but seeded automatically from the
+    detector instead of two user clicks. This clears the automatically-detectable
+    connection errors so only the ones the detector missed remain (fixed by hand in
+    Step 5.5). Returns (new_arc, new_z, n_bridges_removed).
+    """
+    arc = np.asarray(arc, float)
+    z   = np.asarray(z, float)
+    n   = len(arc)
+    bad = np.asarray(bad_edge_xy, float).reshape(-1, 2)
+    if not len(bad) or n == 0:
+        return arc, z, 0
+
+    _, adj = _grid_adjacency(arc, z, pixel_size)
+    deg    = [len(adj[i]) for i in range(n)]
+    seeds  = cKDTree(np.column_stack([arc, z])).query(bad)[1]
+
+    def _deg2_component(start):
+        """Maximal set of degree-2 nodes connected to `start` through degree-2
+        nodes (the bridge). If `start` is a junction, union its degree-2 arms."""
+        if deg[start] != 2:
+            comp = set()
+            for nb in adj[start]:
+                if deg[nb] == 2:
+                    comp |= _deg2_component(nb)
+            return comp
+        seen, stack = {start}, [start]
+        while stack:
+            u = stack.pop()
+            for w in adj[u]:
+                if deg[w] == 2 and w not in seen:
+                    seen.add(w)
+                    stack.append(w)
+        return seen
+
+    remove, n_bridges = set(), 0
+    for s in np.unique(seeds):
+        s = int(s)
+        if s in remove:
+            continue
+        comp = _deg2_component(s)
+        if comp:
+            remove |= comp
+            n_bridges += 1
+
+    if not remove:
+        if verbose:
+            print(f"[auto-clean] {len(bad)} flagged bad connection(s), none removable "
+                  f"(seeds sit on junctions) — left for the manual fix")
+        return arc, z, 0
+
+    keep = np.ones(n, bool)
+    keep[list(remove)] = False
+    if verbose:
+        print(f"[auto-clean] removed {n_bridges} detected bad-connection bridge(s) "
+              f"({len(remove)} points) automatically")
+    return arc[keep], z[keep], n_bridges
+
+
+def plot_crown_skeleton_2d_html(arc, z, surface_arc, surface_z, out_path, crown_label,
+                                crown_band=None, changed_idx=None, quality_report=None,
+                                title=""):
+    """Single-panel interactive 2D view of a crown skeleton (crown_XX.html + editor).
+
+    x=z, y=arc. Surface points grey (halo cut when crown_band is given), skeleton
+    points red; hovering a skeleton point shows its local index i and (arc, z).
+    Scroll/drag zoom enabled (no equal-aspect lock). ``changed_idx`` points are
+    ringed to show what an edit changed. When ``quality_report`` is given, the
+    detected issues INSIDE the crown band are overlaid — bad connections (blue x),
+    loops (magenta open circles), empty regions (black open squares) — and the
+    title shows the in-band issue count.
+    """
+    arc   = np.asarray(arc)
+    z     = np.asarray(z)
+    s_arc = np.asarray(surface_arc)
+    s_z   = np.asarray(surface_z)
+
+    def _in_band(xy_arc, xy_z):
+        if crown_band is None:
+            return xy_arc, xy_z
+        lo, hi = float(crown_band[0]), float(crown_band[1])
+        m = (xy_z >= lo) & (xy_z <= hi)
+        return xy_arc[m], xy_z[m]
+
+    s_arc, s_z = _in_band(s_arc, s_z)
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=s_z, y=s_arc, mode='markers', name='surface',
+        marker=dict(size=2, color='lightgray'), hoverinfo='skip'))
+    fig.add_trace(go.Scatter(
+        x=z, y=arc, mode='markers', name='skeleton',
+        marker=dict(size=4, color='red'), customdata=np.arange(len(arc)),
+        hovertemplate="i=%{customdata}<br>arc=%{y:.4f}<br>z=%{x:.4f}<extra></extra>"))
+
+    if changed_idx is not None and len(changed_idx):
+        ci = np.asarray(changed_idx, int)
+        fig.add_trace(go.Scatter(
+            x=z[ci], y=arc[ci], mode='markers', name='changed',
+            marker=dict(size=8, color='deepskyblue', symbol='circle-open',
+                        line=dict(width=2)), customdata=ci,
+            hovertemplate="changed i=%{customdata}<br>arc=%{y:.4f}<br>z=%{x:.4f}<extra></extra>"))
+
+    # overlay flagged quality issues (in-band only) so the user can verify detection
+    n_issues = None
+    if quality_report is not None:
+        def _pts_in_band(xy):
+            xy = np.asarray(xy)
+            if not len(xy):
+                return xy
+            a, zz = _in_band(xy[:, 0], xy[:, 1])
+            return np.column_stack([a, zz])
+        bad_xy   = _pts_in_band(quality_report.get('bad_edge_xy',    np.empty((0, 2))))
+        loop_xy  = _pts_in_band(quality_report.get('loop_points_xy', np.empty((0, 2))))
+        empty_xy = _pts_in_band(quality_report.get('empty_xy',       np.empty((0, 2))))
+        n_issues = len(bad_xy) + len(loop_xy) + len(empty_xy)
+
+        # so the point index i is still readable where a marker covers a skeleton
+        # point, tag each issue marker with its nearest skeleton point's index
+        sk_tree = cKDTree(np.column_stack([arc, z])) if len(arc) else None
+        def _nearest_i(xy):
+            if sk_tree is None or not len(xy):
+                return np.full(len(xy), -1, int)
+            return sk_tree.query(xy)[1].astype(int)   # xy is (K,2) [arc, z]
+
+        if len(bad_xy):
+            fig.add_trace(go.Scatter(
+                x=bad_xy[:, 1], y=bad_xy[:, 0], mode='markers',
+                name=f'bad connection ({len(bad_xy)})',
+                marker=dict(symbol='x', size=7, color='blue', line=dict(width=1)),
+                customdata=_nearest_i(bad_xy),
+                hovertemplate="BAD CONNECTION<br>nearest i=%{customdata}<br>"
+                              "arc=%{y:.4f}<br>z=%{x:.4f}<extra></extra>"))
+        if len(loop_xy):
+            fig.add_trace(go.Scatter(
+                x=loop_xy[:, 1], y=loop_xy[:, 0], mode='markers',
+                name=f'loop ({len(loop_xy)} pts)',
+                marker=dict(symbol='circle-open', size=6, color='magenta', line=dict(width=1)),
+                customdata=_nearest_i(loop_xy),
+                hovertemplate="LOOP<br>i=%{customdata}<br>"
+                              "arc=%{y:.4f}<br>z=%{x:.4f}<extra></extra>"))
+        if len(empty_xy):
+            fig.add_trace(go.Scatter(
+                x=empty_xy[:, 1], y=empty_xy[:, 0], mode='markers',
+                name=f'empty region ({len(empty_xy)})',
+                marker=dict(symbol='square-open', size=8, color='black', line=dict(width=1)),
+                hovertemplate="EMPTY REGION<br>arc=%{y:.4f}<br>z=%{x:.4f}<extra></extra>"))
+
+    ttl = title or f'{crown_label} — 2D skeleton'
+    if n_issues is not None:
+        ttl += '  (clean)' if n_issues == 0 else f'  ({n_issues} issue marker(s))'
+
+    # Size the figure to the data aspect (equal px per unit in z and arc) so the
+    # default view isn't stretched. We avoid scaleanchor (which would disable
+    # scroll zoom); free axes still allow scroll/drag zoom.
+    allz = np.concatenate([z, s_z]) if len(s_z) else z
+    alla = np.concatenate([arc, s_arc]) if len(s_arc) else arc
+    z_rng = float(np.ptp(allz)) or 1.0
+    a_rng = float(np.ptp(alla)) or 1.0
+    scale = 780.0 / max(z_rng, a_rng)
+    fig_w = int(np.clip(z_rng * scale + 130, 380, 1500))
+    fig_h = int(np.clip(a_rng * scale + 120, 380, 1100))
+
+    fig.update_layout(
+        template='plotly_white', width=fig_w, height=fig_h,
+        margin=dict(l=55, r=20, t=60, b=45), title=ttl,
+        xaxis_title='z', yaxis=dict(title='arc'),
+        legend=dict(orientation='h', yanchor='bottom', y=1.01, xanchor='left', x=0))
+    pio.write_html(fig, out_path, auto_open=False, config={'scrollZoom': True})
+    return out_path

@@ -1,0 +1,14 @@
+.gitignore
+CLAUDE.md
+to_do.txt
+presentation.txt
+examples/functions/__pycache__
+
+
+presentations/figures/2crownCrimpedXienceStent
+presentations/figures/16crownCrimpedXienceStent+extremaSupports
+
+data/stent_designs/2crownCrimpedXienceStent.stl
+data/stent_designs/16crownCrimpedXienceStent+extremaSupports.stl
+examples/notebook_outputs/
+presentations
