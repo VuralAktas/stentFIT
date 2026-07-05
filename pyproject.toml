@@ -1,43 +1,30 @@
-[build-system]
-requires = ["setuptools>=64", "wheel"]
-build-backend = "setuptools.build_meta"
-
-[project]
-name = "stentFIT"
+[tool.poetry]
+name = "stentfit"
 version = "0.1.0"
-description = "Semi-automated virtual stent implantation via contact simulation (BeamMe / 4C)."
-readme = "CLAUDE.md"
-license = { text = "MIT" }
-authors = [{ name = "Vural Aktas", email = "vuralaktas6741@gmail.com" }]
-requires-python = ">=3.10"
+description = "Semi-automated virtual stent implantation via contact simulation"
+authors = ["Vural Aktas <vuralaktas6741@gmail.com>"]
+license = "MIT"
+readme = "README.md"
 
-# Runtime dependencies — THE single source of truth for what stentFIT needs.
-# Add a new line here whenever you `import` a new third-party package.
-dependencies = [
-    "numpy",
-    "scipy",
-    "pandas",
-    "matplotlib",
-    "plotly",
-    "trimesh",
-    "scikit-image",
-    "scikit-learn",
-    "networkx",
-    "h5py",
-    "joblib",
-    "beamme",
-    # "requests",
-    # "psimpy",
-    # "coscine",
-]
+[tool.poetry.dependencies]
+python = ">=3.13,<3.14" # capped: networkx has no build for Python 3.14.1
+numpy = ">=2.5.1"
+scipy = ">=1.18.0"
+pandas = ">=3.0.3"
+matplotlib = ">=3.11.0"
+plotly = ">=6.8.0"
+trimesh = ">=4.12.2"
+scikit-image = ">=0.26.0"
+scikit-learn = ">=1.9.0"
+networkx = ">=3.6.1"
+h5py = ">=3.16.0"
+joblib = ">=1.5.3"
+beamme = ">=0.2.0"
 
-[project.optional-dependencies]
-# Notebook / development-only tools. Install with: pip install -e ".[dev]"
+
+[dependency-groups]
 dev = [
-    "ipykernel",
-    "ipython",
-    "jupyter",
+    "ipykernel (>=7.3.0,<8.0.0)",
+    "ipython (>=9.15.0,<10.0.0)",
+    "jupyter (>=1.1.1,<2.0.0)"
 ]
-
-[tool.setuptools.packages.find]
-where = ["src"]
