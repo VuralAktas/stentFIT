@@ -75,7 +75,7 @@ def preprocess_stent(
     pca_mean  = pts.mean(axis=0)
     centered  = pts - pca_mean
     cov       = np.cov(centered.T)
-    eigvals, eigvecs = np.linalg.eig(cov)
+    eigvals, eigvecs = np.linalg.eigh(cov)
     pca_axis  = eigvecs[:, np.argmax(eigvals)]
 
     center_cylinder_radius = np.linalg.norm(centered, axis=1).min() * 0.5
