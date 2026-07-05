@@ -1,20 +1,17 @@
-# Conda environment definition for stentFIT.
+# Conda environment for stentFIT development.
 #
-# Create the environment:   conda env create -f environment.yml
-# Activate it:              conda activate env_stentFIT
-# Update after edits:       conda env update -f environment.yml --prune
-# Remove it:                conda env remove --name env_stentFIT
+# 1. Create the environment:  conda env create -f environment.yml
+# 2. Activate it:             conda activate env_stentfit
+# 3. Install stentFIT + deps: poetry install
 #
-# This file only manages Python + conda-level setup. All package dependencies
-# live in pyproject.toml and are installed via the `-e .` entry below
-# (single source of truth). To switch Python versions later, edit the one
+# This file only sets up Python + pip. All package dependencies live in
+# pyproject.toml / poetry.lock and are installed with `poetry install`
+# (the single source of truth). To change Python versions, edit the one
 # `python=` line and recreate/update the environment.
-name: env_stentFIT
+name: env_stentfit
 channels:
   - conda-forge
   - defaults
 dependencies:
-  - python=3.14
+  - python=3.13
   - pip
-  - pip:
-      - -e .          # installs stentFIT + all deps from pyproject.toml
