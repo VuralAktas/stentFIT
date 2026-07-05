@@ -144,7 +144,6 @@ dmypy.json
 # --- stentFIT project-specific ignores ---
 CLAUDE.md
 to_do.txt
-presentation.txt
 data/stent_designs/2crownCrimpedXienceStent.stl
 data/stent_designs/16crownCrimpedXienceStent+extremaSupports.stl
 examples/notebook_outputs/

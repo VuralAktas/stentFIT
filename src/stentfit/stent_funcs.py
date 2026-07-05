@@ -2,12 +2,18 @@ import numpy as np
 import trimesh
 from trimesh.path.entities import Line
 import matplotlib.pyplot as plt
+from matplotlib.colors import rgb_to_hsv, to_rgb
+from matplotlib.lines import Line2D
 import pandas as pd
 import ast
 import datetime
 import pathlib
 import json
 import time
+import os
+import glob
+import pickle
+import base64
 from collections import deque, Counter
 from sklearn.cluster import DBSCAN
 
@@ -2888,3 +2894,1064 @@ def plot_crown_skeleton_2d_html(arc, z, surface_arc, surface_z, out_path, crown_
         legend=dict(orientation='h', yanchor='bottom', y=1.01, xanchor='left', x=0))
     pio.write_html(fig, out_path, auto_open=False, config={'scrollZoom': True})
     return out_path
+
+
+# =====================================================================================
+# Pipeline step orchestrators (Steps 1-9)
+# -------------------------------------------------------------------------------------
+# One function per notebook step: each takes explicit parameters (no notebook globals),
+# writes the same intermediate files into ``output_dir``, and returns the data the next
+# step needs. The Step-1 notebook wires these together in three thin wrappers.
+# =====================================================================================
+
+
+def sample_stent_points(mesh, stent_name, output_dir, n_points=None,
+                        samples_per_face=1, max_display=500_000,
+                        remove_supports=False, random_seed=0):
+    """Sample the STL surface into a cylindrical-coordinate point cloud (Steps 1-2).
+
+    Auto-decides the sample count from the stent size (small/short stents -> ~1e6,
+    large ones -> ~1e7, scaled from the mesh face count) unless ``n_points`` forces
+    a count. Aligns the PCA axis to [0,0,1] via ``preprocess_stent``, renders an
+    HTML scatter (hover shows point_id) and saves ``sampling_points.csv``. Returns
+    ``{stent_df, stent_features, stent_centerline_direction}``.
+    """
+    pre_stent_info = compute_pre_stent_size_ratio(mesh)
+    pre_size_ratio = pre_stent_info['size_ratio']
+    pre_length     = pre_stent_info['length']
+    target_samples = int(1e6) if (pre_size_ratio < 10 or pre_length < 15) else int(1e7)
+
+    auto_n_samples = len(mesh.faces)            # samples_per_face = 1
+    if auto_n_samples > 10 * target_samples:
+        auto_n_samples = auto_n_samples // 10
+    elif auto_n_samples < target_samples * 0.5 and auto_n_samples > 0.1 * target_samples:
+        auto_n_samples = auto_n_samples * 10
+    elif auto_n_samples < target_samples * 0.1:
+        auto_n_samples = auto_n_samples * 100
+
+    print(f"[preanalysis] size_ratio={pre_size_ratio:.2f}, length={pre_length:.2f} mm "
+          f"-> target_samples={target_samples:,}")
+    print(f"[preanalysis] mesh faces={len(mesh.faces):,} -> auto n_samples={auto_n_samples:,}")
+
+    n_use = auto_n_samples if n_points is None else int(n_points)
+    print(f"[preanalysis] sampling {n_use:,} points "
+          f"({'auto' if n_points is None else 'overridden by n_points'})")
+
+    pre = preprocess_stent(
+        mesh=mesh, n_samples=n_use, samples_per_face=samples_per_face,
+        n_thickness_slices=100, slice_cutoff=5, thickness_calc_plot=False,
+        remove_supports=remove_supports, random_seed=random_seed)
+    stent_df       = pre['stent_df']
+    stent_features = pre['stent_features']
+    centerline_dir = pre['stent_centerline_direction']
+
+    sampling_html = os.path.join(output_dir, 'sampling_points.html')
+    sampling_csv  = os.path.join(output_dir, 'sampling_points.csv')
+    plot_points_3d_html(stent_df, 'point_id', sampling_html,
+                        title=f'{stent_name} sampling', max_display=max_display)
+    print(f"[plot] {sampling_html}  (inspect the sampled point cloud)")
+
+    stent_df[['point_id', 'r', 'theta', 'z_cylindrical', 'x', 'y', 'z']].to_csv(
+        sampling_csv, index=False)
+    print(f"\n[saved] {sampling_csv}  ({len(stent_df):,} points)")
+
+    return {'stent_df': stent_df, 'stent_features': stent_features,
+            'stent_centerline_direction': centerline_dir}
+
+
+def detect_crowns(stent_df, stent_features, stent_name, output_dir, max_display=500_000):
+    """Auto-detect crowns and label every point with a ``crown_id`` (Step 3).
+
+    Runs ``find_crowns`` (no count enforcement), renders the 3D crown assignment
+    (categorical colours) and the interactive dip-detection plot, and saves
+    ``crown_points.csv``. Returns ``{stent_df, crown_edges, conn_radius_3d, n_crowns}``.
+    """
+    strut_thickness = stent_features['strut_thickness']
+
+    crown_dips_html = os.path.join(output_dir, 'crown_dips.html')
+    crown_html      = os.path.join(output_dir, 'crown_assignment.html')
+    crown_csv       = os.path.join(output_dir, 'crown_points.csv')
+
+    crown_res      = find_crowns(stent_df, strut_thickness=strut_thickness)
+    stent_df       = crown_res['stent_df']          # now has 'crown_id'
+    crown_edges    = crown_res['crown_edges']
+    conn_radius_3d = crown_res['conn_radius_3d']
+    n_crowns       = crown_res['n_crowns']
+    print(f"Detected {n_crowns} crowns.")
+
+    plot_crown_dips_html(crown_res, crown_dips_html)
+    plot_points_3d_html(stent_df, 'point_id', crown_html, color_col='crown_id',
+                        title=f'{stent_name} crowns ({n_crowns})', max_display=max_display,
+                        categorical=True)
+    print(f"[plot] {crown_html}")
+    print(f"[plot] {crown_dips_html}")
+
+    stent_df[['point_id', 'r', 'theta', 'z_cylindrical', 'x', 'y', 'z', 'crown_id']].to_csv(
+        crown_csv, index=False)
+    print(f"[saved] {crown_csv}")
+
+    return {'stent_df': stent_df, 'crown_edges': crown_edges,
+            'conn_radius_3d': conn_radius_3d, 'n_crowns': n_crowns}
+
+
+def _downsample_surface_pair(a, b, n=40000, seed=0):
+    """Downsample paired arrays to ``n`` points (display only)."""
+    a = np.asarray(a); b = np.asarray(b)
+    if len(a) <= n:
+        return a, b
+    idx = np.random.default_rng(seed).choice(len(a), n, replace=False)
+    return a[idx], b[idx]
+
+
+def skeletonize_crowns_2d(stent_df, stent_features, crown_edges, conn_radius_3d,
+                          output_dir, auto_tune=True, pixels_per_strut=10, dilate_px=3,
+                          pad_fraction=0.20, tune_time_limit=120, quality_gamma=2.0,
+                          seam_tol_frac=0.01, crown_halo_frac=0.4):
+    """Skeletonise each crown in 2D and store the results in a CROWN_2D dict (Step 5).
+
+    Segments the whole stent once (each crown -> 3 z-pieces) for the region map +
+    ``region_allowed`` adjacency, then per crown (with a ``crown_halo_frac`` z-halo):
+    unroll -> (auto-tune or fixed) skeletonise -> trim to the crown band. Detected
+    bad connections are auto-cleaned (whole-bridge removal) and the skeleton
+    re-checked so per-crown plots flag only what the detector MISSED. Writes
+    ``skeleton_plots/crown_XX.html`` / ``crown_XX_convergence.html`` / ``crown_XX_2d.csv``.
+    Returns ``{crown_2d, crown_order}``.
+    """
+    r_mid           = stent_features['r_mid']
+    strut_thickness = stent_features['strut_thickness']
+
+    plots_dir = os.path.join(output_dir, 'skeleton_plots')
+    os.makedirs(plots_dir, exist_ok=True)
+
+    # --- single segmentation for the whole stent (each crown -> 3 pieces) ---
+    segmented      = segment_stent(stent_df, strut_thickness, conn_radius_3d,
+                                   n_sub_per_crown=3)
+    seg_df_full    = segmented['stent_df']          # whole stent, now has 'region'
+    region_allowed = segmented['region_allowed']    # global region adjacency
+
+    crown_order = (seg_df_full.groupby('crown_id')['z_cylindrical'].mean()
+                              .sort_values().index.tolist())
+    use_halo = crown_edges is not None and len(crown_edges) >= 2
+    z_all    = seg_df_full['z_cylindrical'].values
+
+    crown_2d = {}          # crown_label -> per-crown 2D skeleton record
+    print(f"Skeletonising {len(crown_order)} crowns "
+          f"({'auto-tune' if auto_tune else 'fixed params'})...")
+
+    for ci, c in enumerate(crown_order):
+        label = f"crown_{int(c):02d}"
+        own_z = seg_df_full.loc[seg_df_full['crown_id'] == c, 'z_cylindrical']
+        if use_halo:
+            k = int(np.clip(np.digitize(own_z.mean(), crown_edges) - 1,
+                            0, len(crown_edges) - 2))
+            z_lo, z_hi = float(crown_edges[k]), float(crown_edges[k + 1])
+            halo    = crown_halo_frac * (z_hi - z_lo)
+            seg_sub = seg_df_full[(z_all >= z_lo - halo) & (z_all <= z_hi + halo)].copy()
+        else:
+            z_lo, z_hi = float(own_z.min()), float(own_z.max())
+            seg_sub    = seg_df_full[seg_df_full['crown_id'] == c].copy()
+
+        opened = open_stent_to_plane(seg_sub, r_mid, pad_fraction)
+        arc_flat, z_flat = opened['arc_flat'], opened['z_flat']
+
+        print(f"\n===== {label} ({ci + 1}/{len(crown_order)}) — "
+              f"{len(seg_sub):,} pts, band z=[{z_lo:.4f}, {z_hi:.4f}] =====")
+
+        if auto_tune:
+            tuned   = tune_skeleton_params(
+                arc=arc_flat, z=z_flat, stent_df=seg_sub, stent_features=stent_features,
+                region_allowed=region_allowed, pps0=pixels_per_strut, dil0=dilate_px,
+                pad_fraction=pad_fraction, seam_tol_frac=seam_tol_frac,
+                time_limit=tune_time_limit, quality_gamma=quality_gamma,
+                plot=False, verbose=True)
+            sk_2d          = tuned['skeleton_2d']
+            history        = tuned['history']
+            quality_report = tuned['quality_report']
+            diag_pps, diag_dil = tuned['best_pps'], tuned['best_dilate_px']
+        else:
+            sk_2d = compute_skeleton_2d(
+                arc_flat=arc_flat, z_flat=z_flat, arc_min_flat=opened['arc_min_flat'],
+                arc_max_flat=opened['arc_max_flat'], circumference=opened['circumference'],
+                stent_df=seg_sub, stent_geometry=stent_features,
+                pixels_per_strut=pixels_per_strut, dilate_px=dilate_px,
+                pad_fraction=pad_fraction, plot=False, seam_tol_frac=seam_tol_frac)
+            history = None
+            quality_report = check_skeleton_quality(
+                df_skeleton_2d=sk_2d['df_skeleton_2d'], pixel_size=sk_2d['pixel_size'],
+                stent_df=seg_sub, r_mid=r_mid, region_allowed=region_allowed,
+                strut_thickness=strut_thickness, verbose=True)
+            diag_pps, diag_dil = pixels_per_strut, dilate_px
+
+        # trim the final skeleton to the crown's own z-band (drop the halo)
+        skel_df2d = sk_2d['df_skeleton_2d']
+        arc_all   = skel_df2d['arc'].to_numpy()
+        z_2d_all  = skel_df2d['z'].to_numpy()
+        z_tol = 0.01 * strut_thickness
+        tmask = (z_2d_all >= z_lo - z_tol) & (z_2d_all <= z_hi + z_tol)
+        arc_c = arc_all[tmask]
+        z_c   = z_2d_all[tmask]
+
+        # auto-clean the DETECTED bad connections (whole-bridge removal, same as the
+        # manual fix), then re-check so the plot flags only errors the detector missed.
+        bad_xy = np.asarray(quality_report.get('bad_edge_xy', np.empty((0, 2)))).reshape(-1, 2)
+        bad_in = bad_xy[(bad_xy[:, 1] >= z_lo) & (bad_xy[:, 1] <= z_hi)] if len(bad_xy) else bad_xy
+        if len(bad_in):
+            arc_c, z_c, n_auto = auto_clean_bad_connections_2d(
+                arc_c, z_c, sk_2d['pixel_size'], bad_in, verbose=True)
+            if n_auto:
+                quality_report = check_skeleton_quality(
+                    df_skeleton_2d=pd.DataFrame({'arc': arc_c, 'z': z_c}),
+                    pixel_size=sk_2d['pixel_size'], stent_df=seg_sub, r_mid=r_mid,
+                    region_allowed=region_allowed, strut_thickness=strut_thickness,
+                    verbose=False)
+
+        # store this crown's 2D skeleton (editable in Step 5.5)
+        surf_arc_ds, surf_z_ds = _downsample_surface_pair(arc_flat, z_flat)
+        crown_2d[label] = {
+            'crown_id'  : c,
+            'arc'       : arc_c.copy(),
+            'z'         : z_c.copy(),
+            'pixel_size': sk_2d['pixel_size'],
+            'z_lo'      : z_lo,
+            'z_hi'      : z_hi,
+            'surf_arc'  : surf_arc_ds,
+            'surf_z'    : surf_z_ds,
+            'n_edits'   : 0,
+        }
+
+        # (1) the 2D skeleton alone (single panel, zoomable, remaining issues flagged)
+        skel_html = os.path.join(plots_dir, f'{label}.html')
+        plot_crown_skeleton_2d_html(
+            arc_c, z_c, surf_arc_ds, surf_z_ds, skel_html, label,
+            crown_band=(z_lo, z_hi), quality_report=quality_report)
+        # (2) the tuning convergence / issue-summary, in a separate file
+        conv_html = os.path.join(plots_dir, f'{label}_convergence.html')
+        plot_crown_convergence_html(history, conv_html, c, quality_report=quality_report,
+                                    pps=diag_pps, dil_px=diag_dil)
+        # (3) a plain 2D CSV (i, arc, z) for the record
+        pd.DataFrame({'i': np.arange(len(arc_c)), 'arc': arc_c, 'z': z_c}).to_csv(
+            os.path.join(plots_dir, f'{label}_2d.csv'), index=False)
+        print(f"  {label}: {len(arc_c):,} skeleton pts  ->  {skel_html}")
+
+    n_total = sum(len(v['arc']) for v in crown_2d.values())
+    print(f"\nStored {len(crown_2d)} crowns ({n_total:,} 2D skeleton points) in CROWN_2D.")
+    print(f"Per-crown plots (crown_XX.html + _convergence.html) + CSVs saved in {plots_dir}")
+    print("Detected bad connections were auto-cleaned; review each crown_XX.html for any "
+          "remaining errors and fix them by hand in the manual-edit step.")
+
+    return {'crown_2d': crown_2d, 'crown_order': crown_order}
+
+
+def save_crown_2d_checkpoint(crown_2d, stent_features, stent_centerline_direction,
+                             r_mid, strut_thickness, circumference, crown_edges,
+                             output_dir, verbose=True):
+    """Pickle the per-crown 2D skeletons + scalars to ``crown_2d.pkl`` (Step 5.4).
+
+    Lets the manual-edit step resume after a kernel restart without re-running the
+    Step-5 auto-tune. The surface cloud is reused from ``crown_points.csv``.
+    Returns the checkpoint path.
+    """
+    crown2d_pkl = os.path.join(output_dir, 'crown_2d.pkl')
+    with open(crown2d_pkl, 'wb') as f:
+        pickle.dump({
+            'CROWN_2D'                  : crown_2d,
+            'stent_features'            : stent_features,
+            'stent_centerline_direction': np.asarray(stent_centerline_direction),
+            'r_mid'                     : float(r_mid),
+            'strut_thickness'           : float(strut_thickness),
+            'circumference'             : float(circumference),
+            'crown_edges'               : crown_edges,
+        }, f)
+    if verbose:
+        print(f"[checkpoint] saved {len(crown_2d)} per-crown 2D skeletons -> {crown2d_pkl}")
+    return crown2d_pkl
+
+
+def load_crown_2d_checkpoint(output_dir):
+    """Reload the ``crown_2d.pkl`` checkpoint + point cloud after a kernel restart.
+
+    Restores the per-crown 2D skeletons and the scalars the manual-edit / wrap
+    steps rely on, and reads the surface cloud from ``crown_points.csv``. Returns a
+    state dict (``crown_2d``, ``stent_features``, ``stent_centerline_direction``,
+    ``r_mid``, ``strut_thickness``, ``circumference``, ``crown_edges``, ``stent_df``).
+    """
+    crown2d_pkl = os.path.join(output_dir, 'crown_2d.pkl')
+    crown_csv   = os.path.join(output_dir, 'crown_points.csv')
+    for p in (crown2d_pkl, crown_csv):
+        if not os.path.exists(p):
+            raise FileNotFoundError(
+                f"missing {p} - run Steps 1-5.4 first (per-crown checkpoint not found).")
+
+    with open(crown2d_pkl, 'rb') as f:
+        ck = pickle.load(f)
+
+    os.makedirs(os.path.join(output_dir, 'skeleton_plots'), exist_ok=True)
+    print(f"[resume] loading point cloud from {crown_csv} ...")
+    stent_df = pd.read_csv(crown_csv)
+
+    state = {
+        'crown_2d'                  : ck['CROWN_2D'],
+        'stent_features'            : ck['stent_features'],
+        'stent_centerline_direction': np.asarray(ck['stent_centerline_direction']),
+        'r_mid'                     : float(ck['r_mid']),
+        'strut_thickness'           : float(ck['strut_thickness']),
+        'circumference'             : float(ck['circumference']),
+        'crown_edges'               : ck.get('crown_edges'),
+        'stent_df'                  : stent_df,
+    }
+    print(f"[resume] restored {len(state['crown_2d'])} per-crown 2D skeletons + "
+          f"{len(stent_df):,} surface points. Ready for the manual-edit step.")
+    return state
+
+
+def _parse_two_ids(s):
+    """Parse a 'a, b' / 'a b' string into exactly two int point indices."""
+    vals = [int(x) for x in (s or '').replace(',', ' ').split()]
+    if len(vals) != 2:
+        raise ValueError("please give exactly two point indices, e.g. '12, 40'")
+    return vals[0], vals[1]
+
+
+def _render_crown_2d(crown_2d, label, plots_dir, changed_idx=None, suffix=None):
+    """Render one crown's current 2D skeleton to ``crown_XX[_edited_N].html``."""
+    rec  = crown_2d[label]
+    name = f"{label}_edited_{rec['n_edits']}" if suffix == 'edited' else label
+    out  = os.path.join(plots_dir, f"{name}.html")
+    plot_crown_skeleton_2d_html(
+        rec['arc'], rec['z'], rec['surf_arc'], rec['surf_z'], out, label,
+        crown_band=(rec['z_lo'], rec['z_hi']), changed_idx=changed_idx,
+        title=f"{name} — 2D skeleton")
+    return out
+
+
+def edit_crowns_2d_interactive(crown_2d, stent_features, stent_centerline_direction,
+                               r_mid, strut_thickness, circumference, crown_edges,
+                               output_dir):
+    """Interactively fix per-crown 2D skeleton defects by naming two anchors (Step 5.5).
+
+    Prompts for a crown and a problem type: 'loop' collapses a bubble into a single
+    straight path (``fix_crown_loop_2d``); 'connection' deletes a whole wrong bridge
+    up to its bounding junctions (``fix_crown_connection_2d``). Each edit is previewed
+    as ``crown_XX_edited_N.html`` and kept only if confirmed (kept edits re-save
+    ``crown_2d.pkl`` so a restart reloads the edited crowns). Mutates and returns
+    ``crown_2d``.
+    """
+    plots_dir = os.path.join(output_dir, 'skeleton_plots')
+    os.makedirs(plots_dir, exist_ok=True)
+
+    if input("Do you want to manually edit any crown? [y/n] ").strip().lower() == 'y':
+        while True:
+            ans = input("\nWhich crown would you like to change? "
+                        "(e.g. crown_01, crown_02, ...; empty = done) ").strip()
+            if not ans:
+                break
+            try:
+                label = ans if ans.startswith('crown_') else f"crown_{int(ans):02d}"
+            except ValueError:
+                print(f"  '{ans}' is not a valid crown name. "
+                      f"Available: {', '.join(crown_2d)}")
+                continue
+            if label not in crown_2d:
+                print(f"  '{label}' not found. Available: {', '.join(crown_2d)}")
+                continue
+
+            rec  = crown_2d[label]
+            prob = input("What is the problem in the skeleton? (loop / connection) ").strip().lower()
+
+            if prob.startswith('loop'):
+                print("  -> I'll remove the loop (bubble) and join the two points you give "
+                      "with a single evenly-spaced straight line. Everything else stays.")
+                a, b = _parse_two_ids(input("  Two point indices at the loop ends (e.g. 12, 40): "))
+                new_arc, new_z, changed = fix_crown_loop_2d(rec['arc'], rec['z'],
+                                                            rec['pixel_size'], a, b)
+            elif prob.startswith('conn'):
+                print("  -> I'll remove the WHOLE wrong bridge (extending up to where it "
+                      "meets the struts) to open a clean gap. Everything else stays.")
+                a, b = _parse_two_ids(input("  Two point indices ON the wrong bridge itself, "
+                                            "e.g. its two ends (e.g. 12, 40): "))
+                new_arc, new_z, changed = fix_crown_connection_2d(rec['arc'], rec['z'],
+                                                                  rec['pixel_size'], a, b)
+            else:
+                print("  Unknown problem — choose 'loop' or 'connection'.")
+                continue
+
+            if len(new_arc) == len(rec['arc']):
+                print("  No change made (see the note above). Re-check the point indices.")
+                continue
+
+            # keep a backup so the edit can be undone, then tentatively apply + render
+            prev_arc, prev_z, prev_n = rec['arc'].copy(), rec['z'].copy(), rec['n_edits']
+            rec['arc'], rec['z'] = new_arc, new_z
+            rec['n_edits'] += 1
+            out = _render_crown_2d(crown_2d, label, plots_dir, changed_idx=changed,
+                                   suffix='edited')
+            print(f"  preview saved as {label}_edited_{rec['n_edits']} -> {out}")
+
+            if input("  Are you happy with this edit? (y/n) ").strip().lower().startswith('y'):
+                save_crown_2d_checkpoint(crown_2d, stent_features, stent_centerline_direction,
+                                         r_mid, strut_thickness, circumference, crown_edges,
+                                         output_dir, verbose=False)
+                print(f"  kept edit {rec['n_edits']} on {label}. (crown_2d.pkl updated)")
+            else:
+                rec['arc'], rec['z'], rec['n_edits'] = prev_arc, prev_z, prev_n
+                try:
+                    os.remove(out)
+                except OSError:
+                    pass
+                print(f"  reverted — {label} restored to its previous state. You can try again.")
+
+    return crown_2d
+
+
+def assemble_2d_skeleton(crown_2d):
+    """Concatenate the (edited) per-crown 2D skeletons into one flat skeleton.
+
+    Orders crowns by ``crown_id`` and stacks their ``arc`` / ``z`` / per-point
+    ``pixel_size``. Returns ``{skel_arc, skel_z, skel_px, pixel_size}`` (the last a
+    median pixel size across crowns), ready for the 3D wrap.
+    """
+    order    = sorted(crown_2d, key=lambda L: crown_2d[L]['crown_id'])
+    skel_arc = np.concatenate([crown_2d[L]['arc'] for L in order])
+    skel_z   = np.concatenate([crown_2d[L]['z']   for L in order])
+    skel_px  = np.concatenate([np.full(len(crown_2d[L]['arc']), crown_2d[L]['pixel_size'])
+                               for L in order])
+    pixel_size = float(np.median([crown_2d[L]['pixel_size'] for L in order]))
+    print(f"\nAssembled 2D skeleton: {len(skel_arc):,} points "
+          f"| pixel_size median = {pixel_size:.5f}")
+    return {'skel_arc': skel_arc, 'skel_z': skel_z, 'skel_px': skel_px,
+            'pixel_size': pixel_size}
+
+
+def wrap_skeleton_to_3d(skel_arc, skel_z, skel_px, pixel_size, surf_df, r_mid,
+                        circumference, strut_thickness, output_dir, stent_name,
+                        wrap_max_surf=None, seam_tol_frac=0.01, seam_z_tol_frac=3.0,
+                        prune_tip_frac=0, max_display=500_000, random_seed=0):
+    """Wrap the 2D skeleton onto the local mid-surface and run graph cleanup (Step 6).
+
+    Lifts each 2D point to 3D via a per-point local mid-surface radius, classifies
+    node degree, then folds the seam, contracts junction clusters, prunes short
+    spurs and collapses tiny loops. On a huge cloud a downsampled throwaway copy is
+    used for the radius estimate only (``wrap_max_surf``). Saves
+    ``skeleton_points.csv`` + ``skeleton_only.html`` and returns the final SKELETON_DF.
+    """
+    if wrap_max_surf is not None and len(surf_df) > wrap_max_surf:
+        wrap_surf = surf_df.sample(wrap_max_surf, random_state=random_seed)
+        print(f"[wrap] downsampled surface for the wrap: {len(surf_df):,} -> "
+              f"{len(wrap_surf):,} pts (wrap_max_surf)")
+    else:
+        wrap_surf = surf_df
+
+    skel3d = adjust_skeleton_to_local_midsurface(
+        skel_arc, skel_z, wrap_surf, r_mid, circumference, search_radius=strut_thickness)
+
+    df = analyze_skeleton_connectivity(skel3d['df_skeleton_3d'], skel_px)
+    df = merge_seam_duplicates(df, r_mid, strut_thickness,
+                               seam_band_frac=seam_tol_frac, z_tol_frac=seam_z_tol_frac)
+    df = collapse_junction_clusters(df)
+    df = prune_skeleton_spurs(df, pixel_size, tip_frac=prune_tip_frac)
+    df = collapse_tiny_loops(df, strut_thickness)
+
+    skeleton_df = df[['skeleton_point_id', 'x', 'y', 'z', 'r', 'theta',
+                      'node_type', 'degree', 'neighbor_ids']].copy()
+
+    skeleton_only_html = os.path.join(output_dir, 'skeleton_only.html')
+    skeleton_csv       = os.path.join(output_dir, 'skeleton_points.csv')
+    skeleton_df.to_csv(skeleton_csv, index=False)
+    plot_skeleton_html(skeleton_df, skeleton_only_html,
+                       title=f'{stent_name} skeleton', max_display=max_display)
+
+    print(f"\nSkeleton finalised: {len(skeleton_df):,} points "
+          f"({(skeleton_df['node_type'] == 'junction').sum()} junctions, "
+          f"{(skeleton_df['degree'] == 1).sum()} endpoints)")
+    print(f"[saved] {skeleton_csv}")
+    print(f"[saved] {skeleton_only_html}  (inspect the final 3D skeleton)")
+    return skeleton_df
+
+
+def group_skeleton_curves(skeleton_points_df):
+    """Split the skeleton into curves (degree-2 chains bounded by junctions /
+    endpoints, or closed degree-2 loops). Returns lists of skeleton_point_ids."""
+    dfc = skeleton_points_df.reset_index(drop=True)
+    adj = {}
+    for _, row in dfc.iterrows():
+        nbrs = row['neighbor_ids']
+        if isinstance(nbrs, str):
+            nbrs = ast.literal_eval(nbrs)
+        adj[int(row['skeleton_point_id'])] = list(int(n) for n in nbrs)
+
+    degree   = {pid: len(nbrs) for pid, nbrs in adj.items()}
+    specials = {pid for pid, d in degree.items() if d != 2}
+    curves, visited_edges = [], set()
+
+    def walk(start, nxt):
+        path = [start, nxt]
+        visited_edges.add(frozenset((start, nxt)))
+        prev, cur = start, nxt
+        while cur not in specials:
+            others = [n for n in adj[cur] if n != prev]
+            if not others:
+                break
+            nb = others[0]
+            visited_edges.add(frozenset((cur, nb)))
+            path.append(nb)
+            prev, cur = cur, nb
+            if cur == start:
+                break
+        return path
+
+    for s in specials:
+        for nb in adj[s]:
+            if frozenset((s, nb)) not in visited_edges:
+                curves.append(walk(s, nb))
+    for pid in adj:
+        for nb in adj[pid]:
+            if frozenset((pid, nb)) not in visited_edges:
+                curves.append(walk(pid, nb))
+    return curves
+
+
+def fit_curve_spline(point_ids, coords, every, k, s):
+    """Fit a B-spline through every Nth point of a curve; fall back to the raw
+    control polyline (tck=None) if the fit fails."""
+    pts  = coords.loc[point_ids].to_numpy()
+    keep = np.r_[True, np.any(np.diff(pts, axis=0) != 0, axis=1)]
+    pts  = pts[keep]
+    if len(pts) < 2:
+        return None
+    is_loop = (point_ids[0] == point_ids[-1]) and len(pts) > 3
+    every   = max(1, min(every, (len(pts) - 1) // max(k, 1)))
+    idx     = np.unique(np.r_[np.arange(0, len(pts), every), len(pts) - 1])
+    ctrl    = pts[idx]
+    if is_loop:
+        if np.allclose(ctrl[0], ctrl[-1]):
+            ctrl = ctrl[:-1]
+        if len(ctrl) < 4:
+            is_loop = False
+    seg_len = float(np.linalg.norm(np.diff(pts, axis=0), axis=1).sum())
+    kk = min(k, len(ctrl) - 1)
+    if kk >= 1:
+        try:
+            (tck, u) = splprep([ctrl[:, 0], ctrl[:, 1], ctrl[:, 2]],
+                               s=s, k=kk, per=int(is_loop))
+            return {'tck': tck, 'u': u, 'ctrl': ctrl, 'n_ctrl': len(ctrl),
+                    'k': kk, 'is_loop': is_loop, 'length': seg_len}
+        except Exception:
+            pass
+    return {'tck': None, 'u': None, 'ctrl': ctrl, 'n_ctrl': len(ctrl),
+            'k': 0, 'is_loop': False, 'length': seg_len}
+
+
+def _spline_record(spl):
+    """Neutral (degree, knot_vector, control_points) record for one curve, ready
+    to rebuild as splinepy.BSpline. tck=None -> degree-1 control polyline."""
+    if spl is None:
+        return None
+    if spl['tck'] is not None:
+        t, c, k = spl['tck']
+        ctrl = np.asarray(c).T                       # (n_ctrl, 3) xyz
+        return {'degree': int(k),
+                'knot_vector': [float(v) for v in t],
+                'control_points': ctrl.tolist(),
+                'is_loop': bool(spl['is_loop']),
+                'length': float(spl['length'])}
+    ctrl = np.asarray(spl['ctrl'])
+    return {'degree': 1, 'knot_vector': None,        # polyline fallback
+            'control_points': ctrl.tolist(),
+            'is_loop': False, 'length': float(spl['length'])}
+
+
+def fit_skeleton_splines(skeleton_df, output_dir, spline_every=10, spline_degree=3,
+                         smooth=0.0):
+    """Group the skeleton graph into curves and fit a B-spline per curve (Step 7).
+
+    Renders the smooth curves to ``splines.html`` and exports ``skeleton_splines.json``
+    (per-curve degree / knot_vector / control_points), which rebuilds directly as a
+    ``splinepy.BSpline`` for BeamMe. Returns ``{curves, splines}``.
+    """
+    coords  = skeleton_df.set_index('skeleton_point_id')[['x', 'y', 'z']]
+    curves  = group_skeleton_curves(skeleton_df)
+    splines = [fit_curve_spline(c, coords, spline_every, spline_degree, smooth)
+               for c in curves]
+    print(f"Grouped {len(curves)} curves; fitted "
+          f"{sum(s is not None for s in splines)} splines.")
+
+    splines_html = os.path.join(output_dir, 'splines.html')
+    plot_splines_html(splines, splines_html)
+
+    splines_json = os.path.join(output_dir, 'skeleton_splines.json')
+    with open(splines_json, 'w') as f:
+        json.dump({
+            'n_curves': len(splines),
+            'note': ('Per-curve B-splines. Rebuild each as '
+                     'splinepy.BSpline(degrees=[degree], knot_vectors=[knot_vector], '
+                     'control_points=control_points) then pass to BeamMe '
+                     'create_beam_mesh_from_splinepy (or create_beam_mesh_parametric_curve '
+                     'via the spline evaluator). control_points are (n_ctrl, 3) xyz in mm. '
+                     'knot_vector=null marks a degree-1 polyline fallback.'),
+            'curves': [_spline_record(s) for s in splines],
+        }, f, indent=2)
+
+    print(f"[saved] {splines_html}")
+    print(f"[saved] {splines_json}  ({len(splines)} curves)")
+    return {'curves': curves, 'splines': splines}
+
+
+def save_stent_features_and_views(skeleton_df, stent_df, stent_features,
+                                  stent_centerline_direction, crown_edges, output_dir,
+                                  stent_name, max_display=500_000):
+    """Write the skeleton+cloud overlay and the final ``stent_features.json`` (Step 8).
+
+    Renders ``skeleton_with_cloud.html`` (sparse cloud underlay) and folds the
+    centreline direction + crown boundaries into ``stent_features.json``. Crown
+    boundaries prefer the detected ``crown_edges``, else are derived from the
+    per-point ``crown_id`` groups. Returns ``{features_path, crown_boundaries}``.
+    """
+    # Keep the cloud underlay sparse so the skeleton stays easy to see.
+    cloud_display = int(max_display / 5)
+
+    skeleton_cloud_html = os.path.join(output_dir, 'skeleton_with_cloud.html')
+    plot_skeleton_with_cloud_html(skeleton_df, stent_df, skeleton_cloud_html,
+                                  max_cloud=cloud_display)
+
+    # crown boundaries (z): prefer detected crown_edges; else derive from crown_id groups.
+    if crown_edges is not None and len(np.asarray(crown_edges).ravel()) >= 2:
+        crown_boundaries = np.asarray(crown_edges, float).ravel()
+    elif 'crown_id' in stent_df.columns:
+        _g = (stent_df.groupby('crown_id')['z'].agg(['min', 'max', 'mean'])
+                      .sort_values('mean'))
+        _lo, _hi = _g['min'].to_numpy(), _g['max'].to_numpy()
+        crown_boundaries = np.concatenate([[_lo[0]], 0.5 * (_hi[:-1] + _lo[1:]), [_hi[-1]]])
+    else:
+        crown_boundaries = None
+
+    features_path = os.path.join(output_dir, 'stent_features.json')
+    features_out = {k: (float(v) if isinstance(v, (np.floating, np.integer)) else v)
+                    for k, v in stent_features.items()}
+    features_out['stent_centerline_direction'] = [
+        float(v) for v in np.asarray(stent_centerline_direction).ravel()]
+    features_out['crown_boundaries'] = (None if crown_boundaries is None
+                                        else [float(e) for e in crown_boundaries])
+    with open(features_path, 'w') as f:
+        json.dump(features_out, f, indent=2)
+
+    skeleton_csv = os.path.join(output_dir, 'skeleton_points.csv')
+    splines_html = os.path.join(output_dir, 'splines.html')
+    splines_json = os.path.join(output_dir, 'skeleton_splines.json')
+    print("[saved] final outputs:")
+    for p in (skeleton_csv, splines_html, splines_json, skeleton_cloud_html,
+              features_path):
+        print(f"   {p}")
+    print(f"   crown_boundaries: "
+          f"{0 if crown_boundaries is None else len(crown_boundaries)} values "
+          f"folded into stent_features.json")
+    print(f"\nThe results of the skeletonization and spline fitting have been saved "
+          f"in {output_dir}. Please check the results. The stent 1D wireframe is now "
+          f"ready for the simulation.")
+    return {'features_path': features_path, 'crown_boundaries': crown_boundaries}
+
+
+def _to_arc_z(x, y, z, r_mid):
+    """3D (x, y, z) -> unrolled (z_axial, arc) with arc = r_mid * atan2(y, x)."""
+    return np.asarray(z, float), r_mid * np.arctan2(np.asarray(y, float),
+                                                    np.asarray(x, float))
+
+
+def _break_seam(z_ax, arc, thresh):
+    """Insert NaNs where arc jumps across the theta seam so the polyline does not
+    draw a spurious wrap-around segment across the plot."""
+    z_ax = np.asarray(z_ax, float).copy()
+    arc  = np.asarray(arc, float).copy()
+    for j in np.where(np.abs(np.diff(arc)) > thresh)[0][::-1]:
+        z_ax = np.insert(z_ax, j + 1, np.nan)
+        arc  = np.insert(arc,  j + 1, np.nan)
+    return z_ax, arc
+
+
+def _plotly_decode(o):
+    """Decode a Plotly typed-array ({'bdata','dtype'[, 'shape']}) or a plain list."""
+    if isinstance(o, dict) and 'bdata' in o:
+        dt = {'f8': '<f8', 'f4': '<f4', 'i1': 'i1', 'i2': '<i2', 'i4': '<i4',
+              'u1': 'u1', 'u4': '<u4'}[o['dtype']]
+        a = np.frombuffer(base64.b64decode(o['bdata']), dtype=dt)
+        if 'shape' in o:
+            a = a.reshape(tuple(int(s) for s in str(o['shape']).split(',')))
+        return a
+    return np.asarray(o)
+
+
+def _load_convergence(path):
+    """Pull trace data from a saved crown_XX_convergence.html.
+    Returns one of:
+      {'kind':'convergence', 'total':(x,y), 'defect':(x,y), 'quality':(x,y)}
+      {'kind':'quality_bar', 'x':labels, 'y':counts, 'colors':colors}
+    or None on failure."""
+    try:
+        html = open(path, encoding='utf-8').read()
+        i = html.rfind('Plotly.newPlot(')
+        j = html.find('[', i)
+        depth, k, instr, esc = 0, j, False, False        # bracket scan, string-aware
+        while k < len(html):
+            ch = html[k]
+            if instr:
+                if esc:            esc = False
+                elif ch == '\\':   esc = True
+                elif ch == '"':    instr = False
+            elif ch == '"':        instr = True
+            elif ch == '[':        depth += 1
+            elif ch == ']':
+                depth -= 1
+                if depth == 0:
+                    break
+            k += 1
+        data = json.loads(html[j:k + 1])
+        # --- auto-tune ON: scatter traces named total / defect / quality ---
+        out = {}
+        for tr in data:
+            nm = tr.get('name')
+            if nm in ('total', 'defect', 'quality') and 'x' in tr and 'y' in tr:
+                out[nm] = (_plotly_decode(tr['x']).astype(float),
+                           _plotly_decode(tr['y']).astype(float))
+        if out:
+            out['kind'] = 'convergence'
+            return out
+        # --- auto-tune OFF: single bar trace (quality summary) ---
+        for tr in data:
+            if tr.get('type') == 'bar' and 'x' in tr and 'y' in tr:
+                return {'kind': 'quality_bar',
+                        'x':      list(_plotly_decode(tr['x'])),
+                        'y':      _plotly_decode(tr['y']).astype(float),
+                        'colors': tr.get('marker', {}).get('color', ['steelblue'])}
+        return None
+    except Exception as e:
+        print(f"  [tuning] could not read {os.path.basename(path)}: {e}")
+        return None
+
+
+def _hue_gap(a, b):
+    d = abs(a - b) % 1.0
+    return min(d, 1.0 - d)
+
+
+def _band_conv(k, crown_order, n_bands, conv_files, conv_dir):
+    """Map unrolled band k to its crown_XX_convergence.html path + crown id."""
+    if crown_order is not None and len(crown_order) == n_bands:
+        cid = int(crown_order[k])
+        return os.path.join(conv_dir, f'crown_{cid:02d}_convergence.html'), cid
+    if k < len(conv_files):
+        base = os.path.basename(conv_files[k])
+        cid  = int(base.split('_')[1])
+        return conv_files[k], cid
+    return None, None
+
+
+def plot_skeleton_splines_2d(skeleton_curves, skeleton_splines, stent_df, r_mid,
+                             circumference, crown_edges, crown_order, output_dir,
+                             stent_name):
+    """Render the unrolled 2D skeleton with a per-crown tuning strip (Steps 9-10).
+
+    Draws every fitted spline on an unrolled (z, arc) plane (touching curves given
+    different hues), overlays the point cloud + crown boundaries, and puts each
+    crown's tuning-convergence curves (read back from its convergence HTML) above
+    its band. Saves ``skeleton_splines_2d.png`` and a self-contained
+    ``skeleton_splines_2d.html``.
+    """
+    # --- varied colours, touching curves differ in HUE (rotating greedy colouring) ---
+    palette = []
+    for _nm in ('tab20', 'tab20b', 'tab20c'):
+        _cm = plt.get_cmap(_nm)
+        palette.extend(_cm(i) for i in range(_cm.N))
+    n_pal   = len(palette)
+    pal_hue = np.array([rgb_to_hsv(to_rgb(c))[0] for c in palette])
+    HUE_TOL = 0.06                                 # min circular hue gap to neighbours
+
+    pt2curves = {}
+    for ci, cpts in enumerate(skeleton_curves):
+        for p in cpts:
+            pt2curves.setdefault(int(p), []).append(ci)
+    curve_adj = {ci: set() for ci in range(len(skeleton_curves))}
+    for shared in pt2curves.values():
+        for a in shared:
+            for b in shared:
+                if a != b:
+                    curve_adj[a].add(b)
+
+    curve_color_idx = {}
+    ptr = 0
+    for ci in range(len(skeleton_curves)):
+        nbr_idx  = [curve_color_idx[n] for n in curve_adj[ci] if n in curve_color_idx]
+        nbr_hues = [pal_hue[j] for j in nbr_idx]
+        chosen   = None
+        for step in range(n_pal):
+            cand = (ptr + step) % n_pal
+            if cand in nbr_idx:
+                continue
+            if all(_hue_gap(pal_hue[cand], h) >= HUE_TOL for h in nbr_hues):
+                chosen = cand
+                break
+        if chosen is None:
+            for step in range(n_pal):
+                cand = (ptr + step) % n_pal
+                if cand not in nbr_idx:
+                    chosen = cand
+                    break
+        curve_color_idx[ci] = chosen
+        ptr = (chosen + 1) % n_pal
+
+    # --- crown boundaries (z) for the vertical dashed lines ---------------------------
+    features_path = os.path.join(output_dir, 'stent_features.json')
+    crown_lines   = None
+    if os.path.exists(features_path):
+        with open(features_path) as f:
+            cb = json.load(f).get('crown_boundaries')
+        if cb is not None:
+            crown_lines = np.asarray(cb, float).ravel()
+    if crown_lines is None and crown_edges is not None \
+            and len(np.asarray(crown_edges).ravel()) >= 2:
+        crown_lines = np.asarray(crown_edges, float).ravel()
+    if crown_lines is None and 'crown_id' in stent_df.columns:
+        g   = (stent_df.groupby('crown_id')['z'].agg(['min', 'max', 'mean'])
+                       .sort_values('mean'))
+        lo  = g['min'].to_numpy()
+        hi  = g['max'].to_numpy()
+        crown_lines = np.concatenate([[lo[0]], 0.5 * (hi[:-1] + lo[1:]), [hi[-1]]])
+    crown_lines = None if crown_lines is None else np.sort(np.asarray(crown_lines, float))
+
+    # --- map each crown band to its convergence file ---
+    conv_dir   = os.path.join(output_dir, 'skeleton_plots')
+    conv_files = sorted(glob.glob(os.path.join(conv_dir, 'crown_*_convergence.html')))
+    n_bands    = 0 if crown_lines is None else len(crown_lines) - 1
+
+    # --- figure: main unrolled plot (bottom) + per-crown tuning strip (top) ------------
+    L, B, W, H = 0.05, 0.06, 0.93, 0.52            # main axes box (figure coords)
+    TY0, TH    = 0.66, 0.28                         # tuning strip band (figure coords)
+
+    fig = plt.figure(figsize=(16, 9))
+    ax  = fig.add_axes([L, B, W, H])
+
+    # point-cloud underlay (grey)
+    ax.scatter(stent_df['z'].to_numpy(), r_mid * stent_df['theta'].to_numpy(),
+               s=1, c='0.8', alpha=0.5, linewidths=0, rasterized=True, zorder=1)
+
+    # each spline curve, coloured so touching curves differ
+    seam_thresh = 0.5 * circumference
+    n_drawn     = 0
+    for ci, spl in enumerate(skeleton_splines):
+        if spl is None:
+            continue
+        if spl['tck'] is not None:
+            xx, yy, zz = splev(np.linspace(0.0, 1.0, 200), spl['tck'])
+        else:
+            ctrl = np.asarray(spl['ctrl'])
+            xx, yy, zz = ctrl[:, 0], ctrl[:, 1], ctrl[:, 2]
+        z_ax, arc = _break_seam(*_to_arc_z(xx, yy, zz, r_mid), seam_thresh)
+        ax.plot(z_ax, arc, '-', lw=1.8, color=palette[curve_color_idx[ci]], zorder=2)
+        n_drawn += 1
+
+    if crown_lines is not None:
+        xlo, xhi = float(crown_lines[0]), float(crown_lines[-1])
+        span = (xhi - xlo) or 1.0
+        xlo -= 0.01 * span
+        xhi += 0.01 * span
+        ax.set_xlim(xlo, xhi)
+        for e in crown_lines:
+            ax.axvline(e, ls='--', lw=1.6, color='k', alpha=0.9, zorder=10)
+    else:
+        xlo, xhi = ax.get_xlim()
+        span = (xhi - xlo) or 1.0
+
+    fig.suptitle(f'{stent_name} — unrolled 2D skeleton + per-crown tuning',
+                 fontsize=11, y=0.995)
+    ax.set_xlabel('z  (axial position, mm)')
+    ax.set_ylabel('arc = r_mid · θ  (circumferential, mm)')
+
+    # per-crown tuning plots above their bands
+    tune_colors = (('total', 'black'), ('defect', 'royalblue'), ('quality', 'orange'))
+    tax = None
+    n_tuned = 0
+    for k in range(n_bands):
+        a, b = float(crown_lines[k]), float(crown_lines[k + 1])
+        fx0  = L + (a - xlo) / (xhi - xlo) * W
+        fw   = (b - a) / (xhi - xlo) * W
+        pad  = 0.14 * fw
+        tax  = fig.add_axes([fx0 + pad, TY0, max(fw - 2 * pad, 1e-3), TH])
+        path, cid = _band_conv(k, crown_order, n_bands, conv_files, conv_dir)
+        conv = _load_convergence(path) if path and os.path.exists(path) else None
+        if conv is None:
+            tax.axis('off')
+            continue
+        if conv['kind'] == 'convergence':
+            for nm, col in tune_colors:
+                if nm in conv:
+                    xs, ys = conv[nm]
+                    tax.plot(xs, ys, '-', color=col, lw=1.0, marker='o', ms=2, label=nm)
+            tax.margins(x=0.03)
+        else:  # quality_bar
+            short_x = [l.replace(' ', '\n') for l in conv['x']]
+            tax.bar(short_x, conv['y'], color=conv['colors'], width=0.6)
+            tax.set_ylim(bottom=0)
+        tax.set_title(f'crown {cid}', fontsize=7, pad=2)
+        tax.tick_params(labelsize=5, length=2, pad=1)
+        n_tuned += 1
+
+    # shared legend on the last tuning axes (loc='best' finds the emptiest spot)
+    if n_tuned and tax is not None:
+        handles = [Line2D([0], [0], color=col, marker='o', ms=3, lw=1.2, label=nm)
+                   for nm, col in tune_colors]
+        tax.legend(handles=handles, fontsize=7, loc='best', frameon=True,
+                   title='tuning error', title_fontsize=7)
+
+    unrolled_png  = os.path.join(output_dir, 'skeleton_splines_2d.png')
+    unrolled_html = os.path.join(output_dir, 'skeleton_splines_2d.html')
+    fig.savefig(unrolled_png, dpi=150, bbox_inches='tight')
+
+    # embed the PNG as base64 in a self-contained HTML file
+    with open(unrolled_png, 'rb') as _f:
+        _png_b64 = base64.b64encode(_f.read()).decode()
+    with open(unrolled_html, 'w') as _f:
+        _f.write(
+            '<!DOCTYPE html><html><head><meta charset="utf-8">'
+            f'<title>{stent_name} — unrolled 2D skeleton</title></head>'
+            '<body style="margin:0;background:#fff;">'
+            f'<img src="data:image/png;base64,{_png_b64}" '
+            'style="width:100%;height:auto;">'
+            '</body></html>'
+        )
+    plt.show()
+    print(f"[saved] {unrolled_png}  ({n_drawn} curves, "
+          f"{0 if crown_lines is None else len(crown_lines)} crown boundaries, "
+          f"{n_tuned}/{n_bands} crown tuning plots)")
+    print(f"[saved] {unrolled_html}")
+    return {'png': unrolled_png, 'html': unrolled_html}
+
+
+def plot_skeleton_splines_trimesh(skeleton_splines, output_dir, show=True):
+    """Export the fitted splines as a coloured 3D path (.glb + trimesh .html).
+
+    Evaluates each spline into a polyline, builds a ``trimesh.path.Path3D`` with one
+    colour per curve, writes a portable ``skeleton_splines.glb`` and a self-contained
+    ``skeleton_splines_trimesh.html``, and (when ``show``) opens the in-notebook view.
+    """
+    _verts, _ents, _cols = [], [], []
+    _off  = 0
+    _cmap = plt.get_cmap('tab20')
+    _n    = 0
+    for spl in skeleton_splines:
+        if spl is None:
+            continue
+        if spl['tck'] is not None:
+            xx, yy, zz = splev(np.linspace(0.0, 1.0, 120), spl['tck'])
+            pts = np.column_stack([xx, yy, zz])
+        else:                                    # degree-1 polyline fallback
+            pts = np.asarray(spl['ctrl'], float)
+        if len(pts) < 2:
+            continue
+        _ents.append(Line(np.arange(_off, _off + len(pts))))
+        _verts.append(pts)
+        _cols.append((np.array(_cmap(_n % 20)) * 255).astype(np.uint8))
+        _off += len(pts)
+        _n   += 1
+
+    spline_path = trimesh.path.Path3D(entities=_ents, vertices=np.vstack(_verts))
+    try:
+        spline_path.colors = np.array(_cols, dtype=np.uint8)
+    except Exception as e:
+        print(f"[trimesh] per-curve colouring skipped: {e}")
+
+    splines_glb   = os.path.join(output_dir, 'skeleton_splines.glb')
+    splines_thtml = os.path.join(output_dir, 'skeleton_splines_trimesh.html')
+    with open(splines_glb, 'wb') as f:
+        f.write(spline_path.scene().export(file_type='glb'))
+    try:
+        from trimesh.viewer import notebook as _tvn
+        with open(splines_thtml, 'w') as f:
+            f.write(_tvn.scene_to_html(spline_path.scene()))
+        print(f"[saved] {splines_thtml}")
+    except Exception as e:
+        print(f"[trimesh] html export skipped: {e}")
+    print(f"[saved] {splines_glb}  ({_n} spline curves)")
+
+    if show:
+        spline_path.show()
+    return spline_path
+
+
+def _feat(stent_features, key):
+    """Read a feature value, unwrapping the {'value', 'unit'} form if present."""
+    v = stent_features[key]
+    return v['value'] if isinstance(v, dict) and 'value' in v else v
+
+
+def _bspline_from_record(rec):
+    """Rebuild a splinepy.BSpline from a skeleton_splines.json curve record.
+    knot_vector=None marks a degree-1 polyline fallback -> clamped uniform knots."""
+    import splinepy
+    ctrl = np.asarray(rec['control_points'], float)
+    if rec['knot_vector'] is not None:
+        return splinepy.BSpline(degrees=[int(rec['degree'])],
+                                knot_vectors=[rec['knot_vector']],
+                                control_points=ctrl)
+    n  = len(ctrl)                                   # degree-1 polyline fallback
+    kv = [0.0, 0.0] + list(np.linspace(0.0, 1.0, n)[1:-1]) + [1.0, 1.0]
+    return splinepy.BSpline(degrees=[1], knot_vectors=[kv], control_points=ctrl)
+
+
+def mesh_skeleton_beams(output_dir, l_el=0.1, youngs_modulus=2.0e5, poisson_ratio=0.3,
+                        density=0.0, beam_class_label='Beam3rHerm2Line3'):
+    """Mesh the fitted splines into a 1D Simo-Reissner beam mesh with BeamMe (Step 9).
+
+    Rebuilds each ``skeleton_splines.json`` curve as a ``splinepy.BSpline`` and meshes
+    it into one BeamMe ``Mesh`` (beam radius = strut_thickness / 2). Material +
+    element choices are provisional placeholders; only the geometry is final. Writes
+    ``skeleton_beam_mesh_beam.vtu`` and returns the mesh. Imports ``splinepy`` /
+    ``beamme`` lazily so the rest of ``stent_funcs`` runs without those heavy deps.
+    """
+    import splinepy  # noqa: F401  (used indirectly via _bspline_from_record)
+    from beamme.core.mesh import Mesh
+    from beamme.four_c.material import MaterialReissner
+    from beamme.four_c.element_beam import Beam3rHerm2Line3, Beam3rLine2Line2
+    from beamme.mesh_creation_functions.beam_splinepy import create_beam_mesh_from_splinepy
+
+    beam_classes = {'Beam3rHerm2Line3': Beam3rHerm2Line3,
+                    'Beam3rLine2Line2': Beam3rLine2Line2}
+    beam_class = beam_classes[beam_class_label]
+
+    # --- read the stent's saved data from the output folder (self-contained) ---
+    with open(os.path.join(output_dir, 'stent_features.json')) as f:
+        stent_features = json.load(f)
+    with open(os.path.join(output_dir, 'skeleton_splines.json')) as f:
+        splines_data = json.load(f)
+
+    strut_thickness = float(_feat(stent_features, 'strut_thickness'))
+    print(f"[folder] read stent_features.json from {output_dir}")
+    print(f"[folder] strut_thickness = {strut_thickness:.4f} mm")
+
+    beam_radius = strut_thickness / 2.0            # circular cross-section radius (mm)
+
+    beam_mesh = Mesh()
+    beam_mat  = MaterialReissner(radius=beam_radius, youngs_modulus=youngs_modulus,
+                                 nu=poisson_ratio, density=density)
+
+    n_meshed, n_skipped = 0, 0
+    for rec in splines_data['curves']:
+        if rec is None or len(rec['control_points']) < 2:
+            n_skipped += 1
+            continue
+        try:
+            create_beam_mesh_from_splinepy(beam_mesh, beam_class, beam_mat,
+                                           _bspline_from_record(rec), l_el=l_el)
+            n_meshed += 1
+        except Exception as e:
+            n_skipped += 1
+            if n_skipped <= 5:
+                print(f"  [skip] curve failed: {type(e).__name__}: {str(e)[:100]}")
+
+    print(f"\nMeshed {n_meshed}/{splines_data['n_curves']} curves "
+          f"({n_skipped} skipped) into a 1D beam mesh:")
+    print(f"  {len(beam_mesh.nodes):,} nodes, {len(beam_mesh.elements):,} "
+          f"{beam_class_label} elements")
+    print(f"  cross-section radius {beam_radius:.4f} mm, target element length "
+          f"{l_el:.4f} mm")
+
+    beam_mesh.write_vtk(output_name='skeleton_beam_mesh', output_directory=output_dir)
+    print(f"[saved] {os.path.join(output_dir, 'skeleton_beam_mesh_beam.vtu')}")
+    return beam_mesh
