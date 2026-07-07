@@ -8,7 +8,7 @@ from scipy.spatial import cKDTree
 from scipy.ndimage import uniform_filter1d
 from scipy.signal import find_peaks
 
-from .plotting import plot_points_3d_html, plot_crown_dips_html
+from .stent_plotting import plot_points_3d_html, plot_crown_dips_html
 
 
 def find_crowns(

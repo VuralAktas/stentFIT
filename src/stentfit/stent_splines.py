@@ -4,7 +4,7 @@ import json
 import os
 from scipy.interpolate import splprep
 
-from .plotting import plot_splines_html
+from .stent_plotting import plot_splines_html
 
 
 def group_skeleton_curves(skeleton_points_df):

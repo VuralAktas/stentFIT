@@ -31,11 +31,11 @@ and interactive HTML views into the output directory.
 ## Usage
 
 The full, interactive workflow — including the manual-edit and checkpoint steps — is in
-[`examples/stent_skeleton.ipynb`](examples/stent_skeleton.ipynb). The pipeline API lives
-in the `stentfit.stent` subpackage and is exposed through a single import point:
+[`examples/stent_skeleton.ipynb`](examples/stent_skeleton.ipynb). The pipeline API is
+exposed through a single import point:
 
 ```python
-from stentfit.stent import (
+from stentfit import (
     # Stage 1 — sample the STL, detect crowns, skeletonise each crown in 2D
     sample_stent_points, detect_crowns, skeletonize_crowns_2d,
     save_crown_2d_checkpoint, load_crown_2d_checkpoint,

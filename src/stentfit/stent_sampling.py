@@ -9,7 +9,7 @@ import os
 from sklearn.cluster import DBSCAN
 from skimage.morphology import closing
 
-from .plotting import plot_points_3d_html
+from .stent_plotting import plot_points_3d_html
 
 REPO_ROOT = pathlib.Path(__file__).parent.parent.parent.parent.absolute()
 

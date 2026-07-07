@@ -10,8 +10,8 @@ from scipy.sparse.csgraph import connected_components
 from scipy.spatial import cKDTree
 from skimage.morphology import skeletonize, dilation, closing, disk
 
-from .crowns import segment_stent
-from .plotting import plot_crown_skeleton_2d_html, plot_crown_convergence_html, _render_crown_2d
+from .stent_crowns import segment_stent
+from .stent_plotting import plot_crown_skeleton_2d_html, plot_crown_convergence_html, _render_crown_2d
 
 
 def open_stent_to_plane(stent_df: pd.DataFrame, r_mid: float, pad_fraction: float) -> dict:

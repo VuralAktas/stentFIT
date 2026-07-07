@@ -6,7 +6,7 @@ import json
 import os
 from scipy.spatial import cKDTree
 
-from .plotting import plot_skeleton_html, plot_skeleton_with_cloud_html
+from .stent_plotting import plot_skeleton_html, plot_skeleton_with_cloud_html
 
 
 def adjust_skeleton_to_local_midsurface(
