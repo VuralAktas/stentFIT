@@ -31,22 +31,36 @@ and interactive HTML views into the output directory.
 ## Usage
 
 The full, interactive workflow — including the manual-edit and checkpoint steps — is in
-[`examples/stent_skeleton.ipynb`](examples/stent_skeleton.ipynb). The pipeline runs in
-three stages:
+[`examples/stent_skeleton.ipynb`](examples/stent_skeleton.ipynb). The pipeline API lives
+in the `stentfit.stent` subpackage and is exposed through a single import point:
 
 ```python
-import trimesh
-from stentfit import stent_funcs
+from stentfit.stent import (
+    # Stage 1 — sample the STL, detect crowns, skeletonise each crown in 2D
+    sample_stent_points, detect_crowns, skeletonize_crowns_2d,
+    save_crown_2d_checkpoint, load_crown_2d_checkpoint,
+    edit_crowns_2d_interactive, assemble_2d_skeleton,
+    # Stage 2 — wrap the 2D skeleton onto the 3D mid-surface and fit a B-spline per strut
+    wrap_skeleton_to_3d, fit_skeleton_splines, save_stent_features_and_views,
+    plot_skeleton_splines_2d, plot_skeleton_splines_trimesh,
+    # Stage 3 — mesh the skeleton into 1D beams with BeamMe
+    mesh_skeleton_beams,
+)
+```
 
-mesh = trimesh.load("data/stent_designs/stent04.stl")
+The example notebook wraps these into three stages you run in sequence:
 
-# Stage 1 — sample the STL, detect crowns, skeletonise each crown in 2D
-# Stage 2 — wrap the 2D skeleton onto the 3D mid-surface and fit a B-spline per strut
-# Stage 3 — mesh the skeleton into 1D beams with BeamMe
+```python
+state = run_skeletonization_2d()          # Stage 1: sample → crowns → 2D skeleton (+ checkpoint)
+state = resume_and_edit_crowns(OUTPUT_DIR, state)  # optional manual 2D edits → assemble skeleton
+state = finalize_skeleton(state)          # Stage 2: wrap to 3D, clean graph, fit splines, export
+beam_mesh = mesh_skeleton_beams(OUTPUT_DIR)        # Stage 3: mesh splines into 1D beams
 ```
 
 Each stage writes CSV/JSON exports and interactive HTML views into the output
-directory. See the example notebook for the complete, parameterised pipeline.
+directory, and two checkpoints (`crown_2d.pkl`, `checkpoint_meta.json`) let the pipeline
+resume after a kernel restart. See the example notebook for the complete, parameterised
+pipeline.
 
 ## Contributing
 
