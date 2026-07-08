@@ -13,6 +13,9 @@ from .stent_skeleton_2d import (skeletonize_crowns_2d, save_crown_2d_checkpoint,
 from .stent_skeleton_3d import wrap_skeleton_to_3d, save_stent_features_and_views
 from .stent_splines import fit_skeleton_splines, mesh_skeleton_beams
 from .stent_plotting import plot_skeleton_splines_2d, plot_skeleton_splines_trimesh
+# One-call pipeline + staged entry points (imported last: it depends on the above).
+from .stent_pipeline import (stent_pipeline, run_skeletonization_2d,
+                             resume_and_edit_crowns, finalize_skeleton)
 
 __version__ = version("stentfit")
 
@@ -22,4 +25,6 @@ __all__ = [
     "edit_crowns_2d_interactive", "assemble_2d_skeleton", "wrap_skeleton_to_3d",
     "save_stent_features_and_views", "fit_skeleton_splines", "mesh_skeleton_beams",
     "plot_skeleton_splines_2d", "plot_skeleton_splines_trimesh",
+    "stent_pipeline", "run_skeletonization_2d", "resume_and_edit_crowns",
+    "finalize_skeleton",
 ]

@@ -17,82 +17,6 @@ import plotly.io as pio
 import plotly.colors as pcolors
 
 
-def plot_skeleton_quality(
-    skeleton_2d_result: dict,
-    stent_df: pd.DataFrame,
-    r_mid: float,
-    quality_report: dict,
-    figsize=(16, 7),
-) -> None:
-    """Overlay the quality issues on the unrolled (z, arc) skeleton.
-
-    Skeleton coloured by region inside the kept window, the dropped padding
-    skeleton in grey, and bad connections / loops / empty regions highlighted.
-    """
-    skel        = skeleton_2d_result['df_skeleton_2d'][['arc', 'z']].to_numpy()
-    skel_pad    = skeleton_2d_result['df_skeleton_2d_padded'][['arc', 'z']].to_numpy()
-    skel_region = quality_report['skel_region']
-    arc_lo, arc_hi   = skeleton_2d_result['arc_band']
-    arc_min, arc_max = skeleton_2d_result['arc_window']
-    circ = 2 * np.pi * r_mid
-
-    # Replicate surface points across the seam to fill the padded band
-    surf_arc = r_mid * stent_df['theta'].to_numpy()
-    surf_z   = stent_df['z'].to_numpy()
-    a3 = np.concatenate([surf_arc - circ, surf_arc, surf_arc + circ])
-    z3 = np.concatenate([surf_z,          surf_z,   surf_z])
-    in_band = (a3 >= arc_lo) & (a3 <= arc_hi)
-    a3, z3  = a3[in_band], z3[in_band]
-    sel = np.random.default_rng(0).choice(len(a3), min(len(a3), int(3e5)), replace=False)
-
-    rng    = np.random.default_rng(1)
-    cmap   = {r: rng.random(3) for r in np.unique(skel_region)}
-    colors = np.array([cmap[r] for r in skel_region])
-
-    # padding-only skeleton points (outside the kept window)
-    pad_only = (skel_pad[:, 0] < arc_min) | (skel_pad[:, 0] > arc_max)
-
-    fig, ax = plt.subplots(figsize=figsize)
-    ax.scatter(z3[sel], a3[sel], s=0.3, c='0.88', linewidths=0, zorder=0)
-    ax.scatter(skel_pad[pad_only, 1], skel_pad[pad_only, 0], s=2.0, c='0.6',
-               linewidths=0, zorder=1, label='padding skeleton (dropped)')
-    ax.scatter(skel[:, 1], skel[:, 0], s=2.0, c=colors, linewidths=0, zorder=2)
-
-    ax.axhline(arc_min, color='red', linestyle='--', linewidth=1, zorder=3)
-    ax.axhline(arc_max, color='red', linestyle='--', linewidth=1, zorder=3)
-
-    bad_xy   = quality_report['bad_edge_xy']
-    loop_xy  = quality_report['loop_points_xy']
-    empty_xy = quality_report['empty_xy']
-
-    if len(bad_xy):
-        ax.scatter(bad_xy[:, 1], bad_xy[:, 0], s=140, marker='x', c='red',
-                   linewidths=2.5, zorder=5,
-                   label=f'bad connection ({len(quality_report["bad_connections"])} pair(s))')
-    if len(loop_xy):
-        n_reg_loops    = len(quality_report['region_loops'])
-        n_border_loops = len(quality_report.get('border_loops', {}))
-        ax.scatter(loop_xy[:, 1], loop_xy[:, 0], s=40, marker='o',
-                   facecolors='none', edgecolors='magenta', linewidths=1.4, zorder=4,
-                   label=f'loop ({n_reg_loops} region, {n_border_loops} border)')
-    if len(empty_xy):
-        ax.scatter(empty_xy[:, 1], empty_xy[:, 0], s=220, marker='s',
-                   facecolors='none', edgecolors='black', linewidths=2.0, zorder=6,
-                   label=f'empty region ({len(empty_xy)})')
-        for (a, z_c), er in zip(empty_xy, quality_report['empty_regions']):
-            ax.annotate(f'R{er}', (z_c, a), color='black', fontsize=8,
-                        ha='center', va='bottom')
-
-    ax.set_aspect('equal')
-    ax.set_ylim(arc_lo, arc_hi)          # show the full padded band
-    ax.set_xlabel('z (mm)'); ax.set_ylabel('arc (mm)')
-    ax.set_title('Skeleton quality issues (unrolled surface, incl. padding band)')
-    ax.legend(loc='upper right', framealpha=0.9)
-    plt.tight_layout()
-    plt.show()
-
-
-
 def _downsample_df(df: pd.DataFrame, max_display: int, random_state: int = 0) -> pd.DataFrame:
     """Return df unchanged if small, else a random subset of ``max_display`` rows
     (ids preserved). Display-only — never used for processing."""
@@ -828,12 +752,15 @@ def plot_skeleton_splines_2d(skeleton_curves, skeleton_splines, stent_df, r_mid,
 
 
 
-def plot_skeleton_splines_trimesh(skeleton_splines, output_dir, show=True):
+def plot_skeleton_splines_trimesh(skeleton_splines, output_dir, show=False):
     """Export the fitted splines as a coloured 3D path (.glb + trimesh .html).
 
     Evaluates each spline into a polyline, builds a ``trimesh.path.Path3D`` with one
     colour per curve, writes a portable ``skeleton_splines.glb`` and a self-contained
-    ``skeleton_splines_trimesh.html``, and (when ``show``) opens the in-notebook view.
+    ``skeleton_splines_trimesh.html``, and (when ``show``) opens the interactive
+    trimesh window. ``show`` defaults to ``False`` so the function stays headless-safe
+    (opening the window needs a GUI backend such as ``pyglet``); the ``.html`` file is
+    the portable view.
     """
     _verts, _ents, _cols = [], [], []
     _off  = 0
@@ -875,6 +802,10 @@ def plot_skeleton_splines_trimesh(skeleton_splines, output_dir, show=True):
     print(f"[saved] {splines_glb}  ({_n} spline curves)")
 
     if show:
-        spline_path.show()
+        try:
+            spline_path.show()
+        except Exception as e:
+            print(f"[trimesh] interactive window skipped ({e}); "
+                  f"use skeleton_splines_trimesh.html instead")
     return spline_path
 

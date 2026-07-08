@@ -2,6 +2,7 @@ import numpy as np
 import ast
 import json
 import os
+from collections import Counter
 from scipy.interpolate import splprep
 
 from .stent_plotting import plot_splines_html
@@ -46,6 +47,45 @@ def group_skeleton_curves(skeleton_points_df):
         for nb in adj[pid]:
             if frozenset((pid, nb)) not in visited_edges:
                 curves.append(walk(pid, nb))
+    return curves
+
+
+
+def prune_spur_curves(curves):
+    """Drop spur curves left over after grouping (Step 7 double-check).
+
+    Each curve is a chain of skeleton_point_ids whose endpoints (first / last id) are
+    the junctions or dead-ends it meets. A curve is kept only if BOTH of its endpoints
+    are shared with at least one other curve; a curve with a free endpoint (an id that
+    no other curve touches) is a dangling spur and is removed. Closed loops
+    (first id == last id) are always kept. Pruning iterates because removing one spur
+    can turn a neighbouring segment into a new spur (a chain of dead-end pieces).
+
+    Complements the node-level `prune_skeleton_spurs` in the 3D graph cleanup.
+    Returns the filtered list of curves.
+    """
+    curves = [list(c) for c in curves]
+    while True:
+        endpoint_count = Counter()
+        for c in curves:
+            endpoint_count[c[0]]  += 1
+            endpoint_count[c[-1]] += 1
+
+        kept, dropped = [], 0
+        for c in curves:
+            if c[0] == c[-1]:                                  # closed loop -> keep
+                kept.append(c)
+                continue
+            free_start = endpoint_count[c[0]]  <= 1
+            free_end   = endpoint_count[c[-1]] <= 1
+            if free_start or free_end:
+                dropped += 1
+            else:
+                kept.append(c)
+
+        curves = kept
+        if dropped == 0:                                       # fixed point reached
+            break
     return curves
 
 
@@ -103,8 +143,11 @@ def _spline_record(spl):
 
 
 def fit_skeleton_splines(skeleton_df, output_dir, spline_every=10, spline_degree=3,
-                         smooth=0.0):
+                         smooth=0.0, prune_spurs=True):
     """Group the skeleton graph into curves and fit a B-spline per curve (Step 7).
+
+    With ``prune_spurs=True`` (default), a curve-level double-check removes dangling
+    spur curves (a curve with a free endpoint no other curve shares) before fitting.
 
     Renders the smooth curves to ``splines.html`` and exports ``skeleton_splines.json``
     (per-curve degree / knot_vector / control_points), which rebuilds directly as a
@@ -112,6 +155,12 @@ def fit_skeleton_splines(skeleton_df, output_dir, spline_every=10, spline_degree
     """
     coords  = skeleton_df.set_index('skeleton_point_id')[['x', 'y', 'z']]
     curves  = group_skeleton_curves(skeleton_df)
+    if prune_spurs:
+        n_before = len(curves)
+        curves   = prune_spur_curves(curves)
+        if len(curves) < n_before:
+            print(f"Pruned {n_before - len(curves)} spur curve(s) "
+                  f"({n_before} -> {len(curves)}).")
     splines = [fit_curve_spline(c, coords, spline_every, spline_degree, smooth)
                for c in curves]
     print(f"Grouped {len(curves)} curves; fitted "

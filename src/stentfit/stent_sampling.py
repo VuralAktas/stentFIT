@@ -11,8 +11,6 @@ from skimage.morphology import closing
 
 from .stent_plotting import plot_points_3d_html
 
-REPO_ROOT = pathlib.Path(__file__).parent.parent.parent.parent.absolute()
-
 
 def compute_pre_stent_size_ratio(mesh: trimesh.Trimesh) -> dict:
     """Estimate stent length, diameter and their ratio from the raw mesh."""
@@ -272,11 +270,14 @@ def preprocess_stent(
 
 
 
-def load_update_stent_data(stent_name, material_name, youngs_modulus, poissons_ratio,
+def load_update_stent_data(stent_dir, material_name, youngs_modulus, poissons_ratio,
                     density, max_elastic_strain):
     """Load stent geometry/skeleton data and extend features with material parameters.
 
-    Each key in the returned features dict maps to {"value": ..., "unit": "..."}.
+    ``stent_dir`` is the per-stent output folder (e.g.
+    ``examples/notebook_outputs/<STENT_NAME>/``), mirroring the ``output_dir`` argument
+    of ``sample_stent_points``. Each key in the returned features dict maps to
+    {"value": ..., "unit": "..."}.
     Density is stored in kg/m³; callers using the mm-N-tonne system must convert to t/mm³.
     stent_features.json is updated only when material parameters are new or have changed.
     The JSON stores {"value", "unit"} wrapped entries for all keys.
@@ -300,7 +301,7 @@ def load_update_stent_data(stent_name, material_name, youngs_modulus, poissons_r
     _MAT_KEYS = {"material_name", "youngs_modulus", "poissons_ratio",
                  "shear_modulus", "density", "max_elastic_strain"}
 
-    stent_dir = REPO_ROOT / "examples" / "notebook_outputs" / stent_name
+    stent_dir = pathlib.Path(stent_dir)
     print(f"Loading stent data from: {stent_dir.resolve()}")
 
     with open(stent_dir / "stent_features.json") as f:

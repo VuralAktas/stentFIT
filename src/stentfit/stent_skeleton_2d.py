@@ -14,29 +14,19 @@ from .stent_crowns import segment_stent
 from .stent_plotting import plot_crown_skeleton_2d_html, plot_crown_convergence_html, _render_crown_2d
 
 
-def open_stent_to_plane(stent_df: pd.DataFrame, r_mid: float, pad_fraction: float) -> dict:
+def open_stent_to_plane(stent_df: pd.DataFrame, r_mid: float) -> dict:
     """
-    Unwrap all surface points onto a 2D (arc, z) plane with periodic padding.
+    Unwrap all surface points onto a 2D (arc, z) plane.
     """
     circumference = 2 * np.pi * r_mid
     arc_flat      = r_mid * stent_df['theta'].values
     z_flat        = stent_df['z_cylindrical'].values
     arc_min_flat  = arc_flat.min()
-    arc_max_flat  = arc_flat.max()
-    pad_width     = pad_fraction * circumference
-
-    arc_three = np.concatenate([arc_flat - circumference, arc_flat, arc_flat + circumference])
-    z_three   = np.concatenate([z_flat,                   z_flat,   z_flat])
-    pad_mask  = ((arc_three >= arc_min_flat - pad_width) &
-                 (arc_three <= arc_max_flat + pad_width))
 
     return {
-        'arc_padded'   : arc_three[pad_mask],
-        'z_padded'     : z_three[pad_mask],
         'arc_flat'     : arc_flat,
         'z_flat'       : z_flat,
         'arc_min_flat' : arc_min_flat,
-        'arc_max_flat' : arc_max_flat,
         'circumference': circumference,
     }
 
@@ -46,7 +36,6 @@ def compute_skeleton_2d(
     arc_flat: np.ndarray,
     z_flat: np.ndarray,
     arc_min_flat: float,
-    arc_max_flat: float,
     circumference: float,
     stent_df: pd.DataFrame,
     stent_geometry: dict,
@@ -54,86 +43,66 @@ def compute_skeleton_2d(
     dilate_px: int,
     pad_fraction: float,
     plot: bool,
-    seam_tol_frac: float = 0.0,
 ) -> dict:
     """Rasterise, dilate, skeletonise, then map back to (arc, z).
 
-    The unroll introduces a seam at the arc boundary, so the points are
-    replicated +/-circumference and a pad_fraction margin is kept while
-    rasterising; the skeleton is then cropped back to the real arc window.
-    seam_tol_frac widens that crop by seam_tol_frac * strut_thickness on both
-    edges so a strut crossing the seam reconnects in 3D (0.0 = hard crop).
+    Rasterises on a periodic (cylindrical) grid exactly one circumference wide, so
+    the arc wraps (the last column is a neighbour of the first) and there is no seam
+    cut. A wrap-pad of pad_fraction of the width gives the thinning continuous
+    context across the seam; only the central one turn is kept, so each angular
+    position appears exactly once and a strut on the seam stays continuous.
     """
     pixel_size = stent_geometry['strut_thickness'] / pixels_per_strut
 
-    # Step 1: seam padding (replicate along arc, keep a margin band)
-    arc_three = np.concatenate([arc_flat - circumference, arc_flat, arc_flat + circumference])
-    z_three   = np.concatenate([z_flat,                   z_flat,   z_flat])
-    band      = ((arc_three >= arc_flat.min() - pad_fraction * circumference) &
-                 (arc_three <= arc_flat.max() + pad_fraction * circumference))
-    arc_pad, z_pad = arc_three[band], z_three[band]   # padded surface points (incl. seam copies)
+    # --- periodic (cylindrical) raster: one circumference wide, the arc wraps ---
+    # The last column is a neighbour of the first, so there is NO seam cut. Nothing
+    # gets sliced, so a strut sitting on the seam stays one continuous line.
+    n_cols = max(1, int(round(circumference / pixel_size)))
+    z_lo   = z_flat.min()
+    n_rows = int(np.ceil((z_flat.max() - z_lo) / pixel_size)) + 1
 
-    # Step 2: canvas spans the padded band so seam copies are not clipped
-    arc_lo, arc_hi = arc_pad.min(), arc_pad.max()
-    z_lo,   z_hi   = z_pad.min(),   z_pad.max()
-    n_cols = int(np.ceil((arc_hi - arc_lo) / pixel_size)) + 1
-    n_rows = int(np.ceil((z_hi   - z_lo)   / pixel_size)) + 1
+    # Every point gets a column 0..n_cols-1; going past the end wraps back to 0.
+    col = np.mod(np.round((arc_flat - arc_min_flat) / pixel_size).astype(int), n_cols)
+    row = np.clip(np.round((z_flat - z_lo) / pixel_size).astype(int), 0, n_rows - 1)
 
-    col_idx = np.clip(((arc_pad - arc_lo) / pixel_size).astype(int), 0, n_cols - 1)
-    row_idx = np.clip(((z_pad   - z_lo)   / pixel_size).astype(int), 0, n_rows - 1)
-
-    # Step 3: rasterise, dilate, skeletonise
     img = np.zeros((n_rows, n_cols), dtype=bool)
-    img[row_idx, col_idx] = True
+    img[row, col] = True
 
-    img_solid = dilation(img,       footprint=disk(dilate_px))
+    # Copy a strip from each side onto the other side ("wrap"), so the thinning sees
+    # the strut continuously across the seam. pad_cols is just working room.
+    pad_cols = min(n_cols, max(dilate_px + 1, int(round(pad_fraction * n_cols))))
+    img_wrap = np.pad(img, ((0, 0), (pad_cols, pad_cols)), mode='wrap')
+
+    img_solid = dilation(img_wrap, footprint=disk(dilate_px))
     img_solid = closing (img_solid, footprint=disk(1))
+    img_skel  = skeletonize(img_solid)
 
-    img_skel = skeletonize(img_solid)
+    # Keep just the middle one turn (drop the wrap strips we added).
+    sk_rows, sk_cols_w = np.where(img_skel)
+    keep    = (sk_cols_w >= pad_cols) & (sk_cols_w < pad_cols + n_cols)
+    sk_rows = sk_rows[keep]
+    sk_cols = sk_cols_w[keep] - pad_cols
 
-    sk_rows, sk_cols = np.where(img_skel)
-    skel_arc_pad = arc_lo + (sk_cols + 0.5) * pixel_size
-    skel_z_pad   = z_lo   + (sk_rows + 0.5) * pixel_size
-
-    # Step 4: crop back to the real arc window (plus seam tolerance)
-    seam_tol  = seam_tol_frac * stent_geometry['strut_thickness']
-    seam_mask = ((skel_arc_pad >= arc_min_flat - seam_tol) &
-                 (skel_arc_pad <= arc_max_flat + seam_tol))
-    skel_arc  = skel_arc_pad[seam_mask]
-    skel_z    = skel_z_pad[seam_mask]
+    skel_arc = arc_min_flat + (sk_cols + 0.5) * pixel_size
+    skel_z   = z_lo         + (sk_rows + 0.5) * pixel_size
 
     if plot:
-        fig, axes = plt.subplots(2, 1, figsize=(14, 11))
-
-        axes[0].imshow(img_skel.T, cmap='gray_r', origin='lower',
-                       extent=(z_lo, z_hi, arc_lo, arc_hi), aspect='equal')
-        axes[0].axhline(arc_min_flat, color='red', linestyle='--', linewidth=1)
-        axes[0].axhline(arc_max_flat, color='red', linestyle='--', linewidth=1)
-        axes[0].set_title('Skeleton on padded band  (red dashes = kept arc window; outside = padding)')
-        axes[0].set_xlabel('z (mm)'); axes[0].set_ylabel('arc (mm)')
-
-        axes[1].scatter(z_pad,      arc_pad,      s=0.3, c='lightsteelblue', linewidths=0)
-        axes[1].scatter(skel_z_pad, skel_arc_pad, s=1.0, c='0.65',   linewidths=0, label='padding (dropped)')
-        axes[1].scatter(skel_z,     skel_arc,     s=1.5, c='crimson', linewidths=0, label='kept skeleton')
-        axes[1].axhline(arc_min_flat, color='red', linestyle='--', linewidth=1)
-        axes[1].axhline(arc_max_flat, color='red', linestyle='--', linewidth=1)
-        axes[1].set_title('Skeleton over surface points (incl. padding region)')
-        axes[1].set_xlabel('z (mm)'); axes[1].set_ylabel('arc (mm)')
-        axes[1].set_aspect('equal'); axes[1].legend(loc='upper right', markerscale=6)
-
+        fig, ax = plt.subplots(figsize=(14, 6))
+        ax.scatter(z_flat,  arc_flat, s=0.3, c='lightsteelblue', linewidths=0, label='surface')
+        ax.scatter(skel_z,  skel_arc, s=1.5, c='crimson',        linewidths=0, label='skeleton (one turn)')
+        ax.axhline(arc_min_flat,                 color='red', linestyle='--', linewidth=1)
+        ax.axhline(arc_min_flat + circumference, color='red', linestyle='--', linewidth=1)
+        ax.set_title('Periodic (cylindrical) skeleton over surface points — one circumference')
+        ax.set_xlabel('z (mm)'); ax.set_ylabel('arc (mm)')
+        ax.set_aspect('equal'); ax.legend(loc='upper right', markerscale=6)
         plt.tight_layout()
         plt.show()
 
     return {
-        'skel_arc'             : skel_arc,
-        'skel_z'               : skel_z,
-        'skel_arc_padded'      : skel_arc_pad,
-        'skel_z_padded'        : skel_z_pad,
-        'arc_window'           : (arc_min_flat, arc_max_flat),
-        'arc_band'             : (arc_lo, arc_hi),
-        'pixel_size'           : pixel_size,
-        'df_skeleton_2d'       : pd.DataFrame({'arc': skel_arc,     'z': skel_z}),
-        'df_skeleton_2d_padded': pd.DataFrame({'arc': skel_arc_pad, 'z': skel_z_pad}),
+        'skel_arc'      : skel_arc,
+        'skel_z'        : skel_z,
+        'pixel_size'    : pixel_size,
+        'df_skeleton_2d': pd.DataFrame({'arc': skel_arc, 'z': skel_z}),
     }
 
 
@@ -465,10 +434,9 @@ def tune_skeleton_params(
     q_eps: float = 1e-3,          # floor on the quality residual so total_error stays > 0
     quality_gamma: float = 2.0,   # quality_error convexity: 1 = linear, >1 = diminishing returns
     res_no_improve_max: int = 5,  # steps (after the first clean step) with no total_error improvement
-    target_penalty: float = 0.0,  # defect_error <= this counts as "feasible" (clean) AND gates best selection
+    target_penalty: float = 1.0,  # defect_error <= this counts as "feasible" (clean) AND gates best selection
     max_repeats: int = 2,        # stop once the SAME (pps, dil) state has been visited this many times
     pad_fraction: float = 0.20,
-    seam_tol_frac: float = 0.0,   # widen the seam crop so wrap-crossing struts reconnect in 3D
     time_limit: float = 100.0,
     predictive_stop: bool = True,
     max_iters: int = int(1e3),
@@ -545,10 +513,9 @@ def tune_skeleton_params(
 
         _it_t0 = time.time()
         res = compute_skeleton_2d(
-            arc_flat=arc, z_flat=z, arc_min_flat=arc.min(), arc_max_flat=arc.max(),
+            arc_flat=arc, z_flat=z, arc_min_flat=arc.min(),
             circumference=circ, stent_df=stent_df, stent_geometry=stent_features,
             pixels_per_strut=pps, dilate_px=dil, pad_fraction=pad_fraction, plot=False,
-            seam_tol_frac=seam_tol_frac,
         )
         qr = check_skeleton_quality(
             res['df_skeleton_2d'], res['pixel_size'], stent_df, r_mid, region_allowed,
@@ -929,7 +896,7 @@ def _downsample_surface_pair(a, b, n=40000, seed=0):
 def skeletonize_crowns_2d(stent_df, stent_features, crown_edges, conn_radius_3d,
                           output_dir, auto_tune=True, pixels_per_strut=10, dilate_px=3,
                           pad_fraction=0.20, tune_time_limit=120, quality_gamma=2.0,
-                          seam_tol_frac=0.01, crown_halo_frac=0.4):
+                          crown_halo_frac=0.4):
     """Skeletonise each crown in 2D and store the results in a CROWN_2D dict (Step 5).
 
     Segments the whole stent once (each crown -> 3 z-pieces) for the region map +
@@ -974,7 +941,7 @@ def skeletonize_crowns_2d(stent_df, stent_features, crown_edges, conn_radius_3d,
             z_lo, z_hi = float(own_z.min()), float(own_z.max())
             seg_sub    = seg_df_full[seg_df_full['crown_id'] == c].copy()
 
-        opened = open_stent_to_plane(seg_sub, r_mid, pad_fraction)
+        opened = open_stent_to_plane(seg_sub, r_mid)
         arc_flat, z_flat = opened['arc_flat'], opened['z_flat']
 
         print(f"\n===== {label} ({ci + 1}/{len(crown_order)}) — "
@@ -984,7 +951,7 @@ def skeletonize_crowns_2d(stent_df, stent_features, crown_edges, conn_radius_3d,
             tuned   = tune_skeleton_params(
                 arc=arc_flat, z=z_flat, stent_df=seg_sub, stent_features=stent_features,
                 region_allowed=region_allowed, pps0=pixels_per_strut, dil0=dilate_px,
-                pad_fraction=pad_fraction, seam_tol_frac=seam_tol_frac,
+                pad_fraction=pad_fraction,
                 time_limit=tune_time_limit, quality_gamma=quality_gamma,
                 plot=False, verbose=True)
             sk_2d          = tuned['skeleton_2d']
@@ -994,10 +961,10 @@ def skeletonize_crowns_2d(stent_df, stent_features, crown_edges, conn_radius_3d,
         else:
             sk_2d = compute_skeleton_2d(
                 arc_flat=arc_flat, z_flat=z_flat, arc_min_flat=opened['arc_min_flat'],
-                arc_max_flat=opened['arc_max_flat'], circumference=opened['circumference'],
+                circumference=opened['circumference'],
                 stent_df=seg_sub, stent_geometry=stent_features,
                 pixels_per_strut=pixels_per_strut, dilate_px=dilate_px,
-                pad_fraction=pad_fraction, plot=False, seam_tol_frac=seam_tol_frac)
+                pad_fraction=pad_fraction, plot=False)
             history = None
             quality_report = check_skeleton_quality(
                 df_skeleton_2d=sk_2d['df_skeleton_2d'], pixel_size=sk_2d['pixel_size'],
@@ -1005,12 +972,18 @@ def skeletonize_crowns_2d(stent_df, stent_features, crown_edges, conn_radius_3d,
                 strut_thickness=strut_thickness, verbose=True)
             diag_pps, diag_dil = pixels_per_strut, dilate_px
 
-        # trim the final skeleton to the crown's own z-band (drop the halo)
+        # trim the final skeleton to the crown's own z-band (drop most of the halo).
+        # Unlike the seam, neighbouring crowns are skeletonised on SEPARATE, unaligned
+        # pixel grids, so the two halves of a boundary strut do not coincide. We keep a
+        # small overlap band past each edge so both crowns share points there and the
+        # halves always reconnect in 3D. The overlap is sized in PIXELS (intrinsic
+        # resolution), not a design fraction; the old 0.01*strut slack was sub-pixel and
+        # therefore unreliable, which is why boundary struts were sometimes pruned.
         skel_df2d = sk_2d['df_skeleton_2d']
         arc_all   = skel_df2d['arc'].to_numpy()
         z_2d_all  = skel_df2d['z'].to_numpy()
-        z_tol = 0.01 * strut_thickness
-        tmask = (z_2d_all >= z_lo - z_tol) & (z_2d_all <= z_hi + z_tol)
+        z_ov  = 2.0 * sk_2d['pixel_size']
+        tmask = (z_2d_all >= z_lo - z_ov) & (z_2d_all <= z_hi + z_ov)
         arc_c = arc_all[tmask]
         z_c   = z_2d_all[tmask]
 
