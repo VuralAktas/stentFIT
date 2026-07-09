@@ -210,7 +210,7 @@ def _bspline_from_record(rec):
 
 
 
-def mesh_skeleton_beams(output_dir, l_el=0.1, youngs_modulus=2.0e5, poisson_ratio=0.3,
+def mesh_skeleton_beams(input_dir, output_dir, l_el=0.1, youngs_modulus=2.0e5, poisson_ratio=0.3,
                         density=0.0, beam_class_label='Beam3rHerm2Line3'):
     """Mesh the fitted splines into a 1D Simo-Reissner beam mesh with BeamMe (Step 9).
 
@@ -231,13 +231,13 @@ def mesh_skeleton_beams(output_dir, l_el=0.1, youngs_modulus=2.0e5, poisson_rati
     beam_class = beam_classes[beam_class_label]
 
     # --- read the stent's saved data from the output folder (self-contained) ---
-    with open(os.path.join(output_dir, 'stent_features.json')) as f:
+    with open(os.path.join(input_dir, 'stent_features.json')) as f:
         stent_features = json.load(f)
-    with open(os.path.join(output_dir, 'skeleton_splines.json')) as f:
+    with open(os.path.join(input_dir, 'skeleton_splines.json')) as f:
         splines_data = json.load(f)
 
     strut_thickness = float(_feat(stent_features, 'strut_thickness'))
-    print(f"[folder] read stent_features.json from {output_dir}")
+    print(f"[folder] read stent_features.json from {input_dir}")
     print(f"[folder] strut_thickness = {strut_thickness:.4f} mm")
 
     beam_radius = strut_thickness / 2.0            # circular cross-section radius (mm)
@@ -267,7 +267,7 @@ def mesh_skeleton_beams(output_dir, l_el=0.1, youngs_modulus=2.0e5, poisson_rati
     print(f"  cross-section radius {beam_radius:.4f} mm, target element length "
           f"{l_el:.4f} mm")
 
-    beam_mesh.write_vtk(output_name='skeleton_beam_mesh', output_directory=output_dir)
-    print(f"[saved] {os.path.join(output_dir, 'skeleton_beam_mesh_beam.vtu')}")
+    '''beam_mesh.write_vtk(output_name='skeleton_beam_mesh', output_directory=output_dir)
+    print(f"[saved] {os.path.join(output_dir, 'skeleton_beam_mesh_beam.vtu')}")'''
     return beam_mesh
 

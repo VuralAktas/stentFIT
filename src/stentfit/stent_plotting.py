@@ -264,6 +264,7 @@ def plot_crown_dips_html(crown_res: dict, out_path: str) -> str:
     dips   = np.asarray(crown_res['dip_indices'], dtype=int)
     thresh = float(crown_res['dip_depth_thresh'])
     n_bands = crown_res.get('n_bands', '?')
+    bounds = np.asarray(crown_res.get('boundary_z', []), dtype=float)
 
     fig = go.Figure()
     fig.add_trace(go.Scatter(
@@ -272,14 +273,20 @@ def plot_crown_dips_html(crown_res: dict, out_path: str) -> str:
         hovertemplate="z=%{x:.4f}<br>points/slice=%{y:.1f}<extra></extra>"))
     if len(dips):
         fig.add_trace(go.Scatter(
-            x=zc[dips], y=cnt[dips], mode='markers', name='crown dips',
-            marker=dict(size=12, color='red', symbol='triangle-down'),
-            hovertemplate="DIP<br>z=%{x:.4f}<br>points/slice=%{y:.1f}<extra></extra>"))
+            x=zc[dips], y=cnt[dips], mode='markers', name='candidate dips',
+            marker=dict(size=10, color='lightgray', symbol='triangle-down',
+                        line=dict(color='gray', width=1)),
+            hovertemplate="candidate dip<br>z=%{x:.4f}<br>points/slice=%{y:.1f}<extra></extra>"))
+    for i, zb in enumerate(bounds):
+        fig.add_vline(x=float(zb), line=dict(color='red', width=1.5),
+                      annotation_text='boundary' if i == 0 else None,
+                      annotation_position='top')
     fig.add_hline(y=thresh, line=dict(color='red', dash='dot', width=1),
                   annotation_text='depth cutoff', annotation_position='top left')
     fig.update_layout(
         template='plotly_white', height=420, margin=dict(l=40, r=20, t=50, b=40),
-        title=f"Crown dips -> {n_bands} crown-to-crown bands  ({len(dips)} dips)",
+        title=f"Crown boundaries -> {n_bands} crowns  "
+              f"({len(bounds)} cuts from {len(dips)} candidate dips)",
         xaxis_title='z_cylindrical', yaxis_title='points / slice')
     pio.write_html(fig, out_path, auto_open=False, config={'scrollZoom': True})
     return out_path

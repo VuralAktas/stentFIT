@@ -275,7 +275,7 @@ def load_update_stent_data(stent_dir, material_name, youngs_modulus, poissons_ra
     """Load stent geometry/skeleton data and extend features with material parameters.
 
     ``stent_dir`` is the per-stent output folder (e.g.
-    ``examples/notebook_outputs/<STENT_NAME>/``), mirroring the ``output_dir`` argument
+    ``outputs/stent_skeleton/<STENT_NAME>/``), mirroring the ``output_dir`` argument
     of ``sample_stent_points``. Each key in the returned features dict maps to
     {"value": ..., "unit": "..."}.
     Density is stored in kg/m³; callers using the mm-N-tonne system must convert to t/mm³.

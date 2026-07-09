@@ -235,9 +235,10 @@ def check_stent_artery_fit(
     skel_mapped: np.ndarray,
     skel: "pd.DataFrame",
     features: dict,
-    artery_mesh: trimesh.Trimesh,
     artery_cl: np.ndarray,
     artery_radius: float,
+    *,
+    artery_mesh: "trimesh.Trimesh | None" = None,
     n_sample: int = 3000,
     rng_seed: int = 42,
 ) -> dict:
@@ -246,14 +247,21 @@ def check_stent_artery_fit(
     Check 5 (bending strain) is material-based when 'max_elastic_strain' is present
     in features, otherwise falls back to a geometric heuristic.
 
+    Containment / clearance (checks 3 & 4) are measured as each stent node's
+    **radial distance from the artery centreline** vs. the lumen radius. This is
+    mesh-independent, so it works for any wall thickness — a two-shell *walled*
+    artery mesh has an ambiguous surface inside/outside test, which used to make
+    containment misreport. It uses the nominal ``artery_radius`` (wall roughness is
+    approximated, not resolved).
+
     Parameters
     ----------
-    skel_mapped   : (N, 3) ndarray
+    skel_mapped   : (N, 3) ndarray  placed (warped) stent node positions
     skel          : DataFrame  (skeleton table with node_type, neighbor_ids)
     features      : dict       (each key maps to {"value": ..., "unit": "..."})
-    artery_mesh   : trimesh.Trimesh
     artery_cl     : (M, 3) ndarray  artery centreline
     artery_radius : float           nominal artery lumen radius [mm]
+    artery_mesh   : trimesh.Trimesh, optional  no longer used (kept for API compat)
     n_sample      : int             nodes sampled for checks 3 & 4
 
     Returns
@@ -294,23 +302,35 @@ def check_stent_artery_fit(
         ),
     )
 
-    # ── 3 & 4. Containment + wall clearance (shared KD-tree query) ────────────
+    # ── 3 & 4. Containment + wall clearance (radial distance to the centreline) ─
+    # Mesh-independent: compare each sampled stent node's radial distance from the
+    # artery centreline against the lumen radius. Robust for any wall thickness /
+    # shape (a two-shell walled mesh has an ambiguous inside/outside test).
     print("  [3/5] Containment + [4/5] Clearance … ", end="", flush=True)
     idx = rng.choice(len(skel_mapped), min(n_sample, len(skel_mapped)), replace=False)
-    inside, dists = _inside_mesh_kdtree(artery_mesh, skel_mapped[idx])
+    pts = np.asarray(skel_mapped)[idx]
 
+    tang = np.gradient(artery_cl, axis=0)
+    tang /= np.linalg.norm(tang, axis=1, keepdims=True)
+    _, nidx = cKDTree(artery_cl).query(pts, workers=-1)
+    vec = pts - artery_cl[nidx]
+    axial = np.einsum("ij,ij->i", vec, tang[nidx])                 # component along the axis
+    radial_dist = np.sqrt(np.maximum(np.einsum("ij,ij->i", vec, vec) - axial ** 2, 0.0))
+
+    inside = radial_dist < artery_radius
     pct = inside.mean() * 100
     checks["containment"] = dict(
         sampled    = len(idx),
         pct_inside = round(pct, 1),
         passed     = pct >= 95.0,
-        note = f"{pct:.1f}% of {len(idx):,} sampled nodes inside artery lumen",
+        note = (f"{pct:.1f}% of {len(idx):,} sampled nodes inside artery lumen "
+                f"(radial distance < {artery_radius:.3f} mm)"),
     )
 
-    n_penet  = int((~inside).sum())
-    clr      = np.where(inside, dists, -dists)
-    min_cl   = float(clr.min())
-    strut_r  = features["strut_thickness"]["value"] / 2.0 if "strut_thickness" in features else 0.0
+    clearance = artery_radius - radial_dist          # + inside the lumen, - penetrating
+    n_penet   = int((radial_dist >= artery_radius).sum())
+    min_cl    = float(clearance.min())
+    strut_r   = features["strut_thickness"]["value"] / 2.0 if "strut_thickness" in features else 0.0
     passed_cl = (n_penet == 0) and (min_cl >= strut_r)
     print(f"{pct:.1f}% inside, min clearance {min_cl:.3f} mm, {n_penet} penetrating")
     checks["clearance"] = dict(
@@ -320,7 +340,7 @@ def check_stent_artery_fit(
         sampled          = len(idx),
         passed           = passed_cl,
         note = (
-            f"Min wall clearance {min_cl:.3f} mm "
+            f"Min lumen clearance {min_cl:.3f} mm "
             f"(strut radius {strut_r:.3f} mm), {n_penet} penetrating nodes"
         ),
     )
@@ -376,5 +396,124 @@ def check_stent_artery_fit(
         passed                    = ok_curv,
         note                      = curv_note,
     )
+
+    return checks
+
+
+def check_coupling_assumptions(
+    *,
+    beam_youngs: float,
+    solid_youngs: float,
+    beam_diameter: float,
+    beam_element_length: float,
+    solid_element_length: float,
+    stiffness_ratio_min: float = 10.0,
+    length_ratio_min: float = 1,
+    length_ratio_max: float = 6,
+    length_ratio_accuracy_max: float = 8.0,
+) -> dict:
+    """Validity checks for mixed-dimensional 1D-beam-to-3D-solid (mortar) coupling.
+
+    These are the Steinbrecher et al. conditions the coupling relies on, and are
+    separate from the geometric ``check_stent_artery_fit`` (which checks fit, not
+    the numerical coupling assumptions):
+
+    1. **stiffness** — the beam (stent) must be much stiffer than the solid
+       (artery): ``E_beam / E_solid >= stiffness_ratio_min``.
+    2. **rule_of_thumb** — the solid element must be at least as large as the beam
+       cross-section: ``L_solid >= D_beam`` (i.e. the beam cross-section is small
+       compared to the solid elements).
+    3. **element_length_ratio** — the beam-to-solid element ratio ``r = L_beam / L_solid``
+       must sit in the valid band ``length_ratio_min <= r <= length_ratio_accuracy_max``:
+       a **lower** bound (beam elements fairly long vs the solid, so the mortar
+       coupling is well-conditioned) and an **upper accuracy** bound — the L2 error
+       of the coupling is flat up to ``r ~ 8`` and then climbs steeply (Steinbrecher
+       et al. convergence study), so ``r`` must not exceed ``length_ratio_accuracy_max``.
+       The recommended optimum is ``length_ratio_min .. length_ratio_max`` (~2.5-5).
+
+    Parameters
+    ----------
+    beam_youngs, solid_youngs : float   Young's moduli of the beam / solid [MPa]
+    beam_diameter             : float   beam cross-section diameter [mm] (= 2 x beam radius = strut thickness)
+    beam_element_length       : float   beam (1D) element length [mm]
+    solid_element_length      : float   representative solid element edge length [mm]
+    stiffness_ratio_min       : float   min E_beam / E_solid
+    length_ratio_min, length_ratio_max     : float   recommended (optimal) band for L_beam / L_solid
+    length_ratio_accuracy_max : float   hard upper limit on L_beam / L_solid (accuracy cliff, ~8)
+
+    Returns
+    -------
+    dict  {check_name: {passed, note, ...values...}, "all_passed": bool}
+        Also prints a short pass/fail table.
+    """
+    checks = {}
+
+    # 1. Stiffness ratio -------------------------------------------------------
+    stiff = beam_youngs / solid_youngs if solid_youngs > 0 else float("inf")
+    ok_stiff = stiff >= stiffness_ratio_min
+    checks["stiffness"] = dict(
+        E_beam_MPa    = beam_youngs,
+        E_solid_MPa   = solid_youngs,
+        ratio         = round(stiff, 2),
+        threshold_min = stiffness_ratio_min,
+        passed        = bool(ok_stiff),
+        note = (f"E_beam/E_solid = {stiff:.1f} "
+                f"({'>=' if ok_stiff else '<'} {stiffness_ratio_min}) "
+                f"- beam {'is' if ok_stiff else 'is NOT'} much stiffer than the solid"),
+    )
+
+    # 2. Rule of thumb: solid element size >= beam cross-section diameter -------
+    rot = solid_element_length / beam_diameter if beam_diameter > 0 else float("inf")
+    ok_rot = solid_element_length >= beam_diameter
+    checks["rule_of_thumb"] = dict(
+        solid_element_mm = round(solid_element_length, 4),
+        beam_diameter_mm = round(beam_diameter, 4),
+        ratio            = round(rot, 2),
+        threshold_min    = 1.0,
+        passed           = bool(ok_rot),
+        note = (f"L_solid/D_beam = {rot:.2f} "
+                f"({'>=' if ok_rot else '<'} 1) - solid element "
+                f"{'>=' if ok_rot else '<'} beam cross-section diameter"),
+    )
+
+    # 3. Element length ratio: beam elements long vs solid, but not too long ---
+    #    Valid band [length_ratio_min, length_ratio_accuracy_max]: below -> mortar
+    #    coupling poorly conditioned; above ~8 -> L2 error grows (Steinbrecher).
+    lr = beam_element_length / solid_element_length if solid_element_length > 0 else float("inf")
+    ok_lr = length_ratio_min <= lr <= length_ratio_accuracy_max
+    within_optimal = length_ratio_min <= lr <= length_ratio_max
+    if lr > length_ratio_accuracy_max:
+        lr_note = (f"L_beam/L_solid = {lr:.2f} (> {length_ratio_accuracy_max}) "
+                   f"- too long: L2 coupling error grows; refine the solid or coarsen the beam")
+    elif lr < length_ratio_min:
+        lr_note = (f"L_beam/L_solid = {lr:.2f} (< {length_ratio_min}) "
+                   f"- beam elements are NOT fairly long vs solid elements")
+    elif within_optimal:
+        lr_note = (f"L_beam/L_solid = {lr:.2f} - in the optimal "
+                   f"{length_ratio_min}-{length_ratio_max} band")
+    else:
+        lr_note = (f"L_beam/L_solid = {lr:.2f} - acceptable "
+                   f"(above the {length_ratio_max} optimum, below the "
+                   f"{length_ratio_accuracy_max} accuracy limit)")
+    checks["element_length_ratio"] = dict(
+        beam_element_mm  = round(beam_element_length, 4),
+        solid_element_mm = round(solid_element_length, 4),
+        ratio            = round(lr, 2),
+        valid_band       = (length_ratio_min, length_ratio_accuracy_max),
+        optimal_band     = (length_ratio_min, length_ratio_max),
+        within_optimal   = bool(within_optimal),
+        passed           = bool(ok_lr),
+        note             = lr_note,
+    )
+
+    all_passed = all(c["passed"] for c in checks.values())
+    checks["all_passed"] = all_passed
+
+    print("Mixed-dimensional coupling assumption check")
+    print("-------------------------------------------")
+    for name in ("stiffness", "rule_of_thumb", "element_length_ratio"):
+        c = checks[name]
+        print(f"  [{'PASS' if c['passed'] else 'FAIL'}] {name:22s} {c['note']}")
+    print(f"  => {'ALL CHECKS PASSED' if all_passed else 'ONE OR MORE CHECKS FAILED'}")
 
     return checks

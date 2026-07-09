@@ -57,6 +57,7 @@ def run_skeletonization_2d(stl_file:str,
                            max_display:int = 500_000,
                            remove_supports:bool = False,
                            random_seed:int = 0,
+                           n_crowns:int = None,
                            auto_tune:bool = True,
                            pixels_per_strut:int = 10,
                            dilate_px:int = 3,
@@ -113,7 +114,7 @@ def run_skeletonization_2d(stl_file:str,
     centerline_dir = sampled['stent_centerline_direction']
 
     crowns = detect_crowns(stent_df, stent_features, stent_name, output_dir,
-                           max_display=max_display)
+                           max_display=max_display, n_crowns=n_crowns)
     stent_df       = crowns['stent_df']
     crown_edges    = crowns['crown_edges']
     conn_radius_3d = crowns['conn_radius_3d']
@@ -219,11 +220,11 @@ def finalize_skeleton(state:dict,
 def stent_pipeline( stl_file:str,
                     output_dir:str,
                     stent_name:str,
-                    mesh_beams:bool = False,
                     n_points:int = None,
                     max_display:int = 500_000,
                     remove_supports:bool = False,
                     random_seed:int = 0,
+                    n_crowns:int = None,
                     auto_tune:bool = True,
                     pixels_per_strut:int = 10,
                     dilate_px:int = 3,
@@ -250,6 +251,7 @@ def stent_pipeline( stl_file:str,
                                     max_display=max_display,
                                     remove_supports=remove_supports,
                                     random_seed=random_seed,
+                                    n_crowns=n_crowns,
                                     auto_tune=auto_tune,
                                     pixels_per_strut=pixels_per_strut,
                                     dilate_px=dilate_px,
@@ -272,14 +274,9 @@ def stent_pipeline( stl_file:str,
                                 prune_tip_frac=prune_tip_frac,
                                 max_display=max_display,
                                 random_seed=random_seed)
-    
-    if mesh_beams:
-        beam_mesh = mesh_skeleton_beams(output_dir=output_dir,
-                                        l_el=l_el,
-                                        youngs_modulus=youngs_modulus,
-                                        poisson_ratio=poisson_ratio,
-                                        density=density,
-                                        beam_class_label=beam_class_label)
+
 
 
     print(f"[pipeline] done -> {output_dir}") 
+
+    return state

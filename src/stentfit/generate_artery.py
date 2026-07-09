@@ -182,6 +182,28 @@ def _build_tube_mesh(
     return mesh
 
 
+def _add_outer_wall(
+    inner_mesh: trimesh.Trimesh,
+    centerline: np.ndarray,
+    radii: np.ndarray,
+    wall_thickness: float,
+    n_circumference: int,
+) -> trimesh.Trimesh:
+    """
+    Give a lumen surface a wall of finite thickness.
+
+    Builds an outer shell at ``radii + wall_thickness``, flips the inner
+    (lumen) surface normals so they point into the wall, and concatenates the
+    two shells into a single two-surface mesh. This is the inner/outer boundary
+    representation of the artery wall; the volumetric (tet/hex) fill between the
+    shells is produced later by the 3D solid mesher.
+    """
+    outer_radii = radii + wall_thickness
+    outer = _build_tube_mesh(centerline, outer_radii, n_circumference)
+    inner_mesh.invert()
+    return trimesh.util.concatenate([outer, inner_mesh])
+
+
 # ---------------------------------------------------------------------------
 # Centreline generators
 # ---------------------------------------------------------------------------
@@ -388,11 +410,7 @@ def generate_straight_artery(
                             noise_amplitude=noise_amplitude, noise_seed=noise_seed)
 
     if wall_thickness > 0:
-        outer_radii = np.full(n_axial, radius + wall_thickness)
-        outer = _build_tube_mesh(cl, outer_radii, n_circumference)
-        # Flip normals of inner surface and combine
-        mesh.invert()
-        mesh = trimesh.util.concatenate([outer, mesh])
+        mesh = _add_outer_wall(mesh, cl, radii, wall_thickness, n_circumference)
 
     return mesh
 
@@ -402,6 +420,7 @@ def generate_curved_artery(
     length: float = 30.0,
     bend_radius: float = 20.0,
     bend_angle_deg: float = 45.0,
+    wall_thickness: float = 0.0,
     n_circumference: int = 32,
     n_axial: int = 100,
     noise_amplitude: float = 0.0,
@@ -427,8 +446,11 @@ def generate_curved_artery(
     """
     cl = curved_centreline(length, bend_radius, bend_angle_deg, n_axial)
     radii = np.full(n_axial, radius)
-    return _build_tube_mesh(cl, radii, n_circumference,
+    mesh = _build_tube_mesh(cl, radii, n_circumference,
                             noise_amplitude=noise_amplitude, noise_seed=noise_seed)
+    if wall_thickness > 0:
+        mesh = _add_outer_wall(mesh, cl, radii, wall_thickness, n_circumference)
+    return mesh
 
 
 def generate_s_bend_artery(
@@ -436,6 +458,7 @@ def generate_s_bend_artery(
     length: float = 40.0,
     bend_radius: float = 25.0,
     bend_angle_deg: float = 25.0,
+    wall_thickness: float = 0.0,
     n_circumference: int = 32,
     n_axial: int = 150,
     noise_amplitude: float = 0.0,
@@ -461,14 +484,18 @@ def generate_s_bend_artery(
     """
     cl = s_bend_centreline(length, bend_radius, bend_angle_deg, n_axial)
     radii = np.full(len(cl), radius)
-    return _build_tube_mesh(cl, radii, n_circumference,
+    mesh = _build_tube_mesh(cl, radii, n_circumference,
                             noise_amplitude=noise_amplitude, noise_seed=noise_seed)
+    if wall_thickness > 0:
+        mesh = _add_outer_wall(mesh, cl, radii, wall_thickness, n_circumference)
+    return mesh
 
 
 def generate_tapered_artery(
     radius_proximal: float = 2.0,
     radius_distal: float = 1.2,
     length: float = 30.0,
+    wall_thickness: float = 0.0,
     n_circumference: int = 32,
     n_axial: int = 100,
     noise_amplitude: float = 0.0,
@@ -492,8 +519,11 @@ def generate_tapered_artery(
     """
     cl = straight_centreline(length, n_axial)
     radii = tapered_radii(radius_proximal, radius_distal, n_axial)
-    return _build_tube_mesh(cl, radii, n_circumference,
+    mesh = _build_tube_mesh(cl, radii, n_circumference,
                             noise_amplitude=noise_amplitude, noise_seed=noise_seed)
+    if wall_thickness > 0:
+        mesh = _add_outer_wall(mesh, cl, radii, wall_thickness, n_circumference)
+    return mesh
 
 
 def generate_artery_for_stent(
@@ -502,6 +532,7 @@ def generate_artery_for_stent(
     noise_amplitude: float = 0.1,
     noise_seed: int | None = 42,
     bend_angle_deg: float = 45.0,
+    wall_thickness: float = 0.5,
 ) -> tuple:
     """
     Generate an artery mesh and centreline sized to match the given stent features.
@@ -516,6 +547,9 @@ def generate_artery_for_stent(
     noise_amplitude: fractional radius perturbation (0 = smooth, 0.05 = ±5%)
     noise_seed     : int for reproducibility, or None for random
     bend_angle_deg : bend angle [deg]; only used for "curved" and "s_bend"
+    wall_thickness : artery wall thickness [mm]; 0 = lumen surface only, >0 adds
+                     an outer shell at (lumen_radius + wall_thickness) so the mesh
+                     carries the inner+outer wall boundary for the 3D solid mesher.
 
     Returns
     -------
@@ -535,16 +569,19 @@ def generate_artery_for_stent(
     configs = {
         "straight": dict(
             radius=artery_radius, length=stent_length * 1.5,
+            wall_thickness=wall_thickness,
             n_circumference=64, n_axial=150,
         ),
         "curved": dict(
             radius=artery_radius, length=stent_length * 1.5,
             bend_radius=_br_c, bend_angle_deg=bend_angle_deg,
+            wall_thickness=wall_thickness,
             n_circumference=64, n_axial=150,
         ),
         "s_bend": dict(
             radius=artery_radius, length=stent_length * 2.0,
             bend_radius=_br_s, bend_angle_deg=bend_angle_deg,
+            wall_thickness=wall_thickness,
             n_circumference=64, n_axial=150,
         ),
     }
@@ -567,7 +604,10 @@ def generate_artery_for_stent(
     total_arc = np.linalg.norm(np.diff(artery_cl, axis=0), axis=1).sum()
 
     print(f"Artery type      : {artery_type}")
-    print(f"Artery radius    : {artery_radius:.3f} mm")
+    print(f"Artery radius    : {artery_radius:.3f} mm (lumen)")
+    print(f"Wall thickness   : {wall_thickness:.3f} mm"
+          + (f"  (outer radius {artery_radius + wall_thickness:.3f} mm)" if wall_thickness > 0
+             else "  (lumen surface only)"))
     print(f"Noise amplitude  : {noise_amplitude} ({noise_amplitude*100:.0f}% of radius)  seed={noise_seed}")
     if artery_type == "curved":
         print(f"Bend angle       : {bend_angle_deg:.1f} deg")

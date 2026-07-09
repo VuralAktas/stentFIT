@@ -17,6 +17,7 @@ trimesh = ">=4.12.2"
 scikit-image = ">=0.26.0"
 scikit-learn = ">=1.9.0"
 beamme = ">=0.2.0"
+gmsh = ">=4.15.0"    # artery solid meshing (Mac-native; replaced Cubit/CubitPy)
 
 
 [dependency-groups]
@@ -24,4 +25,10 @@ dev = [
     "ipykernel (>=7.3.0,<8.0.0)",
     "ipython (>=9.15.0,<10.0.0)",
     "jupyter (>=1.1.1,<2.0.0)"
+]
+# 4C extras. fourcipp parses & writes 4C input files (needed to import the GMSH
+# solid mesh and dump the assembled .4C.yaml). The artery is meshed with GMSH
+# (a core dependency above); Cubit/CubitPy was dropped — it has no macOS build.
+fourc = [
+    "fourcipp (>=1.132.0)"
 ]
