@@ -1,6 +1,5 @@
 import numpy as np
 import trimesh
-from trimesh.path.entities import Line
 import matplotlib.pyplot as plt
 from matplotlib.colors import rgb_to_hsv, to_rgb
 from matplotlib.lines import Line2D
@@ -12,6 +11,7 @@ import glob
 import base64
 from scipy.spatial import cKDTree
 from scipy.interpolate import splev
+from trimesh.viewer import notebook as _tvn
 import plotly.graph_objects as go
 import plotly.io as pio
 import plotly.colors as pcolors
@@ -759,60 +759,74 @@ def plot_skeleton_splines_2d(skeleton_curves, skeleton_splines, stent_df, r_mid,
 
 
 
-def plot_skeleton_splines_trimesh(skeleton_splines, output_dir, show=False):
-    """Export the fitted splines as a coloured 3D path (.glb + trimesh .html).
+def plot_skeleton_splines_trimesh(skeleton_splines, output_dir, show=False, tube_radius=None, sections=6):
+    """Export the fitted splines as a coloured 3D tube mesh (.glb + trimesh .html).
 
-    Evaluates each spline into a polyline, builds a ``trimesh.path.Path3D`` with one
-    colour per curve, writes a portable ``skeleton_splines.glb`` and a self-contained
+    Evaluates each spline into a polyline and builds a solid tube (chained
+    cylinder segments) per curve rather than a ``Path3D`` of GL lines: exported
+    glTF ``LINES`` are rendered with a hairline width by most browsers (three.js
+    ignores ``linewidth`` on most GL backends), so real geometry is the only
+    reliable way to get a visibly thick curve in the exported HTML. Writes a
+    portable ``skeleton_splines.glb`` and a self-contained
     ``skeleton_splines_trimesh.html``, and (when ``show``) opens the interactive
-    trimesh window. ``show`` defaults to ``False`` so the function stays headless-safe
-    (opening the window needs a GUI backend such as ``pyglet``); the ``.html`` file is
-    the portable view.
+    trimesh window. ``show`` defaults to ``False`` so the function stays
+    headless-safe (opening the window needs a GUI backend such as ``pyglet``);
+    the ``.html`` file is the portable view. ``tube_radius`` defaults to ~0.3%
+    of the overall bounding-box diagonal when not given.
     """
-    _verts, _ents, _cols = [], [], []
-    _off  = 0
+    _curves = []
     _cmap = plt.get_cmap('tab20')
-    _n    = 0
     for spl in skeleton_splines:
         if spl is None:
             continue
         if spl['tck'] is not None:
-            xx, yy, zz = splev(np.linspace(0.0, 1.0, 120), spl['tck'])
+            xx, yy, zz = splev(np.linspace(0.0, 1.0, 60), spl['tck'])
             pts = np.column_stack([xx, yy, zz])
         else:                                    # degree-1 polyline fallback
             pts = np.asarray(spl['ctrl'], float)
         if len(pts) < 2:
             continue
-        _ents.append(Line(np.arange(_off, _off + len(pts))))
-        _verts.append(pts)
-        _cols.append((np.array(_cmap(_n % 20)) * 255).astype(np.uint8))
-        _off += len(pts)
-        _n   += 1
+        _curves.append(pts)
 
-    spline_path = trimesh.path.Path3D(entities=_ents, vertices=np.vstack(_verts))
-    try:
-        spline_path.colors = np.array(_cols, dtype=np.uint8)
-    except Exception as e:
-        print(f"[trimesh] per-curve colouring skipped: {e}")
+    if not _curves:
+        print("[trimesh] no curves to plot")
+        return None
+
+    if tube_radius is None:
+        _all_pts = np.vstack(_curves)
+        _diag = np.linalg.norm(_all_pts.max(axis=0) - _all_pts.min(axis=0))
+        tube_radius = 0.003 * _diag
+
+    _tubes = []
+    for _n, pts in enumerate(_curves):
+        _color = (np.array(_cmap(_n % 20)) * 255).astype(np.uint8)
+        _segments = [
+            trimesh.creation.cylinder(radius=tube_radius, segment=[pts[i], pts[i + 1]], sections=sections)
+            for i in range(len(pts) - 1)
+        ]
+        _curve_mesh = trimesh.util.concatenate(_segments)
+        _curve_mesh.visual.face_colors = _color
+        _tubes.append(_curve_mesh)
+
+    spline_mesh = trimesh.util.concatenate(_tubes)
 
     splines_glb   = os.path.join(output_dir, 'skeleton_splines.glb')
     splines_thtml = os.path.join(output_dir, 'skeleton_splines_trimesh.html')
     with open(splines_glb, 'wb') as f:
-        f.write(spline_path.scene().export(file_type='glb'))
+        f.write(spline_mesh.scene().export(file_type='glb'))
     try:
-        from trimesh.viewer import notebook as _tvn
         with open(splines_thtml, 'w') as f:
-            f.write(_tvn.scene_to_html(spline_path.scene()))
+            f.write(_tvn.scene_to_html(spline_mesh.scene()))
         print(f"[saved] {splines_thtml}")
     except Exception as e:
         print(f"[trimesh] html export skipped: {e}")
-    print(f"[saved] {splines_glb}  ({_n} spline curves)")
+    print(f"[saved] {splines_glb}  ({len(_curves)} spline curves, tube_radius={tube_radius:.4g})")
 
     if show:
         try:
-            spline_path.show()
+            spline_mesh.show()
         except Exception as e:
             print(f"[trimesh] interactive window skipped ({e}); "
                   f"use skeleton_splines_trimesh.html instead")
-    return spline_path
+    return spline_mesh
 

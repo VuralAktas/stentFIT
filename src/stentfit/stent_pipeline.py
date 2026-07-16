@@ -1,7 +1,9 @@
 import os
-
 import numpy as np
 import trimesh
+import shutil   # For overwriting the selected stent folder
+import re       # For using the existing folder  
+
 
 # Relative imports so the pipeline works from an installed wheel, independent of the
 # repository layout or the caller's working directory.
@@ -26,7 +28,6 @@ def _pick_existing_output_dir(output_dir:str) -> str:
     If more than one exists, list them and let the user choose; otherwise return the
     only candidate unchanged.
     """
-    import re
 
     parent, base = os.path.split(output_dir.rstrip('/\\'))
     parent = parent or '.'
@@ -83,7 +84,6 @@ def run_skeletonization_2d(stl_file:str,
             f"  [e] use it as-is   [o] overwrite (wipe it first)   "
             f"[n] make a new versioned folder\nChoose [e/o/n]: ").strip().lower()
         if choice.startswith('o'):
-            import shutil
             shutil.rmtree(output_dir)
             print(f"[output] wiped and reusing {output_dir}")
         elif choice.startswith('n'):

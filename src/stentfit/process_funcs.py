@@ -401,7 +401,6 @@ def check_stent_artery_fit(
 
 
 def check_coupling_assumptions(
-    *,
     beam_youngs: float,
     solid_youngs: float,
     beam_diameter: float,
@@ -509,7 +508,7 @@ def check_coupling_assumptions(
     all_passed = all(c["passed"] for c in checks.values())
     checks["all_passed"] = all_passed
 
-    print("Mixed-dimensional coupling assumption check")
+    print("\nMixed-dimensional coupling assumption check")
     print("-------------------------------------------")
     for name in ("stiffness", "rule_of_thumb", "element_length_ratio"):
         c = checks[name]

@@ -6,6 +6,11 @@ from collections import Counter
 from scipy.interpolate import splprep
 
 from .stent_plotting import plot_splines_html
+import splinepy 
+from beamme.core.mesh import Mesh
+from beamme.four_c.material import MaterialReissner
+from beamme.four_c.element_beam import Beam3rHerm2Line3, Beam3rLine2Line2
+from beamme.mesh_creation_functions.beam_splinepy import create_beam_mesh_from_splinepy
 
 
 def group_skeleton_curves(skeleton_points_df):
@@ -198,7 +203,7 @@ def _feat(stent_features, key):
 def _bspline_from_record(rec):
     """Rebuild a splinepy.BSpline from a skeleton_splines.json curve record.
     knot_vector=None marks a degree-1 polyline fallback -> clamped uniform knots."""
-    import splinepy
+
     ctrl = np.asarray(rec['control_points'], float)
     if rec['knot_vector'] is not None:
         return splinepy.BSpline(degrees=[int(rec['degree'])],
@@ -220,11 +225,6 @@ def mesh_skeleton_beams(input_dir, output_dir, l_el=0.1, youngs_modulus=2.0e5, p
     ``skeleton_beam_mesh_beam.vtu`` and returns the mesh. Imports ``splinepy`` /
     ``beamme`` lazily so the rest of ``stent_funcs`` runs without those heavy deps.
     """
-    import splinepy  # noqa: F401  (used indirectly via _bspline_from_record)
-    from beamme.core.mesh import Mesh
-    from beamme.four_c.material import MaterialReissner
-    from beamme.four_c.element_beam import Beam3rHerm2Line3, Beam3rLine2Line2
-    from beamme.mesh_creation_functions.beam_splinepy import create_beam_mesh_from_splinepy
 
     beam_classes = {'Beam3rHerm2Line3': Beam3rHerm2Line3,
                     'Beam3rLine2Line2': Beam3rLine2Line2}
@@ -237,8 +237,6 @@ def mesh_skeleton_beams(input_dir, output_dir, l_el=0.1, youngs_modulus=2.0e5, p
         splines_data = json.load(f)
 
     strut_thickness = float(_feat(stent_features, 'strut_thickness'))
-    print(f"[folder] read stent_features.json from {input_dir}")
-    print(f"[folder] strut_thickness = {strut_thickness:.4f} mm")
 
     beam_radius = strut_thickness / 2.0            # circular cross-section radius (mm)
 
@@ -247,13 +245,21 @@ def mesh_skeleton_beams(input_dir, output_dir, l_el=0.1, youngs_modulus=2.0e5, p
                                  nu=poisson_ratio, density=density)
 
     n_meshed, n_skipped = 0, 0
-    for rec in splines_data['curves']:
+    for curve_idx, rec in enumerate(splines_data['curves']):
         if rec is None or len(rec['control_points']) < 2:
             n_skipped += 1
             continue
         try:
+            n_before = len(beam_mesh.elements)
             create_beam_mesh_from_splinepy(beam_mesh, beam_class, beam_mat,
                                            _bspline_from_record(rec), l_el=l_el)
+            # Tag this curve's new elements with a per-element cell scalar for ParaView.
+            # This is VTK-only visualization data (element.vtk_cell_data -> get_vtk -> .vtu);
+            # InputFile.dump ignores it, so it has no effect on the 4C simulation.
+            #   curve_color : curve id folded into <=32 bins so ParaView's categorical
+            #                 colouring works (it caps at 32 distinct values)
+            for el in beam_mesh.elements[n_before:]:
+                el.vtk_cell_data["curve_color"] = curve_idx % 16
             n_meshed += 1
         except Exception as e:
             n_skipped += 1

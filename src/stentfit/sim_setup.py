@@ -1,21 +1,11 @@
-"""Step 5: build a runnable 4C input file from the assembled beam-to-solid mesh.
-
-``build_smoketest_input`` takes the assembled BeamMe mesh (artery solid + warped
-stent beams + beam-to-solid meshtying, from ``assemble_beam_solid``) and adds the
-sections 4C needs to actually run — solver control, runtime output, boundary
-conditions, and a radial "balloon-imitating" expansion load on the stent — then
-writes a **schema-validated** ``simulation.4C.yaml``.
-
-This is a **smoke test**: the goal is to get 4C to run end-to-end and write output,
-keeping the placeholder solid material and the (tied) meshtying coupling. Real
-deployment physics — beam-to-solid *contact*, HGO artery material, an elasto-plastic
-stent, and a calibrated load over ~100 steps — is a later phase.
-
-The file is built and schema-validated on any platform (needs ``beamme`` +
-``fourcipp``); *running* it needs a compiled 4C binary (Linux/HPC, ``BEAMME_FOUR_C_EXE``).
-"""
-
 import numpy as np
+from scipy.spatial import cKDTree
+from beamme.core.conf import bme
+from beamme.core.geometry_set import GeometrySet
+from beamme.core.boundary_condition import BoundaryCondition
+from beamme.core.function import Function
+from beamme.four_c.input_file import InputFile
+from beamme.four_c.header_functions import (set_header_static, set_runtime_output, set_beam_to_solid_meshtying)
 
 
 def _radial_directions(points: np.ndarray, artery_cl: np.ndarray) -> np.ndarray:
@@ -25,7 +15,6 @@ def _radial_directions(points: np.ndarray, artery_cl: np.ndarray) -> np.ndarray:
     component along the local centreline tangent, and normalise — so the force is
     purely radial (perpendicular to the vessel axis) for straight and curved arteries.
     """
-    from scipy.spatial import cKDTree
 
     artery_cl = np.asarray(artery_cl, dtype=float)
     tang = np.gradient(artery_cl, axis=0)
@@ -71,13 +60,7 @@ def build_smoketest_input(
     -------
     out_path : the written, schema-validated ``simulation.4C.yaml``.
     """
-    from beamme.core.conf import bme
-    from beamme.core.geometry_set import GeometrySet
-    from beamme.core.boundary_condition import BoundaryCondition
-    from beamme.core.function import Function
-    from beamme.four_c.input_file import InputFile
-    from beamme.four_c.header_functions import (set_header_static, set_runtime_output,
-                                                set_beam_to_solid_meshtying)
+
 
     inp = InputFile()
 
