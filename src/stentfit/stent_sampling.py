@@ -363,23 +363,6 @@ def load_update_stent_data(stent_dir, material_name, youngs_modulus, poissons_ra
 
 
 
-def drop_points(stent_df: pd.DataFrame, point_ids) -> pd.DataFrame:
-    """Remove rows from the point cloud by ``point_id``.
-
-    ``point_ids`` is any iterable of ids (empty / None -> no-op). The original
-    ``point_id`` values are preserved (no renumbering) so ids the user reads off
-    an earlier HTML view stay valid across rounds. Returns a new DataFrame.
-    """
-    if point_ids is None:
-        return stent_df
-    ids = [int(p) for p in point_ids]
-    if not ids:
-        return stent_df
-    keep = ~stent_df['point_id'].isin(ids)
-    return stent_df[keep].reset_index(drop=True)
-
-
-
 def sample_stent_points(mesh, stent_name, output_dir, n_points=None,
                         samples_per_face=1, max_display=500_000,
                         remove_supports=False, random_seed=0):

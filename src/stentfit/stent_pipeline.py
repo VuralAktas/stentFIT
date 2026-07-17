@@ -235,12 +235,6 @@ def stent_pipeline( stl_file:str,
 
                     wrap_max_surf:int = 2_000_000,
                     prune_tip_frac:float = 0,
-
-                    l_el:float=0.1,
-                    youngs_modulus:float=2.0e5,
-                    poisson_ratio:float=0.3,
-                    density:float=0.0,
-                    beam_class_label:str='Beam3rHerm2Line3', 
                     ):
     
 

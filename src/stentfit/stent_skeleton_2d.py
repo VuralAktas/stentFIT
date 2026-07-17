@@ -326,89 +326,6 @@ def check_skeleton_quality(
 
 
 
-def remove_bad_connections(
-    df_skeleton_2d: pd.DataFrame,
-    pixel_size: float,
-    stent_df: pd.DataFrame,
-    r_mid: float,
-    region_allowed: np.ndarray,
-    surf_tree: cKDTree = None,
-    surf_reg: np.ndarray = None,
-    verbose: bool = True,
-) -> dict:
-    """Delete skeleton points on edges that join two non-touching regions.
-
-    Region labels come from the nearest surface point, so removing every point on
-    a bad edge clears all bad edges in one pass and leaves a >=2 px gap (the 3D
-    rebuild won't re-bridge). Loops and empty regions are left untouched.
-    """
-    skel = df_skeleton_2d[['arc', 'z']].to_numpy()
-    n_sk = len(skel)
-
-    # Step 1: nearest-surface region per skeleton point
-    if surf_tree is None or surf_reg is None:
-        surf_arc  = r_mid * stent_df['theta'].to_numpy()
-        surf_z    = stent_df['z'].to_numpy()
-        surf_reg  = stent_df['region'].to_numpy()
-        surf_tree = cKDTree(np.column_stack([surf_arc, surf_z]))
-    _, nn       = surf_tree.query(skel)
-    skel_region = surf_reg[nn]
-
-    # Step 2: build the 8-neighbour grid graph (same as check_skeleton_quality)
-    gi = np.round((skel[:, 0] - skel[:, 0].min()) / pixel_size).astype(int)
-    gj = np.round((skel[:, 1] - skel[:, 1].min()) / pixel_size).astype(int)
-    coord_set = set(zip(gi.tolist(), gj.tolist()))
-    coord_idx = {(int(gi[k]), int(gj[k])): k for k in range(n_sk)}
-    edges = []
-    for k in range(n_sk):
-        ci, cj = int(gi[k]), int(gj[k])
-        for di, dj in ((1, 0), (0, 1)):
-            nb = coord_idx.get((ci + di, cj + dj))
-            if nb is not None:
-                edges.append((k, nb))
-        for di, dj in ((1, 1), (1, -1)):
-            nb = coord_idx.get((ci + di, cj + dj))
-            if nb is not None:
-                corner = ((ci + di, cj) in coord_set) or ((ci, cj + dj) in coord_set)
-                if not corner:
-                    edges.append((k, nb))
-    edges = np.array(edges, dtype=int) if edges else np.empty((0, 2), dtype=int)
-
-    # Step 3: drop points on edges between non-touching regions
-    remove = np.zeros(n_sk, dtype=bool)
-    n_bad_edges, bad_pairs = 0, []
-    if len(edges):
-        ra, rb = skel_region[edges[:, 0]], skel_region[edges[:, 1]]
-        bad    = (ra != rb) & ~region_allowed[ra, rb]
-        n_bad_edges = int(bad.sum())
-        if bad.any():
-            remove[np.unique(edges[bad].ravel())] = True
-            bad_pairs = [tuple(int(x) for x in p) for p in
-                         np.unique(np.sort(np.column_stack([ra[bad], rb[bad]]), axis=1), axis=0)]
-
-    df_clean = df_skeleton_2d.loc[~remove].reset_index(drop=True)
-    if verbose:
-        if n_bad_edges:
-            print(f"[clean] removed {int(remove.sum())} point(s) on {n_bad_edges} bad edge(s) "
-                  f"across {len(bad_pairs)} region pair(s) {bad_pairs} "
-                  f"-> {len(df_clean):,} points remain")
-        else:
-            print(f"[clean] no bad connections found -> skeleton unchanged "
-                  f"({len(df_clean):,} points)")
-
-    return {
-        'df_skeleton_2d': df_clean,
-        'skel_arc'      : df_clean['arc'].to_numpy(),
-        'skel_z'        : df_clean['z'].to_numpy(),
-        'pixel_size'    : pixel_size,
-        'n_removed'     : int(remove.sum()),
-        'n_bad_edges'   : n_bad_edges,
-        'removed_xy'    : skel[remove],   # (K, 2) (arc, z) of the cut points
-        'bad_pairs'     : bad_pairs,
-    }
-
-
-
 def tune_skeleton_params(
     arc: np.ndarray,
     z: np.ndarray,
@@ -636,9 +553,8 @@ def _grid_adjacency(arc, z, pixel_size):
     """8-neighbour pixel-grid graph for a 2D skeleton (arc, z).
 
     Returns (edges, adj): edges is an (K, 2) int array of index pairs, adj a list
-    of neighbour-index lists. Same rule as remove_bad_connections /
-    check_skeleton_quality (a diagonal is dropped when it short-cuts a
-    4-connected corner).
+    of neighbour-index lists. Same rule as check_skeleton_quality (a diagonal
+    is dropped when it short-cuts a 4-connected corner).
     """
     arc = np.asarray(arc, float)
     z   = np.asarray(z, float)

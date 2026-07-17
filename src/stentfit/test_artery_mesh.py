@@ -1,7 +1,6 @@
 import numpy as np
 import gmsh
 from pathlib import Path
-from stentfit.process_funcs import _compute_rmf
 from pathlib import Path
 
 from beamme.four_c.model_importer import (import_cubitpy_model,
@@ -53,11 +52,34 @@ def _apply_radial_noise(coords, length, amplitude, seed):
     return out
 
 
+def _compute_rmf(cl: np.ndarray):
+    """Rotation-minimising frame (Bishop frame) along a polyline centreline."""
+    n   = len(cl)
+    T   = np.zeros_like(cl, dtype=float)
+    T[0]    = cl[1] - cl[0]
+    T[-1]   = cl[-1] - cl[-2]
+    T[1:-1] = cl[2:] - cl[:-2]
+    nrm = np.linalg.norm(T, axis=1, keepdims=True)
+    T  /= np.where(nrm > 1e-12, nrm, 1.0)
+
+    seed = np.array([1.0, 0.0, 0.0])
+    if abs(T[0] @ seed) > 0.9:
+        seed = np.array([0.0, 1.0, 0.0])
+    N0 = np.cross(T[0], seed);  N0 /= np.linalg.norm(N0)
+
+    N = np.zeros_like(cl, dtype=float);  N[0] = N0
+    for i in range(1, n):
+        Ni = N[i-1] - (N[i-1] @ T[i]) * T[i]
+        l  = np.linalg.norm(Ni)
+        N[i] = Ni / l if l > 1e-12 else N[i-1]
+
+    return T, N, np.cross(T, N)
+
 def _warp_coords_to_centreline(coords, centreline):
     """Warp straight (+Z) node coordinates onto a 3D centreline with a
-    rotation-minimising frame (the same ``_compute_rmf`` used by
-    ``map_stent_to_artery``): each node's z is its arc-length coordinate, and its
-    (x, y) cross-section is placed via the local normal / binormal.
+    rotation-minimising frame (``_compute_rmf``): each node's z is its
+    arc-length coordinate, and its (x, y) cross-section is placed via the
+    local normal / binormal.
 
     The artery wall's cross-section is a circle, so the azimuthal orientation of
     the frame does not change the solid — the tube simply follows the centreline

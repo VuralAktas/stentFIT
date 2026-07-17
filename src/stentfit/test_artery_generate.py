@@ -361,13 +361,6 @@ def s_bend_centreline(
     return np.array(points)
 
 
-def tapered_radii(
-    r_start: float, r_end: float, n_points: int
-) -> np.ndarray:
-    """Linearly varying radius from r_start to r_end."""
-    return np.linspace(r_start, r_end, n_points)
-
-
 # ---------------------------------------------------------------------------
 # High-level generators
 # ---------------------------------------------------------------------------
@@ -481,41 +474,6 @@ def generate_s_bend_artery(
     """
     cl = s_bend_centreline(length, bend_radius, bend_angle_deg, n_axial)
     radii = np.full(len(cl), radius)
-    mesh = _build_tube_mesh(cl, radii, n_circumference,
-                            noise_amplitude=noise_amplitude, noise_seed=noise_seed)
-    if wall_thickness > 0:
-        mesh = _add_outer_wall(mesh, cl, radii, wall_thickness, n_circumference)
-    return mesh
-
-
-def generate_tapered_artery(
-    radius_proximal: float = 2.0,
-    radius_distal: float = 1.2,
-    length: float = 30.0,
-    wall_thickness: float = 0.0,
-    n_circumference: int = 32,
-    n_axial: int = 100,
-    noise_amplitude: float = 0.0,
-    noise_seed: int | None = None,
-) -> trimesh.Trimesh:
-    """
-    Generate a straight artery that tapers from proximal to distal end.
-
-    Parameters
-    ----------
-    radius_proximal : float
-        Radius at the start (proximal) end in mm.
-    radius_distal : float
-        Radius at the far (distal) end in mm.
-    length : float
-        Vessel length in mm.
-    noise_amplitude : float
-        Biological wall irregularity as a fraction of radius (0 = smooth, 0.05 = ±5%).
-    noise_seed : int or None
-        Random seed for reproducibility.
-    """
-    cl = straight_centreline(length, n_axial)
-    radii = tapered_radii(radius_proximal, radius_distal, n_axial)
     mesh = _build_tube_mesh(cl, radii, n_circumference,
                             noise_amplitude=noise_amplitude, noise_seed=noise_seed)
     if wall_thickness > 0:
