@@ -1,5 +1,4 @@
 import numpy as np
-import matplotlib.pyplot as plt
 import pandas as pd
 import time
 import os
@@ -10,13 +9,23 @@ from scipy.sparse.csgraph import connected_components
 from scipy.spatial import cKDTree
 from skimage.morphology import skeletonize, dilation, closing, disk
 
-from .stent_crowns import segment_stent
-from .stent_plotting import plot_crown_skeleton_2d_html, plot_crown_convergence_html, _render_crown_2d
+from .stent_rings import segment_stent
+from .stent_plotting import plot_ring_skeleton_2d_html, plot_ring_convergence_html, _render_ring_2d
 
 
 def open_stent_to_plane(stent_df: pd.DataFrame, r_mid: float) -> dict:
     """
-    Unwrap all surface points onto a 2D (arc, z) plane.
+    Unroll a cylindrical stent point cloud onto a flat (arc, z) plane.
+
+    Converts each point's ``theta`` to an arc-length coordinate (``r_mid *
+    theta``), leaving ``z`` unchanged. This flat representation is what
+    :func:`compute_skeleton_2d` rasterises and thins.
+
+    :param stent_df: Stent point cloud with ``theta`` and ``z_cylindrical`` columns.
+    :param r_mid: Mid-wall radius, used to convert angle to arc length.
+    :returns: Dict with the unrolled coordinates (``arc_flat``, ``z_flat``),
+        the minimum arc value (``arc_min_flat``), and the full ``circumference``
+        at ``r_mid``.
     """
     circumference = 2 * np.pi * r_mid
     arc_flat      = r_mid * stent_df['theta'].values
@@ -42,19 +51,39 @@ def compute_skeleton_2d(
     pixels_per_strut: int,
     dilate_px: int,
     pad_fraction: float,
-    plot: bool,
 ) -> dict:
-    """Rasterise, dilate, skeletonise, then map back to (arc, z).
+    """
+    Rasterise, dilate, and thin the flat surface points into a 2D skeleton.
 
-    Rasterises on a periodic (cylindrical) grid exactly one circumference wide, so
-    the arc wraps (the last column is a neighbour of the first) and there is no seam
-    cut. A wrap-pad of pad_fraction of the width gives the thinning continuous
-    context across the seam; only the central one turn is kept, so each angular
-    position appears exactly once and a strut on the seam stays continuous.
+    The (arc, z) points are rasterised onto a pixel grid sized so one strut
+    is ``pixels_per_strut`` pixels wide, with the arc axis wrapped (the last
+    column borders the first) so a strut sitting on the seam stays one
+    continuous line. The raster is dilated by ``dilate_px``, closed to fill
+    tiny gaps, then thinned to a 1-pixel-wide skeleton
+    (``skimage.morphology.skeletonize``). A padded copy of the wrap is used
+    only during thinning so the seam sees its true neighbours; the padding is
+    cropped back off before returning.
+
+    :param arc_flat: Flat arc-coordinates of the ring's surface points, from
+        :func:`open_stent_to_plane`.
+    :param z_flat: Flat z-coordinates of the ring's surface points.
+    :param arc_min_flat: Minimum arc value, used as the raster's column origin.
+    :param circumference: Full circumference at the ring's mid-wall radius,
+        sets the raster width.
+    :param stent_df: Ring's surface point cloud (unused directly here, kept
+        for a consistent call signature with the quality check).
+    :param stent_geometry: Stent features dict; only ``strut_thickness`` is used.
+    :param pixels_per_strut: Raster resolution, in pixels across one strut width.
+    :param dilate_px: Dilation radius, in pixels, before thinning.
+    :param pad_fraction: Seam padding, as a fraction of the raster width, so
+        thinning sees the wrap correctly.
+    :returns: Dict with the skeleton's flat coordinates (``skel_arc``,
+        ``skel_z``), the ``pixel_size`` used, and the same points as a
+        DataFrame (``df_skeleton_2d``).
     """
     pixel_size = stent_geometry['strut_thickness'] / pixels_per_strut
 
-    # --- periodic (cylindrical) raster: one circumference wide, the arc wraps ---
+    # periodic (cylindrical) raster: one circumference wide, the arc wraps 
     # The last column is a neighbour of the first, so there is NO seam cut. Nothing
     # gets sliced, so a strut sitting on the seam stays one continuous line.
     n_cols = max(1, int(round(circumference / pixel_size)))
@@ -86,18 +115,6 @@ def compute_skeleton_2d(
     skel_arc = arc_min_flat + (sk_cols + 0.5) * pixel_size
     skel_z   = z_lo         + (sk_rows + 0.5) * pixel_size
 
-    if plot:
-        fig, ax = plt.subplots(figsize=(14, 6))
-        ax.scatter(z_flat,  arc_flat, s=0.3, c='lightsteelblue', linewidths=0, label='surface')
-        ax.scatter(skel_z,  skel_arc, s=1.5, c='crimson',        linewidths=0, label='skeleton (one turn)')
-        ax.axhline(arc_min_flat,                 color='red', linestyle='--', linewidth=1)
-        ax.axhline(arc_min_flat + circumference, color='red', linestyle='--', linewidth=1)
-        ax.set_title('Periodic (cylindrical) skeleton over surface points — one circumference')
-        ax.set_xlabel('z (mm)'); ax.set_ylabel('arc (mm)')
-        ax.set_aspect('equal'); ax.legend(loc='upper right', markerscale=6)
-        plt.tight_layout()
-        plt.show()
-
     return {
         'skel_arc'      : skel_arc,
         'skel_z'        : skel_z,
@@ -108,7 +125,20 @@ def compute_skeleton_2d(
 
 
 def _two_core_mask(V: int, a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    """Mask of nodes in the 2-core (iteratively remove degree<2 nodes)."""
+    """
+    Find a graph's 2-core: every node with degree >= 2 once dead-ends are
+    peeled away.
+
+    Repeatedly removes degree-<=1 nodes (leaves), updating their neighbours'
+    degree as they go, until only nodes that are part of a cycle remain.
+    Used to distinguish a real loop from a simple dead-end branch: a node
+    survives here only if it's actually on a cycle, not just reachable from one.
+
+    :param V: Total number of nodes in the graph.
+    :param a: Edge endpoints, first side (parallel to ``b``).
+    :param b: Edge endpoints, second side (parallel to ``a``).
+    :returns: Boolean mask, ``True`` for every node in the 2-core.
+    """
     deg = np.zeros(V, dtype=int)
     np.add.at(deg, a, 1)
     np.add.at(deg, b, 1)
@@ -138,22 +168,48 @@ def check_skeleton_quality(
     stent_df: pd.DataFrame,
     r_mid: float,
     region_allowed: np.ndarray,
-    strut_thickness: float = None,
+    strut_thickness: float | None = None,
     loop_size_factor: float = 2.0,
-    surf_tree: cKDTree = None,
-    surf_reg: np.ndarray = None,
+    surf_tree: cKDTree | None = None,
+    surf_reg: np.ndarray | None = None,
     verbose: bool = True,
 ) -> dict:
-    """Report skeleton quality against the segmented regions (does not modify it).
+    """
+    Score a 2D skeleton for three defect types and report where they are.
 
-    Flags four issues: bad_connections (edges joining regions that don't touch),
-    region_loops and border_loops (small thinning bubbles, not design cells), and
-    empty_regions (regions with no skeleton point). A loop counts only when its
-    bounding-box diagonal is below loop_size_factor * strut_thickness; with
-    strut_thickness None the size test is off and every loop is flagged.
+    Every skeleton point is assigned to its nearest surface region, and the
+    skeleton's pixel-grid graph is rebuilt from ``df_skeleton_2d`` to check:
+    (1) **bad connections** — an edge joins two regions that are not actually
+    adjacent in 3D (per ``region_allowed``), meaning the skeleton bridged two
+    unrelated struts; (2) **loops** — a small closed cycle inside a region or
+    straddling a border, found via the graph's 2-core, and only flagged if
+    its bounding diagonal is under ``loop_size_factor * strut_thickness`` (a
+    larger loop is a real design cell, not a defect); (3) **empty regions** —
+    a region with no skeleton point at all. This is the scoring function
+    :func:`tune_skeleton_params` minimises over.
 
-    Also returns the (arc, z) location of each issue for plotting. surf_tree /
-    surf_reg let a caller pass a prebuilt KD-tree so a tuner avoids rebuilding it.
+    :param df_skeleton_2d: Skeleton points with ``arc`` and ``z`` columns,
+        from :func:`compute_skeleton_2d`.
+    :param pixel_size: Pixel size the skeleton was rasterised at, used to
+        recover its integer grid coordinates.
+    :param stent_df: Ring's surface point cloud with a ``region`` column.
+    :param r_mid: Mid-wall radius, used to unroll ``theta`` to arc length.
+    :param region_allowed: Region-adjacency matrix from
+        :func:`~stentfit.stent_rings.segment_stent`.
+    :param strut_thickness: Strut thickness, used to size the small-loop
+        cutoff. ``None`` treats every loop as small (no size filtering).
+    :param loop_size_factor: A loop wider than this many strut thicknesses is
+        a design cell, not a defect.
+    :param surf_tree: Prebuilt KD-tree of the surface points, to skip
+        rebuilding it across repeated calls (e.g. inside the tuning loop).
+        ``None`` builds it from ``stent_df``.
+    :param surf_reg: Region labels matching ``surf_tree``, required together with it.
+    :param verbose: Print a pass/fail summary for each defect type.
+    :returns: Dict with the region and skeleton-point counts (``n_regions``,
+        ``n_skel_points``), the defects found (``bad_connections``,
+        ``region_loops``, ``border_loops``, ``empty_regions``), the
+        per-point region labels (``skel_region``), and (arc, z) markers for
+        plotting each defect (``bad_edge_xy``, ``loop_points_xy``, ``empty_xy``).
     """
     skel = df_skeleton_2d[['arc', 'z']].to_numpy()
     n_sk = len(skel)
@@ -211,11 +267,6 @@ def check_skeleton_quality(
     loop_points  = []      # (arc, z) markers for every flagged small loop
 
     def _loop_components(node_mask):
-        """Loops on `node_mask`, each as (region labels spanned, (arc, z) points).
-
-        A loop is one connected component of the sub-graph's 2-core, so call this
-        on a small node set (one region, or a touching pair), not the whole stent.
-        """
         node_idx = np.where(node_mask)[0]
         V = len(node_idx)
         if V == 0 or not len(edges):
@@ -247,7 +298,6 @@ def check_skeleton_quality(
         return comps
 
     def _is_small(xy):
-        """True when the loop's bounding box is no wider than loop_max_diag."""
         return float(np.hypot(*(xy.max(0) - xy.min(0)))) <= loop_max_diag
 
     # Cycles in the per-region skeleton graph.
@@ -357,22 +407,66 @@ def tune_skeleton_params(
     time_limit: float = 100.0,
     predictive_stop: bool = True,
     max_iters: int = int(1e3),
-    plot: bool = True,
     verbose: bool = True,
 ) -> dict:
-    """Error-driven tuner for pixels_per_strut and dilate_px.
+    """
+    Search for the ``pixels_per_strut`` / ``dilate_px`` pair that gives the
+    cleanest 2D skeleton in the least time.
 
-    Each step skeletonises, scores with check_skeleton_quality, and nudges the two
-    parameters by the region-normalised errors: bad connections raise pps and
-    lower dilate_px, empty regions raise pps, loops raise dilate_px (or lower pps
-    once dilate_px is capped). dilate_px is an integer disk radius bounded by the
-    strut spacing (dil <= pps).
+    Each step runs :func:`compute_skeleton_2d` at the current (pps, dil) and
+    scores it with :func:`check_skeleton_quality`. The score is a
+    ``defect_error`` (bad connections, loops, empty regions — zero for a
+    clean skeleton) plus a ``quality_error`` residual that only shrinks as
+    pps/dil gets finer. While defects remain, pps and dil are nudged in
+    proportion to which defect dominates (sharpen for bad connections or
+    empty regions, thicken for loops, thin back down once dilation hits its
+    cap). Once clean, pps is raised step by step to shrink the residual. The
+    search stops on the time limit, on no improvement for
+    ``res_no_improve_max`` steps after going clean, or if the same (pps, dil)
+    state repeats ``max_repeats`` times.
 
-    Selection minimises total_error = defect_error + quality_error, gated so a
-    clean skeleton (defect_error <= target_penalty) always beats a defective one;
-    quality_error is a strictly-positive resolution residual on a 0-100 scale.
-    Stops on a repeated (pps, dil) state, on no improvement for res_no_improve_max
-    steps after the first clean skeleton, or on time_limit / max_iters.
+    :param arc: Flat arc-coordinates of the ring's surface points.
+    :param z: Flat z-coordinates of the ring's surface points.
+    :param stent_df: Ring's surface point cloud with a ``region`` column.
+    :param stent_features: Stent features dict (``r_mid``, ``strut_thickness``).
+    :param region_allowed: Region-adjacency matrix from
+        :func:`~stentfit.stent_rings.segment_stent`.
+    :param pps0: Starting ``pixels_per_strut``.
+    :param dil0: Starting ``dilate_px``.
+    :param pps_min: Lower bound on ``pixels_per_strut``.
+    :param pps_max: Upper bound on ``pixels_per_strut``, keeps runtime bounded.
+    :param dil_min: Lower bound on ``dilate_px``.
+    :param dil_max: Upper bound on ``dilate_px``.
+    :param s_pps_conn: How much ``pps`` rises per unit of bad-connection error.
+    :param s_pps_empty: How much ``pps`` rises per unit of empty-region error.
+    :param s_pps_loop: How much ``pps`` falls per unit of loop error, once
+        ``dilate_px`` is already capped.
+    :param s_pps_explore: Step size ``pps`` is raised by once the skeleton is clean.
+    :param s_dil_loop: How much ``dilate_px`` rises per unit of loop error.
+    :param s_dil_conn: How much ``dilate_px`` falls per unit of bad-connection error.
+    :param w_conn: Weight of bad connections in ``defect_error``.
+    :param w_loop: Weight of loops in ``defect_error``.
+    :param w_empty: Weight of empty regions in ``defect_error``.
+    :param loop_size_factor: A loop wider than this many strut thicknesses is
+        a real design cell, not a defect.
+    :param q_eps: Floor on ``quality_error`` so ``total_error`` never hits zero.
+    :param quality_gamma: Convexity of ``quality_error``; 1 is linear, higher
+        gives diminishing returns as it approaches zero.
+    :param res_no_improve_max: Steps without improvement, after first going
+        clean, before the search stops.
+    :param target_penalty: ``defect_error`` at or below this counts as clean.
+    :param max_repeats: Times the same (pps, dil) state may repeat before the
+        search stops as a cycle.
+    :param pad_fraction: Seam padding passed through to :func:`compute_skeleton_2d`.
+    :param time_limit: Time budget, in seconds, for the whole search.
+    :param predictive_stop: Stop early if the next step is projected to blow
+        the time budget, instead of only checking after it runs.
+    :param max_iters: Hard cap on the number of steps, regardless of time.
+    :param verbose: Print the per-step error table.
+    :returns: Dict with the best ``pps``/``dilate_px`` found (``best_pps``,
+        ``best_dilate_px``), their errors (``best_defect_error``,
+        ``best_quality_error``, ``best_total_error``), the full step history
+        (``history``), and the winning ``skeleton_2d`` / ``quality_report``.
     """
     r_mid = stent_features['r_mid']
     circ  = 2 * np.pi * r_mid
@@ -432,7 +526,7 @@ def tune_skeleton_params(
         res = compute_skeleton_2d(
             arc_flat=arc, z_flat=z, arc_min_flat=arc.min(),
             circumference=circ, stent_df=stent_df, stent_geometry=stent_features,
-            pixels_per_strut=pps, dilate_px=dil, pad_fraction=pad_fraction, plot=False,
+            pixels_per_strut=pps, dilate_px=dil, pad_fraction=pad_fraction,
         )
         qr = check_skeleton_quality(
             res['df_skeleton_2d'], res['pixel_size'], stent_df, r_mid, region_allowed,
@@ -521,21 +615,6 @@ def tune_skeleton_params(
               best['defect_error'], best['quality_error'],
               int(best['conn']), int(best['loop']), best['empty']))
 
-    if plot:
-        # total-error trajectory: defect_error -> 0, leaving the quality residual
-        fig, ax = plt.subplots(figsize=(9, 3.2))
-        ax.plot(hist_df['step'], hist_df['total_error'],  '-', color='crimson',
-                label='total_error', linewidth=2)
-        ax.plot(hist_df['step'], hist_df['defect_error'], '-', color='steelblue',
-                label='defect_error')
-        ax.plot(hist_df['step'], hist_df['quality_error'], '-', color='darkorange',
-                label='quality_error')
-        ax.axhline(0, color='grey', lw=0.8, ls=':')   # ideal (unreachable) total_error = 0
-        ax.set_ylim(bottom=0)
-        ax.set_xlabel('step'); ax.set_ylabel('error'); ax.set_title('tuning trajectory (minimise total_error)')
-        ax.legend(loc='upper right')
-        plt.tight_layout(); plt.show()
-
     return {
         'best_pps'          : best['pps'],
         'best_dilate_px'    : best['dil'],
@@ -549,12 +628,24 @@ def tune_skeleton_params(
 
 
 
-def _grid_adjacency(arc, z, pixel_size):
-    """8-neighbour pixel-grid graph for a 2D skeleton (arc, z).
+def _grid_adjacency(arc: np.ndarray,
+                    z: np.ndarray,
+                    pixel_size: float) -> tuple[np.ndarray, list[list[int]]]:
+    """
+    Rebuild the 8-neighbour pixel-grid graph for a set of 2D skeleton points.
 
-    Returns (edges, adj): edges is an (K, 2) int array of index pairs, adj a list
-    of neighbour-index lists. Same rule as check_skeleton_quality (a diagonal
-    is dropped when it short-cuts a 4-connected corner).
+    Recovers each point's integer grid coordinates from its (arc, z)
+    position and connects it to the neighbours sharing an edge or a
+    non-corner-cutting diagonal — the same connectivity rule used in
+    :func:`check_skeleton_quality`. Used by the manual/automatic bad-edge
+    fixers (:func:`fix_ring_loop_2d`, :func:`fix_ring_connection_2d`,
+    :func:`auto_clean_bad_connections_2d`) to walk the skeleton as a graph.
+
+    :param arc: Flat arc-coordinates of the ring's 2D skeleton.
+    :param z: Flat z-coordinates of the ring's 2D skeleton.
+    :param pixel_size: Pixel size the skeleton was rasterised at.
+    :returns: ``(edges, adj)`` — an ``(E, 2)`` array of point-index pairs,
+        and a per-point adjacency list of neighbour indices.
     """
     arc = np.asarray(arc, float)
     z   = np.asarray(z, float)
@@ -587,9 +678,21 @@ def _grid_adjacency(arc, z, pixel_size):
 
 
 
-def _interp_2d(a, b, spacing):
-    """Evenly-spaced interior points (~spacing apart) on the segment a->b,
-    exclusive of the endpoints. a, b are (arc, z). Returns (M, 2)."""
+def _interp_2d(a: np.ndarray, b: np.ndarray, spacing: float) -> np.ndarray:
+    """
+    Generate evenly-spaced points strictly between two 2D points.
+
+    Used by :func:`fix_ring_loop_2d` to fill a collapsed loop back in as a
+    single straight line between its two kept anchor points, at roughly the
+    skeleton's own pixel spacing.
+
+    :param a: Start point, as ``(arc, z)``.
+    :param b: End point, as ``(arc, z)``.
+    :param spacing: Target distance between consecutive inserted points.
+    :returns: ``(n, 2)`` array of points strictly between ``a`` and ``b``
+        (excluding both endpoints); empty if they're already closer than
+        ``spacing``.
+    """
     a = np.asarray(a, float)
     b = np.asarray(b, float)
     dist = float(np.hypot(*(b - a)))
@@ -601,15 +704,32 @@ def _interp_2d(a, b, spacing):
 
 
 
-def fix_crown_loop_2d(arc, z, pixel_size, anchor_a, anchor_b, verbose=True):
-    """Collapse a loop (bubble) on the 2D crown skeleton into a single path.
+def fix_ring_loop_2d(arc: np.ndarray,
+                     z: np.ndarray,
+                     pixel_size: float,
+                     anchor_a: int,
+                     anchor_b: int,
+                     verbose: bool = True) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Collapse a loop (bubble) in the 2D skeleton into a single straight path.
 
-    ``anchor_a`` / ``anchor_b`` are the two point indices (the plot's hover ``i``)
-    where the loop attaches. The loop is the 2-core connected component containing
-    both anchors; its points are deleted except the two anchors, and an
-    evenly-spaced straight segment is inserted between them. All other points are
-    left unchanged. Returns (new_arc, new_z, changed_idx) where changed_idx marks
-    the inserted points; a no-op returns the inputs and an empty changed_idx.
+    ``anchor_a`` and ``anchor_b`` must both sit on the same loop (found via
+    the grid graph's 2-core, same as :func:`check_skeleton_quality`'s loop
+    check). Every other point on that loop is deleted, and an evenly-spaced
+    straight line is inserted between the two anchors instead. Everything
+    outside the loop is left untouched. If the anchors aren't both on the
+    same loop, nothing changes.
+
+    :param arc: Flat arc-coordinates of the ring's 2D skeleton.
+    :param z: Flat z-coordinates of the ring's 2D skeleton.
+    :param pixel_size: Pixel size the skeleton was rasterised at, used to
+        rebuild its grid adjacency and space the inserted points.
+    :param anchor_a: Point index at one end of the loop to keep.
+    :param anchor_b: Point index at the other end of the loop to keep.
+    :param verbose: Print what was changed, or why nothing was.
+    :returns: ``(arc, z, changed_idx)`` — the edited coordinates and the
+        indices of the newly inserted points. Unchanged, with an empty
+        ``changed_idx``, if the anchors aren't both on the same loop.
     """
     arc = np.asarray(arc, float)
     z   = np.asarray(z, float)
@@ -655,16 +775,33 @@ def fix_crown_loop_2d(arc, z, pixel_size, anchor_a, anchor_b, verbose=True):
 
 
 
-def fix_crown_connection_2d(arc, z, pixel_size, point_a, point_b, verbose=True):
-    """Cut a wrong connection on the 2D crown skeleton by removing the whole bridge.
+def fix_ring_connection_2d(arc: np.ndarray,
+                           z: np.ndarray,
+                           pixel_size: float,
+                           point_a: int,
+                           point_b: int,
+                           verbose: bool = True) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Delete a whole wrong bridge between two points on the 2D skeleton.
 
-    Pick two points ON the wrong link (the little bridge between two struts). The
-    shortest graph path between them identifies the bridge; the removal is then
-    extended along the thin (degree-2) chain in both directions up to the junctions
-    where the bridge meets the real struts, so the ENTIRE bridge is deleted (not
-    just the piece between your two clicks — that would leave two stubs). The
-    bounding junctions and everything else are kept, opening a clean gap. Returns
-    (new_arc, new_z, changed_idx=empty); a no-op returns the inputs.
+    Walks the shortest grid-graph path between ``point_a`` and ``point_b``,
+    then extends outward from each end along the thin (degree-2) chain until
+    it hits a junction or endpoint (degree != 2) — that junction is kept as
+    the boundary, everything strictly inside is removed. ``point_a`` and
+    ``point_b`` should sit on the bridge itself (e.g. its two ends), not on
+    the junctions bounding it. If there's no path between them, or nothing
+    thin to remove, nothing changes.
+
+    :param arc: Flat arc-coordinates of the ring's 2D skeleton.
+    :param z: Flat z-coordinates of the ring's 2D skeleton.
+    :param pixel_size: Pixel size the skeleton was rasterised at, used to
+        rebuild its grid adjacency.
+    :param point_a: Point index on one end of the wrong bridge.
+    :param point_b: Point index on the other end of the wrong bridge.
+    :param verbose: Print what was removed, or why nothing was.
+    :returns: ``(arc, z, changed_idx)`` — the edited coordinates and the
+        indices of any newly inserted points (always empty here — this fix
+        only deletes). Unchanged if there was no path or nothing removable.
     """
     arc = np.asarray(arc, float)
     z   = np.asarray(z, float)
@@ -701,8 +838,6 @@ def fix_crown_connection_2d(arc, z, pixel_size, point_a, point_b, verbose=True):
     remove = set(p for p in path if deg[p] == 2)
 
     def _walk_out(start, inside, max_steps=400):
-        """From a path end, walk AWAY from the path through degree-2 nodes, adding
-        them to `remove`, stopping at the first junction/endpoint (kept)."""
         prev_n, curn = inside, start
         for _ in range(max_steps):
             nbrs = [w for w in adj[curn] if w != prev_n]
@@ -734,16 +869,32 @@ def fix_crown_connection_2d(arc, z, pixel_size, point_a, point_b, verbose=True):
 
 
 
-def auto_clean_bad_connections_2d(arc, z, pixel_size, bad_edge_xy, verbose=True):
-    """Auto-remove the detected bad connections the same way the manual fix does.
+def auto_clean_bad_connections_2d(arc: np.ndarray,
+                                  z: np.ndarray,
+                                  pixel_size: float,
+                                  bad_edge_xy: np.ndarray,
+                                  verbose: bool = True) -> tuple[np.ndarray, np.ndarray, int]:
+    """
+    Remove the skeleton bridges flagged as bad connections by
+    :func:`check_skeleton_quality`.
 
-    For each flagged bad-edge location in ``bad_edge_xy`` (the (arc, z) midpoints
-    from check_skeleton_quality), find the nearest skeleton point and delete the
-    entire thin (degree-2) bridge chain it lies on, up to the bounding junctions —
-    identical to ``fix_crown_connection_2d`` but seeded automatically from the
-    detector instead of two user clicks. This clears the automatically-detectable
-    connection errors so only the ones the detector missed remain (fixed by hand in
-    Step 5.5). Returns (new_arc, new_z, n_bridges_removed).
+    Each entry in ``bad_edge_xy`` is the (arc, z) midpoint of one flagged
+    edge. For each, the nearest skeleton point is used as a seed, and the
+    whole degree-2 chain it belongs to (the thin bridge between two
+    junctions) is removed. A seed that sits on a junction (degree != 2) has
+    no removable chain and is left alone, for the manual-edit step to fix by
+    hand.
+
+    :param arc: Flat arc-coordinates of the ring's 2D skeleton.
+    :param z: Flat z-coordinates of the ring's 2D skeleton.
+    :param pixel_size: Pixel size the skeleton was rasterised at, used to
+        rebuild its grid adjacency.
+    :param bad_edge_xy: (K, 2) array of (arc, z) midpoints, from
+        ``quality_report['bad_edge_xy']``.
+    :param verbose: Print how many bridges (and points) were removed.
+    :returns: ``(arc, z, n_bridges)`` — the cleaned coordinates and the
+        number of bridges removed. Unchanged, with ``n_bridges=0``, if
+        nothing was removable.
     """
     arc = np.asarray(arc, float)
     z   = np.asarray(z, float)
@@ -757,8 +908,6 @@ def auto_clean_bad_connections_2d(arc, z, pixel_size, bad_edge_xy, verbose=True)
     seeds  = cKDTree(np.column_stack([arc, z])).query(bad)[1]
 
     def _deg2_component(start):
-        """Maximal set of degree-2 nodes connected to `start` through degree-2
-        nodes (the bridge). If `start` is a junction, union its degree-2 arms."""
         if deg[start] != 2:
             comp = set()
             for nb in adj[start]:
@@ -799,8 +948,24 @@ def auto_clean_bad_connections_2d(arc, z, pixel_size, bad_edge_xy, verbose=True)
 
 
 
-def _downsample_surface_pair(a, b, n=40000, seed=0):
-    """Downsample paired arrays to ``n`` points (display only)."""
+def _downsample_surface_pair(a: np.ndarray,
+                             b: np.ndarray,
+                             n: int = 40000,
+                             seed: int = 0) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Randomly subsample two matching coordinate arrays down to ``n`` points.
+
+    Used to shrink a ring's surface points before storing them for the 2D
+    skeleton plot, so :func:`~stentfit.stent_plotting.plot_ring_skeleton_2d_html`
+    stays responsive.
+
+    :param a: First coordinate array (e.g. arc).
+    :param b: Second coordinate array (e.g. z), same length as ``a``.
+    :param n: Maximum number of points to keep.
+    :param seed: Seed for the row sampling, for repeatable plots.
+    :returns: ``(a, b)`` unchanged if ``len(a) <= n``, otherwise the same
+        random ``n`` indices taken from both.
+    """
     a = np.asarray(a); b = np.asarray(b)
     if len(a) <= n:
         return a, b
@@ -809,19 +974,49 @@ def _downsample_surface_pair(a, b, n=40000, seed=0):
 
 
 
-def skeletonize_crowns_2d(stent_df, stent_features, crown_edges, conn_radius_3d,
-                          output_dir, auto_tune=True, pixels_per_strut=10, dilate_px=3,
-                          pad_fraction=0.20, tune_time_limit=120, quality_gamma=2.0,
-                          crown_halo_frac=0.4):
-    """Skeletonise each crown in 2D and store the results in a CROWN_2D dict (Step 5).
+def skeletonize_rings_2d(stent_df: pd.DataFrame,
+                         stent_features: dict,
+                         ring_edges: np.ndarray,
+                         conn_radius_3d: float,
+                         output_dir: str,
+                         auto_tune: bool = True,
+                         pixels_per_strut: int = 10,
+                         dilate_px: int = 3,
+                         pad_fraction: float = 0.20,
+                         tune_time_limit: int = 120,
+                         quality_gamma: float = 2.0,
+                         ring_halo_frac: float = 0.4) -> dict:
+    """
+    2D-skeletonise every ring of the stent, one ring at a time.
 
-    Segments the whole stent once (each crown -> 3 z-pieces) for the region map +
-    ``region_allowed`` adjacency, then per crown (with a ``crown_halo_frac`` z-halo):
-    unroll -> (auto-tune or fixed) skeletonise -> trim to the crown band. Detected
-    bad connections are auto-cleaned (whole-bridge removal) and the skeleton
-    re-checked so per-crown plots flag only what the detector MISSED. Writes
-    ``skeleton_plots/crown_XX.html`` / ``crown_XX_convergence.html`` / ``crown_XX_2d.csv``.
-    Returns ``{crown_2d, crown_order}``.
+    Runs :func:`~stentfit.stent_rings.segment_stent` once on the whole stent
+    to get a shared region map, then for each ring: unrolls its points (plus
+    a z-halo, so struts still reconnect across ring boundaries) to a flat
+    (arc, z) plane with :func:`open_stent_to_plane`, skeletonises it (either a
+    single pass with :func:`compute_skeleton_2d`, or an auto-tuned search over
+    ``pixels_per_strut`` / ``dilate_px`` via :func:`tune_skeleton_params`), then
+    trims the result back down to the ring's own z-band. Detected bad
+    connections are auto-cleaned with :func:`auto_clean_bad_connections_2d`.
+    Writes per-ring plots and a CSV under ``output_dir/skeleton_plots/``.
+
+    :param stent_df: Stent point cloud with a ``ring_id`` column (from
+        :func:`~stentfit.stent_rings.detect_rings`).
+    :param stent_features: Stent features dict (``r_mid``, ``strut_thickness``, ...).
+    :param ring_edges: Z-boundaries between rings, used to size each ring's halo.
+    :param conn_radius_3d: 3D connectivity radius used for the region segmentation.
+    :param output_dir: Folder the per-ring plots and CSVs are written into
+        (under a ``skeleton_plots`` subfolder).
+    :param auto_tune: Search for the best skeletonisation parameters per ring,
+        instead of using ``pixels_per_strut`` / ``dilate_px`` directly.
+    :param pixels_per_strut: Raster resolution, in pixels across one strut width.
+    :param dilate_px: Dilation radius, in pixels, before thinning.
+    :param pad_fraction: Seam padding added when unrolling a ring to 2D.
+    :param tune_time_limit: Time budget, in seconds, for the auto-tune search.
+    :param quality_gamma: Weight of the skeleton quality score during tuning.
+    :param ring_halo_frac: Z-halo, as a fraction of ring height, so struts
+        reconnect across neighbouring rings.
+    :returns: Dict with the per-ring 2D skeletons (``ring_2d``, keyed by
+        ``ring_XX`` label) and the ring order along the stent axis (``ring_order``).
     """
     r_mid           = stent_features['r_mid']
     strut_thickness = stent_features['strut_thickness']
@@ -829,38 +1024,38 @@ def skeletonize_crowns_2d(stent_df, stent_features, crown_edges, conn_radius_3d,
     plots_dir = os.path.join(output_dir, 'skeleton_plots')
     os.makedirs(plots_dir, exist_ok=True)
 
-    # --- single segmentation for the whole stent (each crown -> 3 pieces) ---
+    # Single segmentation for the whole stent (each ring -> 3 pieces) 
     segmented      = segment_stent(stent_df, strut_thickness, conn_radius_3d,
-                                   n_sub_per_crown=3)
+                                   n_sub_per_ring=3)
     seg_df_full    = segmented['stent_df']          # whole stent, now has 'region'
     region_allowed = segmented['region_allowed']    # global region adjacency
 
-    crown_order = (seg_df_full.groupby('crown_id')['z_cylindrical'].mean()
+    ring_order = (seg_df_full.groupby('ring_id')['z_cylindrical'].mean()
                               .sort_values().index.tolist())
-    use_halo = crown_edges is not None and len(crown_edges) >= 2
+    use_halo = ring_edges is not None and len(ring_edges) >= 2
     z_all    = seg_df_full['z_cylindrical'].values
 
-    crown_2d = {}          # crown_label -> per-crown 2D skeleton record
-    print(f"Skeletonising {len(crown_order)} crowns "
+    ring_2d = {}          # ring_label -> per-ring 2D skeleton record
+    print(f"Skeletonising {len(ring_order)} rings "
           f"({'auto-tune' if auto_tune else 'fixed params'})...")
 
-    for ci, c in enumerate(crown_order):
-        label = f"crown_{int(c):02d}"
-        own_z = seg_df_full.loc[seg_df_full['crown_id'] == c, 'z_cylindrical']
+    for ci, c in enumerate(ring_order):
+        label = f"ring_{int(c):02d}"
+        own_z = seg_df_full.loc[seg_df_full['ring_id'] == c, 'z_cylindrical']
         if use_halo:
-            k = int(np.clip(np.digitize(own_z.mean(), crown_edges) - 1,
-                            0, len(crown_edges) - 2))
-            z_lo, z_hi = float(crown_edges[k]), float(crown_edges[k + 1])
-            halo    = crown_halo_frac * (z_hi - z_lo)
+            k = int(np.clip(np.digitize(own_z.mean(), ring_edges) - 1,
+                            0, len(ring_edges) - 2))
+            z_lo, z_hi = float(ring_edges[k]), float(ring_edges[k + 1])
+            halo    = ring_halo_frac * (z_hi - z_lo)
             seg_sub = seg_df_full[(z_all >= z_lo - halo) & (z_all <= z_hi + halo)].copy()
         else:
             z_lo, z_hi = float(own_z.min()), float(own_z.max())
-            seg_sub    = seg_df_full[seg_df_full['crown_id'] == c].copy()
+            seg_sub    = seg_df_full[seg_df_full['ring_id'] == c].copy()
 
         opened = open_stent_to_plane(seg_sub, r_mid)
         arc_flat, z_flat = opened['arc_flat'], opened['z_flat']
 
-        print(f"\n===== {label} ({ci + 1}/{len(crown_order)}) — "
+        print(f"\n===== {label} ({ci + 1}/{len(ring_order)}) — "
               f"{len(seg_sub):,} pts, band z=[{z_lo:.4f}, {z_hi:.4f}] =====")
 
         if auto_tune:
@@ -869,7 +1064,7 @@ def skeletonize_crowns_2d(stent_df, stent_features, crown_edges, conn_radius_3d,
                 region_allowed=region_allowed, pps0=pixels_per_strut, dil0=dilate_px,
                 pad_fraction=pad_fraction,
                 time_limit=tune_time_limit, quality_gamma=quality_gamma,
-                plot=False, verbose=True)
+                verbose=True)
             sk_2d          = tuned['skeleton_2d']
             history        = tuned['history']
             quality_report = tuned['quality_report']
@@ -880,7 +1075,7 @@ def skeletonize_crowns_2d(stent_df, stent_features, crown_edges, conn_radius_3d,
                 circumference=opened['circumference'],
                 stent_df=seg_sub, stent_geometry=stent_features,
                 pixels_per_strut=pixels_per_strut, dilate_px=dilate_px,
-                pad_fraction=pad_fraction, plot=False)
+                pad_fraction=pad_fraction)
             history = None
             quality_report = check_skeleton_quality(
                 df_skeleton_2d=sk_2d['df_skeleton_2d'], pixel_size=sk_2d['pixel_size'],
@@ -888,10 +1083,10 @@ def skeletonize_crowns_2d(stent_df, stent_features, crown_edges, conn_radius_3d,
                 strut_thickness=strut_thickness, verbose=True)
             diag_pps, diag_dil = pixels_per_strut, dilate_px
 
-        # trim the final skeleton to the crown's own z-band (drop most of the halo).
-        # Unlike the seam, neighbouring crowns are skeletonised on SEPARATE, unaligned
+        # trim the final skeleton to the ring's own z-band (drop most of the halo).
+        # Unlike the seam, neighbouring rings are skeletonised on SEPARATE, unaligned
         # pixel grids, so the two halves of a boundary strut do not coincide. We keep a
-        # small overlap band past each edge so both crowns share points there and the
+        # small overlap band past each edge so both rings share points there and the
         # halves always reconnect in 3D. The overlap is sized in PIXELS (intrinsic
         # resolution), not a design fraction; the old 0.01*strut slack was sub-pixel and
         # therefore unreliable, which is why boundary struts were sometimes pruned.
@@ -917,10 +1112,10 @@ def skeletonize_crowns_2d(stent_df, stent_features, crown_edges, conn_radius_3d,
                     region_allowed=region_allowed, strut_thickness=strut_thickness,
                     verbose=False)
 
-        # store this crown's 2D skeleton (editable in Step 5.5)
+        # store this ring's 2D skeleton (editable in Step 5.5)
         surf_arc_ds, surf_z_ds = _downsample_surface_pair(arc_flat, z_flat)
-        crown_2d[label] = {
-            'crown_id'  : c,
+        ring_2d[label] = {
+            'ring_id'  : c,
             'arc'       : arc_c.copy(),
             'z'         : z_c.copy(),
             'pixel_size': sk_2d['pixel_size'],
@@ -931,96 +1126,131 @@ def skeletonize_crowns_2d(stent_df, stent_features, crown_edges, conn_radius_3d,
             'n_edits'   : 0,
         }
 
-        # (1) the 2D skeleton alone (single panel, zoomable, remaining issues flagged)
+        # The 2D skeleton alone (single panel, zoomable, remaining issues flagged)
         skel_html = os.path.join(plots_dir, f'{label}.html')
-        plot_crown_skeleton_2d_html(
+        plot_ring_skeleton_2d_html(
             arc_c, z_c, surf_arc_ds, surf_z_ds, skel_html, label,
-            crown_band=(z_lo, z_hi), quality_report=quality_report)
-        # (2) the tuning convergence / issue-summary, in a separate file
+            ring_band=(z_lo, z_hi), quality_report=quality_report)
+        # The tuning convergence / issue-summary, in a separate file
         conv_html = os.path.join(plots_dir, f'{label}_convergence.html')
-        plot_crown_convergence_html(history, conv_html, c, quality_report=quality_report,
+        plot_ring_convergence_html(history, conv_html, c, quality_report=quality_report,
                                     pps=diag_pps, dil_px=diag_dil)
-        # (3) a plain 2D CSV (i, arc, z) for the record
+        # The 2D CSV (i, arc, z) for the record
         pd.DataFrame({'i': np.arange(len(arc_c)), 'arc': arc_c, 'z': z_c}).to_csv(
             os.path.join(plots_dir, f'{label}_2d.csv'), index=False)
         print(f"  {label}: {len(arc_c):,} skeleton pts  ->  {skel_html}")
 
-    n_total = sum(len(v['arc']) for v in crown_2d.values())
-    print(f"\nStored {len(crown_2d)} crowns ({n_total:,} 2D skeleton points) in CROWN_2D.")
-    print(f"Per-crown plots (crown_XX.html + _convergence.html) + CSVs saved in {plots_dir}")
-    print("Detected bad connections were auto-cleaned; review each crown_XX.html for any "
+    n_total = sum(len(v['arc']) for v in ring_2d.values())
+    print(f"\nStored {len(ring_2d)} rings ({n_total:,} 2D skeleton points) in RING_2D.")
+    print(f"Per-ring plots (ring_XX.html + _convergence.html) + CSVs saved in {plots_dir}")
+    print("Detected bad connections were auto-cleaned; review each ring_XX.html for any "
           "remaining errors and fix them by hand in the manual-edit step.")
 
-    return {'crown_2d': crown_2d, 'crown_order': crown_order}
+    return {'ring_2d': ring_2d, 'ring_order': ring_order}
 
 
 
-def save_crown_2d_checkpoint(crown_2d, stent_features, stent_centerline_direction,
-                             r_mid, strut_thickness, circumference, crown_edges,
-                             output_dir, verbose=True):
-    """Pickle the per-crown 2D skeletons + scalars to ``crown_2d.pkl`` (Step 5.4).
-
-    Lets the manual-edit step resume after a kernel restart without re-running the
-    Step-5 auto-tune. The surface cloud is reused from ``crown_points.csv``.
-    Returns the checkpoint path.
+def save_ring_2d_checkpoint(ring_2d: dict,
+                            stent_features: dict,
+                            stent_centerline_direction: np.ndarray,
+                            r_mid: float,
+                            strut_thickness: float,
+                            circumference: float,
+                            ring_edges: np.ndarray,
+                            output_dir: str,
+                            verbose: bool = True) -> str:
     """
-    crown2d_pkl = os.path.join(output_dir, 'crown_2d.pkl')
-    with open(crown2d_pkl, 'wb') as f:
+    Save the assembled per-ring 2D skeletons to disk as a resume checkpoint.
+
+    Pickles ``ring_2d`` plus the scalars needed to rebuild it, into
+    ``ring_2d.pkl``. Together with the already-saved ``ring_points.csv``,
+    this lets :func:`load_ring_2d_checkpoint` restore the pipeline state
+    after a kernel restart, without rerunning sampling, ring detection, or
+    2D skeletonisation.
+
+    :param ring_2d: Per-ring 2D skeletons, from :func:`skeletonize_rings_2d`.
+    :param stent_features: Stent features dict.
+    :param stent_centerline_direction: Stent centreline unit vector.
+    :param r_mid: Mid-wall radius.
+    :param strut_thickness: Strut thickness.
+    :param circumference: Full circumference at ``r_mid``.
+    :param ring_edges: Z-boundaries between rings.
+    :param output_dir: Folder ``ring_2d.pkl`` is written into.
+    :param verbose: Print the saved path and ring count.
+    :returns: Path to the written ``ring_2d.pkl``.
+    """
+    ring2d_pkl = os.path.join(output_dir, 'ring_2d.pkl')
+    with open(ring2d_pkl, 'wb') as f:
         pickle.dump({
-            'CROWN_2D'                  : crown_2d,
+            'RING_2D'                  : ring_2d,
             'stent_features'            : stent_features,
             'stent_centerline_direction': np.asarray(stent_centerline_direction),
             'r_mid'                     : float(r_mid),
             'strut_thickness'           : float(strut_thickness),
             'circumference'             : float(circumference),
-            'crown_edges'               : crown_edges,
+            'ring_edges'               : ring_edges,
         }, f)
     if verbose:
-        print(f"[checkpoint] saved {len(crown_2d)} per-crown 2D skeletons -> {crown2d_pkl}")
-    return crown2d_pkl
+        print(f"[checkpoint] saved {len(ring_2d)} per-ring 2D skeletons -> {ring2d_pkl}")
+    return ring2d_pkl
 
 
 
-def load_crown_2d_checkpoint(output_dir):
-    """Reload the ``crown_2d.pkl`` checkpoint + point cloud after a kernel restart.
-
-    Restores the per-crown 2D skeletons and the scalars the manual-edit / wrap
-    steps rely on, and reads the surface cloud from ``crown_points.csv``. Returns a
-    state dict (``crown_2d``, ``stent_features``, ``stent_centerline_direction``,
-    ``r_mid``, ``strut_thickness``, ``circumference``, ``crown_edges``, ``stent_df``).
+def load_ring_2d_checkpoint(output_dir: str) -> dict:
     """
-    crown2d_pkl = os.path.join(output_dir, 'crown_2d.pkl')
-    crown_csv   = os.path.join(output_dir, 'crown_points.csv')
-    for p in (crown2d_pkl, crown_csv):
+    Reload the per-ring 2D skeletons and surface point cloud from disk.
+
+    Reads back ``ring_2d.pkl`` (from :func:`save_ring_2d_checkpoint`) and
+    ``ring_points.csv``, so the pipeline can resume the manual-edit step
+    after a kernel restart without rerunning sampling, ring detection, or 2D
+    skeletonisation.
+
+    :param output_dir: Folder containing ``ring_2d.pkl`` and ``ring_points.csv``.
+    :raises FileNotFoundError: If either file is missing.
+    :returns: State dict with the per-ring 2D skeletons (``ring_2d``), the
+        stent features and geometry (``stent_features``,
+        ``stent_centerline_direction``, ``r_mid``, ``strut_thickness``,
+        ``circumference``, ``ring_edges``), and the surface point cloud
+        (``stent_df``).
+    """
+    ring2d_pkl = os.path.join(output_dir, 'ring_2d.pkl')
+    ring_csv   = os.path.join(output_dir, 'ring_points.csv')
+    for p in (ring2d_pkl, ring_csv):
         if not os.path.exists(p):
             raise FileNotFoundError(
-                f"missing {p} - run Steps 1-5.4 first (per-crown checkpoint not found).")
+                f"missing {p} - run Steps 1-5.4 first (per-ring checkpoint not found).")
 
-    with open(crown2d_pkl, 'rb') as f:
+    with open(ring2d_pkl, 'rb') as f:
         ck = pickle.load(f)
 
     os.makedirs(os.path.join(output_dir, 'skeleton_plots'), exist_ok=True)
-    print(f"[resume] loading point cloud from {crown_csv} ...")
-    stent_df = pd.read_csv(crown_csv)
+    print(f"[resume] loading point cloud from {ring_csv} ...")
+    stent_df = pd.read_csv(ring_csv)
 
     state = {
-        'crown_2d'                  : ck['CROWN_2D'],
+        'ring_2d'                  : ck['RING_2D'],
         'stent_features'            : ck['stent_features'],
         'stent_centerline_direction': np.asarray(ck['stent_centerline_direction']),
         'r_mid'                     : float(ck['r_mid']),
         'strut_thickness'           : float(ck['strut_thickness']),
         'circumference'             : float(ck['circumference']),
-        'crown_edges'               : ck.get('crown_edges'),
+        'ring_edges'               : ck.get('ring_edges'),
         'stent_df'                  : stent_df,
     }
-    print(f"[resume] restored {len(state['crown_2d'])} per-crown 2D skeletons + "
+    print(f"[resume] restored {len(state['ring_2d'])} per-ring 2D skeletons + "
           f"{len(stent_df):,} surface points. Ready for the manual-edit step.")
     return state
 
 
 
-def _parse_two_ids(s):
-    """Parse a 'a, b' / 'a b' string into exactly two int point indices."""
+def _parse_two_ids(s: str) -> tuple[int, int]:
+    """
+    Parse a "a, b" / "a b" string into exactly two int point indices.
+
+    :param s: User input like ``"12, 40"`` or ``"12 40"``.
+    :raises ValueError: If ``s`` does not contain exactly two integers.
+    :returns: The two parsed indices, as ``(a, b)``.
+    """
     vals = [int(x) for x in (s or '').replace(',', ' ').split()]
     if len(vals) != 2:
         raise ValueError("please give exactly two point indices, e.g. '12, 40'")
@@ -1028,52 +1258,75 @@ def _parse_two_ids(s):
 
 
 
-def edit_crowns_2d_interactive(crown_2d, stent_features, stent_centerline_direction,
-                               r_mid, strut_thickness, circumference, crown_edges,
-                               output_dir):
-    """Interactively fix per-crown 2D skeleton defects by naming two anchors (Step 5.5).
+def edit_rings_2d_interactive(ring_2d: dict,
+                              stent_features: dict,
+                              stent_centerline_direction: np.ndarray,
+                              r_mid: float,
+                              strut_thickness: float,
+                              circumference: float,
+                              ring_edges: np.ndarray,
+                              output_dir: str) -> dict:
+    """
+    Prompt the user to manually fix defects in any ring's 2D skeleton.
 
-    Prompts for a crown and a problem type: 'loop' collapses a bubble into a single
-    straight path (``fix_crown_loop_2d``); 'connection' deletes a whole wrong bridge
-    up to its bounding junctions (``fix_crown_connection_2d``). Each edit is previewed
-    as ``crown_XX_edited_N.html`` and kept only if confirmed (kept edits re-save
-    ``crown_2d.pkl`` so a restart reloads the edited crowns). Mutates and returns
-    ``crown_2d``.
+    Asks once whether to edit any ring at all. If yes, loops: pick a ring by
+    label, describe the problem (``loop`` or ``connection``), give the two
+    point indices at the defect, and the matching fixer runs
+    (:func:`fix_ring_loop_2d` or :func:`fix_ring_connection_2d`). Each edit is
+    applied tentatively, rendered to a preview PNG/HTML via
+    :func:`~stentfit.stent_plotting._render_ring_2d`, and only kept (and
+    checkpointed to disk) if the user confirms it looks right — otherwise the
+    ring is reverted to its state before that edit.
+
+    :param ring_2d: Per-ring 2D skeletons, from :func:`skeletonize_rings_2d`.
+        Edited in place and also returned.
+    :param stent_features: Stent features dict, passed through to the
+        checkpoint save on each confirmed edit.
+    :param stent_centerline_direction: Stent centreline unit vector, passed
+        through to the checkpoint save.
+    :param r_mid: Mid-wall radius, passed through to the checkpoint save.
+    :param strut_thickness: Strut thickness, passed through to the checkpoint save.
+    :param circumference: Full circumference at ``r_mid``, passed through to
+        the checkpoint save.
+    :param ring_edges: Z-boundaries between rings, passed through to the checkpoint save.
+    :param output_dir: Folder edit previews are rendered into and the
+        checkpoint is saved to.
+    :returns: ``ring_2d``, with any confirmed edits applied.
     """
     plots_dir = os.path.join(output_dir, 'skeleton_plots')
     os.makedirs(plots_dir, exist_ok=True)
 
-    if input("Do you want to manually edit any crown? [y/n] ").strip().lower() == 'y':
+    if input("Do you want to manually edit any ring? [y/n] ").strip().lower() == 'y':
         while True:
-            ans = input("\nWhich crown would you like to change? "
-                        "(e.g. crown_01, crown_02, ...; empty = done) ").strip()
+            ans = input("\nWhich ring would you like to change? "
+                        "(e.g. ring_01, ring_02, ...; empty = done) ").strip()
             if not ans:
                 break
             try:
-                label = ans if ans.startswith('crown_') else f"crown_{int(ans):02d}"
+                label = ans if ans.startswith('ring_') else f"ring_{int(ans):02d}"
             except ValueError:
-                print(f"  '{ans}' is not a valid crown name. "
-                      f"Available: {', '.join(crown_2d)}")
+                print(f"  '{ans}' is not a valid ring name. "
+                      f"Available: {', '.join(ring_2d)}")
                 continue
-            if label not in crown_2d:
-                print(f"  '{label}' not found. Available: {', '.join(crown_2d)}")
+            if label not in ring_2d:
+                print(f"  '{label}' not found. Available: {', '.join(ring_2d)}")
                 continue
 
-            rec  = crown_2d[label]
+            rec  = ring_2d[label]
             prob = input("What is the problem in the skeleton? (loop / connection) ").strip().lower()
 
             if prob.startswith('loop'):
                 print("  -> I'll remove the loop (bubble) and join the two points you give "
                       "with a single evenly-spaced straight line. Everything else stays.")
                 a, b = _parse_two_ids(input("  Two point indices at the loop ends (e.g. 12, 40): "))
-                new_arc, new_z, changed = fix_crown_loop_2d(rec['arc'], rec['z'],
+                new_arc, new_z, changed = fix_ring_loop_2d(rec['arc'], rec['z'],
                                                             rec['pixel_size'], a, b)
             elif prob.startswith('conn'):
                 print("  -> I'll remove the WHOLE wrong bridge (extending up to where it "
                       "meets the struts) to open a clean gap. Everything else stays.")
                 a, b = _parse_two_ids(input("  Two point indices ON the wrong bridge itself, "
                                             "e.g. its two ends (e.g. 12, 40): "))
-                new_arc, new_z, changed = fix_crown_connection_2d(rec['arc'], rec['z'],
+                new_arc, new_z, changed = fix_ring_connection_2d(rec['arc'], rec['z'],
                                                                   rec['pixel_size'], a, b)
             else:
                 print("  Unknown problem — choose 'loop' or 'connection'.")
@@ -1087,15 +1340,15 @@ def edit_crowns_2d_interactive(crown_2d, stent_features, stent_centerline_direct
             prev_arc, prev_z, prev_n = rec['arc'].copy(), rec['z'].copy(), rec['n_edits']
             rec['arc'], rec['z'] = new_arc, new_z
             rec['n_edits'] += 1
-            out = _render_crown_2d(crown_2d, label, plots_dir, changed_idx=changed,
+            out = _render_ring_2d(ring_2d, label, plots_dir, changed_idx=changed,
                                    suffix='edited')
             print(f"  preview saved as {label}_edited_{rec['n_edits']} -> {out}")
 
             if input("  Are you happy with this edit? (y/n) ").strip().lower().startswith('y'):
-                save_crown_2d_checkpoint(crown_2d, stent_features, stent_centerline_direction,
-                                         r_mid, strut_thickness, circumference, crown_edges,
+                save_ring_2d_checkpoint(ring_2d, stent_features, stent_centerline_direction,
+                                         r_mid, strut_thickness, circumference, ring_edges,
                                          output_dir, verbose=False)
-                print(f"  kept edit {rec['n_edits']} on {label}. (crown_2d.pkl updated)")
+                print(f"  kept edit {rec['n_edits']} on {label}. (ring_2d.pkl updated)")
             else:
                 rec['arc'], rec['z'], rec['n_edits'] = prev_arc, prev_z, prev_n
                 try:
@@ -1104,23 +1357,31 @@ def edit_crowns_2d_interactive(crown_2d, stent_features, stent_centerline_direct
                     pass
                 print(f"  reverted — {label} restored to its previous state. You can try again.")
 
-    return crown_2d
+    return ring_2d
 
 
 
-def assemble_2d_skeleton(crown_2d):
-    """Concatenate the (edited) per-crown 2D skeletons into one flat skeleton.
-
-    Orders crowns by ``crown_id`` and stacks their ``arc`` / ``z`` / per-point
-    ``pixel_size``. Returns ``{skel_arc, skel_z, skel_px, pixel_size}`` (the last a
-    median pixel size across crowns), ready for the 3D wrap.
+def assemble_2d_skeleton(ring_2d: dict) -> dict:
     """
-    order    = sorted(crown_2d, key=lambda L: crown_2d[L]['crown_id'])
-    skel_arc = np.concatenate([crown_2d[L]['arc'] for L in order])
-    skel_z   = np.concatenate([crown_2d[L]['z']   for L in order])
-    skel_px  = np.concatenate([np.full(len(crown_2d[L]['arc']), crown_2d[L]['pixel_size'])
+    Concatenate every ring's 2D skeleton into one flat skeleton.
+
+    Rings are ordered by ``ring_id`` (bottom to top along the stent axis) and
+    their (arc, z) points are stacked into single arrays. Each point also
+    carries its ring's ``pixel_size``, since different rings may have been
+    skeletonised at different resolutions.
+
+    :param ring_2d: Per-ring 2D skeletons, from :func:`skeletonize_rings_2d`
+        (optionally edited by :func:`edit_rings_2d_interactive`).
+    :returns: Dict with the concatenated coordinates (``skel_arc``,
+        ``skel_z``), the per-point pixel size (``skel_px``), and the median
+        ``pixel_size`` across all rings.
+    """
+    order    = sorted(ring_2d, key=lambda L: ring_2d[L]['ring_id'])
+    skel_arc = np.concatenate([ring_2d[L]['arc'] for L in order])
+    skel_z   = np.concatenate([ring_2d[L]['z']   for L in order])
+    skel_px  = np.concatenate([np.full(len(ring_2d[L]['arc']), ring_2d[L]['pixel_size'])
                                for L in order])
-    pixel_size = float(np.median([crown_2d[L]['pixel_size'] for L in order]))
+    pixel_size = float(np.median([ring_2d[L]['pixel_size'] for L in order]))
     print(f"\nAssembled 2D skeleton: {len(skel_arc):,} points "
           f"| pixel_size median = {pixel_size:.5f}")
     return {'skel_arc': skel_arc, 'skel_z': skel_z, 'skel_px': skel_px,

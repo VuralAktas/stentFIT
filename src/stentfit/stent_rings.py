@@ -8,32 +8,42 @@ from scipy.spatial import cKDTree
 from scipy.ndimage import uniform_filter1d
 from scipy.signal import find_peaks
 
-from .stent_plotting import plot_points_3d_html, plot_crown_dips_html
+from .stent_plotting import plot_points_3d_html, plot_ring_dips_html
 
 
-def find_crowns(
+def find_rings(
     stent_df: pd.DataFrame,
     strut_thickness: float,
-    n_crowns: int = None,             # None -> auto-detect count; int -> force this many
+    n_rings: int | None = None,
     show_plots: bool = False,
-    out_path: str = None,             # if set, save the dip-detection plot here (PNG)
+    out_path: str | None = None,
 ) -> dict:
-    """Split the stent into evenly-spaced, pattern-matched crown bands.
+    """
+    Split the stent point cloud into axial rings and label every point.
 
-    A stent repeats the same shape every fixed axial distance (the crown pitch).
-    find_crowns measures that pitch from the z point-count profile, derives how
-    many crowns fit along the stent, lays an even grid of boundaries, and nudges
-    each boundary onto a nearby strut-free gap (a dip in the point count) when
-    one sits close by. Every point is then labelled by which axial band it falls
-    in, so a crown is always a full-circumference z-slab and never changes within
-    one z-level. The crown number goes in stent_df['crown_id'].
+    Builds a smoothed point-count profile along z; the profile dips where
+    struts converge, marking candidate ring boundaries. When ``n_rings`` is
+    not forced, the ring pitch is read from the profile's autocorrelation
+    (falling back to the raw dip count if no clear period exists). An even
+    grid of boundaries is then laid down and only snapped onto a nearby dip
+    when it sits close, so the rings stay even overall.
 
-    ``n_crowns`` overrides the auto-detected count for stents whose structure is
-    not uniformly periodic (e.g. plain end regions plus an oscillating middle),
-    where autocorrelation cannot reliably infer the intended number of crowns.
-
-    Returns stent_df (with 'crown_id'), crown_edges (band boundaries), n_crowns
-    and conn_radius_3d.
+    :param stent_df: Stent point cloud with ``x``, ``y``, ``z``,
+        ``z_cylindrical``, and ``r`` columns.
+    :param strut_thickness: Strut thickness, used as an upper bound for the
+        3D connectivity radius.
+    :param n_rings: Ring count to force. ``None`` auto-detects it from the
+        z-profile.
+    :param show_plots: Show the dip-detection diagnostic plot inline (matplotlib).
+    :param out_path: File path to save the dip-detection plot as a PNG.
+        ``None`` skips saving.
+    :returns: Dict with the point cloud labelled with ``ring_id``
+        (``stent_df``), the ring z-boundaries (``ring_edges``), the ring
+        count (``n_rings``), the 3D connectivity radius (``conn_radius_3d``),
+        and the dip-detection diagnostics (``dip_z_centers``,
+        ``dip_counts_smoothed``, ``dip_indices``, ``dip_depth_thresh``,
+        ``boundary_z``, ``n_bands``) used by
+        :func:`~stentfit.stent_plotting.plot_ring_dips_html`.
     """
 
     pts3d     = stent_df[['x', 'y', 'z']].values
@@ -66,20 +76,20 @@ def find_crowns(
     n_dips       = len(dips)
     dip_z_all    = np.sort(zc_d[dips]) if n_dips else np.array([])
 
-    # Step 3: decide how many crowns N. If the caller forces n_crowns, use it;
-    # otherwise auto-detect the crown pitch from the profile's autocorrelation.
+    # Step 3: decide how many rings N. If the caller forces n_rings, use it;
+    # otherwise auto-detect the ring pitch from the profile's autocorrelation.
     # Sliding npts_s against itself, the lag of the *strongest* peak is the
-    # dominant repeat distance (one full crown). The strongest peak, not the
-    # first, because the profile also has finer within-crown structure whose
+    # dominant repeat distance (one full ring). The strongest peak, not the
+    # first, because the profile also has finer within-ring structure whose
     # short-lag peaks would over-segment the stent.
-    if n_crowns is not None:
-        N       = max(1, int(n_crowns))
+    if n_rings is not None:
+        N       = max(1, int(n_rings))
         pitch_z = z_range / N
     else:
         prof     = npts_s - npts_s.mean()
         ac       = np.correlate(prof, prof, mode='full')[n_diag - 1:]   # lags 0 .. n_diag-1
         ac_peaks, _ = find_peaks(ac, distance=3)
-        # keep only peaks whose pitch yields a plausible crown count (2 .. n_diag//4)
+        # keep only peaks whose pitch yields a plausible ring count (2 .. n_diag//4)
         if len(ac_peaks):
             lag_N   = np.round(z_range / (ac_peaks * slice_w)).astype(int)
             valid   = ac_peaks[(lag_N >= 2) & (lag_N <= n_diag // 4)]
@@ -96,7 +106,7 @@ def find_crowns(
 
     # Step 4: lay an even grid of N-1 boundaries. Equal width is the priority, so
     # only nudge a boundary onto a nearby dip when the gap sits very close (a
-    # minor adjustment); a far-off dip is ignored so the crowns stay even.
+    # minor adjustment); a far-off dip is ignored so the rings stay even.
     snap_tol = 0.2 * pitch_z
     ideal    = z_min + np.arange(1, N) * (z_range / N)
     if len(dip_z_all):
@@ -121,7 +131,7 @@ def find_crowns(
         axd.axhline(depth_thresh, color='red', ls=':', lw=1,
                     label=f'depth cutoff ({depth_frac:.2f})')
         axd.set_xlabel('z_cylindrical'); axd.set_ylabel('points / slice')
-        axd.set_title(f'{n_bands} crowns (pitch~{pitch_z:.4g})')
+        axd.set_title(f'{n_bands} rings (pitch~{pitch_z:.4g})')
         axd.legend(); axd.grid(True, alpha=0.3)
         plt.tight_layout()
         if out_path is not None:
@@ -131,15 +141,15 @@ def find_crowns(
         else:
             plt.close(fig)
 
-    # Step 5: label every point by axial band -> crown is a full-circumference z-slab
-    crown_f = (np.clip(np.digitize(z_vals, z_edges) - 1, 0, n_bands - 1) + 1).astype(np.int32)
-    C       = int(crown_f.max())
-    stent_df['crown_id'] = crown_f
+    # Step 5: label every point by axial band -> ring is a full-circumference z-slab
+    ring_f = (np.clip(np.digitize(z_vals, z_edges) - 1, 0, n_bands - 1) + 1).astype(np.int32)
+    C       = int(ring_f.max())
+    stent_df['ring_id'] = ring_f
 
     return {
         'stent_df'          : stent_df,
-        'crown_edges'       : z_edges,
-        'n_crowns'          : C,
+        'ring_edges'       : z_edges,
+        'n_rings'          : C,
         'conn_radius_3d'    : conn_radius_3d,
         # dip-detection diagnostic data (for interactive HTML plot)
         'dip_z_centers'     : zc_d,
@@ -156,46 +166,61 @@ def segment_stent(
     stent_df: pd.DataFrame,
     strut_thickness: float,
     conn_radius_3d: float,
-    n_sub_per_crown: int = 3,         # cut each crown into this many equal z-pieces
-    min_region_frac: float = 0.2,     # region < frac * median point-count = "tiny"
+    n_sub_per_ring: int = 3,
+    min_region_frac: float = 0.2,
 ) -> dict:
-    """Slice each crown into z-pieces, label components, clean tiny regions.
-
-    Each crown band (the 'crown_id' column from find_crowns) is cut into
-    n_sub_per_crown equal z-pieces; connected components are found within each
-    (crown, piece) slice. Tiny non-pipe-like regions are absorbed into the
-    nearest normal region.
-
-    Returns stent_df (with 'region'), region_allowed adjacency, whole_stent_region,
-    n_regions and conn_radius_3d.
     """
-    
-    if 'crown_id' not in stent_df.columns:
-        raise KeyError("segment_stent now slices per crown - run crown_stent first "
-                       "so stent_df has a 'crown_id' column.")
+    Split the whole stent into small 3D-connected regions, once for all rings.
+
+    Each ring is first cut into ``n_sub_per_ring`` equal z-pieces. Within each
+    piece, points closer than ``conn_radius_3d`` are grouped into connected
+    regions, and any region smaller than ``min_region_frac`` of the median
+    region size is absorbed into its nearest normal-sized neighbour. The
+    result is a per-point ``region`` label plus which region pairs are
+    actually adjacent in 3D (``region_allowed``) — used later by
+    :func:`~stentfit.stent_skeleton_2d.check_skeleton_quality` to tell a real
+    strut connection from a false one bridging two unrelated regions.
+
+    :param stent_df: Stent point cloud with a ``ring_id`` column (from
+        :func:`detect_rings`).
+    :param strut_thickness: Strut thickness, used indirectly via ``conn_radius_3d``.
+    :param conn_radius_3d: 3D connectivity radius; points closer than this are
+        grouped into the same region.
+    :param n_sub_per_ring: Number of equal z-pieces each ring is cut into
+        before segmenting, so a single ring's points still split into several
+        regions.
+    :param min_region_frac: Regions smaller than this fraction of the median
+        region point-count are absorbed into their nearest normal region.
+    :returns: Dict with the point cloud labelled with ``region`` (``stent_df``),
+        the region-adjacency matrix (``region_allowed``), the region count
+        (``n_regions``), and the ``conn_radius_3d`` passed through unchanged.
+    """
+    if 'ring_id' not in stent_df.columns:
+        raise KeyError("segment_stent now slices per ring - run ring_stent first "
+                       "so stent_df has a 'ring_id' column.")
 
     whole_stent_region = np.array([[True]])  # all points belong to the same whole-stent region
 
     pts3d     = stent_df[['x', 'y', 'z']].values
     z_vals    = stent_df['z_cylindrical'].values
-    crowns    = stent_df['crown_id'].values
+    rings    = stent_df['ring_id'].values
     n_samples = len(pts3d)
 
-    # Step 1: cut each crown into n_sub_per_crown equal z-pieces
+    # Step 1: cut each ring into n_sub_per_ring equal z-pieces
     slc      = np.empty(n_samples, dtype=np.int64)
     next_id  = 0
-    for c in np.unique(crowns):
-        m  = crowns == c
+    for c in np.unique(rings):
+        m  = rings == c
         zc = z_vals[m]
         if zc.max() > zc.min():
-            edges = np.linspace(zc.min(), zc.max(), n_sub_per_crown + 1)
-            sub   = np.clip(np.digitize(zc, edges) - 1, 0, n_sub_per_crown - 1)
+            edges = np.linspace(zc.min(), zc.max(), n_sub_per_ring + 1)
+            sub   = np.clip(np.digitize(zc, edges) - 1, 0, n_sub_per_ring - 1)
         else:
-            sub   = np.zeros(m.sum(), dtype=np.int64)   # degenerate crown -> single piece
+            sub   = np.zeros(m.sum(), dtype=np.int64)   # degenerate ring -> single piece
         slc[m]  = next_id + sub
-        next_id += n_sub_per_crown
+        next_id += n_sub_per_ring
     n_slices = len(np.unique(slc))
-    print(f"[segmentation] {len(np.unique(crowns))} crowns x {n_sub_per_crown} pieces "
+    print(f"[segmentation] {len(np.unique(rings))} rings x {n_sub_per_ring} pieces "
           f"-> {n_slices} z-slices")
 
     # Step 2: connected components within each slice
@@ -273,46 +298,61 @@ def segment_stent(
 
 
 
-def detect_crowns(stent_df, stent_features, stent_name, output_dir, max_display=500_000,
-                  n_crowns=None):
-    """Detect crowns and label every point with a ``crown_id`` (Step 3).
+def detect_rings(
+        stent_df: pd.DataFrame,
+        stent_features: dict,
+        stent_name: str,
+        output_dir: str,
+        max_display: int = 500_000,
+        n_rings: int | None = None) -> dict:
+    """
+    Split the stent point cloud into rings and let the user confirm the count.
 
-    Runs ``find_crowns`` first (auto count unless ``n_crowns`` seeds it), renders
-    the 3D crown assignment (categorical colours) and the interactive dip plot,
-    then lets the user review those plots and, if the count is wrong, type a new
-    crown count to redo the split. Pressing Enter accepts the current result.
-    This interactive check is skipped automatically when there is no console
-    (e.g. scripted / headless runs), where the auto result is accepted as-is.
-    Saves ``crown_points.csv``.
-    Returns ``{stent_df, crown_edges, conn_radius_3d, n_crowns}``.
+    Runs :func:`find_rings` to locate the point-count dips where struts
+    converge, then draws the dip profile and the ring-colored point cloud so
+    the user can check the split. If ``n_rings`` is not given, the user is
+    asked to accept the detected count or type a different one to redo the
+    split with a forced count. Saves ``ring_points.csv``, ``ring_dips.html``,
+    and ``ring_assignment.html`` into ``output_dir``.
+
+    :param stent_df: Stent point cloud, as returned by :func:`sample_stent_points`.
+    :param stent_features: Stent features dict; only ``strut_thickness`` is used.
+    :param stent_name: Name used to label outputs and plots.
+    :param output_dir: Folder the CSV and HTML views are written into.
+    :param max_display: Maximum number of points drawn in the ring-assignment view.
+    :param n_rings: Ring count to force. ``None`` auto-detects it, then still
+        prompts the user to accept or override it.
+    :returns: Dict with the point cloud labelled with ``ring_id``
+        (``stent_df``), the ``ring_edges`` (z-boundaries), ``conn_radius_3d``,
+        and the final ``n_rings``.
     """
     strut_thickness = stent_features['strut_thickness']
 
-    crown_dips_html = os.path.join(output_dir, 'crown_dips.html')
-    crown_html      = os.path.join(output_dir, 'crown_assignment.html')
-    crown_csv       = os.path.join(output_dir, 'crown_points.csv')
+    ring_dips_html = os.path.join(output_dir, 'ring_dips.html')
+    ring_html      = os.path.join(output_dir, 'ring_assignment.html')
+    ring_csv       = os.path.join(output_dir, 'ring_points.csv')
 
-    forced = n_crowns   # None on the first pass -> auto-detect
+    forced = n_rings   # None on the first pass -> auto-detect
     while True:
-        crown_res      = find_crowns(stent_df, strut_thickness=strut_thickness,
-                                     n_crowns=forced)
-        stent_df       = crown_res['stent_df']          # now has 'crown_id'
-        crown_edges    = crown_res['crown_edges']
-        conn_radius_3d = crown_res['conn_radius_3d']
-        n_found        = crown_res['n_crowns']
+        ring_res      = find_rings(stent_df, strut_thickness=strut_thickness,
+                                     n_rings=forced)
+        stent_df       = ring_res['stent_df']          # now has 'ring_id'
+        ring_edges    = ring_res['ring_edges']
+        conn_radius_3d = ring_res['conn_radius_3d']
+        n_found        = ring_res['n_rings']
         how            = 'forced' if forced is not None else 'auto-detected'
-        print(f"Detected {n_found} crowns ({how}).")
+        print(f"Detected {n_found} rings ({how}).")
 
-        plot_crown_dips_html(crown_res, crown_dips_html)
-        plot_points_3d_html(stent_df, 'point_id', crown_html, color_col='crown_id',
-                            title=f'{stent_name} crowns ({n_found})', max_display=max_display,
+        plot_ring_dips_html(ring_res, ring_dips_html)
+        plot_points_3d_html(stent_df, 'point_id', ring_html, color_col='ring_id',
+                            title=f'{stent_name} rings ({n_found})', max_display=max_display,
                             categorical=True)
-        print(f"[plot] {crown_html}")
-        print(f"[plot] {crown_dips_html}")
+        print(f"[plot] {ring_html}")
+        print(f"[plot] {ring_dips_html}")
 
         # let the user inspect the plots and redo with a different count if wanted
         try:
-            ans = input(f"Accept {n_found} crowns? "
+            ans = input(f"Accept {n_found} rings? "
                         f"[Enter = accept, or type a new count e.g. 3 to redo]: ").strip()
         except EOFError:
             ans = ''            # no console -> accept the current (auto) result
@@ -321,14 +361,14 @@ def detect_crowns(stent_df, stent_features, stent_name, output_dir, max_display=
         try:
             forced = max(1, int(ans))
         except ValueError:
-            print(f"  '{ans}' is not a whole number — keeping {n_found} crowns.")
+            print(f"  '{ans}' is not a whole number — keeping {n_found} rings.")
             break
 
-    n_crowns = n_found
-    stent_df[['point_id', 'r', 'theta', 'z_cylindrical', 'x', 'y', 'z', 'crown_id']].to_csv(
-        crown_csv, index=False)
-    print(f"[saved] {crown_csv}")
+    n_rings = n_found
+    stent_df[['point_id', 'r', 'theta', 'z_cylindrical', 'x', 'y', 'z', 'ring_id']].to_csv(
+        ring_csv, index=False)
+    print(f"[saved] {ring_csv}")
 
-    return {'stent_df': stent_df, 'crown_edges': crown_edges,
-            'conn_radius_3d': conn_radius_3d, 'n_crowns': n_crowns}
+    return {'stent_df': stent_df, 'ring_edges': ring_edges,
+            'conn_radius_3d': conn_radius_3d, 'n_rings': n_rings}
 

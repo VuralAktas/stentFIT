@@ -16,10 +16,32 @@ def adjust_skeleton_to_local_midsurface(
     circumference: float,
     search_radius: float,
 ) -> dict:
-    """Wrap the 2D skeleton to 3D using a per-point local radius.
+    """
+    Lift each flat 2D skeleton point to 3D at its own local mid-wall radius.
 
-    Each skeleton point's r is the mean r of surface points within search_radius
-    (in the arc/z plane), instead of the constant r_mid.
+    A skeleton point is placed at the angle and z given by its (arc, z)
+    coordinates, but its radius is the mean radius of the nearby surface
+    points within ``search_radius`` (falling back to ``r_mid`` if none are
+    found) — not a fixed radius. This lets the 3D skeleton follow the
+    stent's real surface undulation instead of sitting on a perfect
+    cylinder. Surface points are triple-tiled along arc (one copy shifted
+    left, one right) first, so the neighbour search sees across the seam
+    without a periodic-distance correction.
+
+    :param skel_arc: Flat arc-coordinates of the assembled 2D skeleton.
+    :param skel_z: Flat z-coordinates of the assembled 2D skeleton.
+    :param stent_df: Stent surface point cloud with ``theta``,
+        ``z_cylindrical``, and ``r`` columns.
+    :param r_mid: Mid-wall radius, used to convert arc back to angle, and as
+        the fallback radius where no surface points are nearby.
+    :param circumference: Full circumference at ``r_mid``, used to tile the
+        surface points across the seam.
+    :param search_radius: Radius, in the (arc, z) plane, used to gather
+        nearby surface points for the local radius average.
+    :returns: Dict with the lifted skeleton as a DataFrame
+        (``df_skeleton_3d``, with ``theta``, ``x``, ``y``, ``z``, ``r``
+        columns) and the same points as a plain ``(N, 3)`` array
+        (``skeleton_points``).
     """
     # Triple-tile surface points so the periodic seam is seamless
     arc_all = r_mid * stent_df['theta'].values
@@ -54,16 +76,32 @@ def adjust_skeleton_to_local_midsurface(
 
 def analyze_skeleton_connectivity(
     df_skeleton_3d: pd.DataFrame,
-    pixel_size,                              # scalar, OR a per-point array (len N)
+    pixel_size: float | np.ndarray,
     neighbor_radius_factor: float = 1.8,
 ) -> pd.DataFrame:
-    """Classify each skeleton point by degree: isolated/endpoint/line/junction.
+    """
+    Build the 3D skeleton graph and classify every point by its degree.
 
-    pixel_size may be a scalar (uniform skeleton) or a per-point array of length N.
-    The per-point form is for a skeleton assembled from pieces tuned to different
-    resolutions: points i, j link only when their distance is within
-    neighbor_radius_factor * max(px_i, px_j), so a fine piece is never
-    over-connected by a coarse piece's radius.
+    Two points are neighbours if they're within ``neighbor_radius_factor``
+    times the local pixel size — this is also what rejoins the two
+    coincident seam ends left over from the periodic 2D raster, since they
+    sit at the same 3D position once wrapped. ``pixel_size`` may be a single
+    scalar (one skeletonisation resolution for the whole stent) or a
+    per-point array (one entry per ring, from
+    :func:`~stentfit.stent_skeleton_2d.assemble_2d_skeleton`), in which case
+    a pair only counts if it's within the coarser of the two points' radii.
+    Each point's degree then sets its ``node_type``: 0 is ``isolated``, 1 is
+    ``endpoint``, 2 is ``line``, and 3+ is ``junction``.
+
+    :param df_skeleton_3d: 3D skeleton points with ``x``, ``y``, ``z`` columns,
+        from :func:`adjust_skeleton_to_local_midsurface`.
+    :param pixel_size: Pixel size the skeleton was rasterised at — a scalar,
+        or a per-point array matching ``df_skeleton_3d``.
+    :param neighbor_radius_factor: How many pixel-sizes apart two points may
+        be and still count as neighbours.
+    :returns: ``df_skeleton_3d``, with added ``skeleton_point_id``,
+        ``degree``, ``node_type``, and ``neighbor_ids`` (list of connected
+        point indices) columns.
     """
     pts = df_skeleton_3d[['x', 'y', 'z']].values
     N   = len(pts)
@@ -103,22 +141,37 @@ def analyze_skeleton_connectivity(
 
 def prune_skeleton_spurs(
     df_connectivity: pd.DataFrame,
-    pixel_size: float,
     tip_frac: float = 0,
-    max_spur_len: float = None,
+    max_spur_len: float | None = None,
     max_iter: int = 10,
     verbose: bool = True,
 ) -> pd.DataFrame:
-    """Remove spurs: short dead-end branches that are not genuine stent tips.
+    """
+    Remove short dead-end branches (spurs) from the 3D skeleton graph.
 
-    A degree-1 node is kept as a tip when it lies within tip_frac of the axial (z)
-    span from either end. Every other dead-end is walked back along its degree-2
-    chain to the first junction and deleted; the walk repeats max_iter times so
-    chained spurs collapse. max_spur_len optionally keeps any non-tip dead-end
-    longer than that (likely a real strut whose far end failed to bridge).
+    Each round, every degree-1 endpoint not protected as a tip is walked
+    along its dead-end chain until it hits a junction, another endpoint, or
+    a loop. The whole chain is removed, unless it terminates on a real tip
+    (kept so the stent's actual ends survive) or is longer than
+    ``max_spur_len`` (kept as a real branch, not a stray spur). This repeats
+    for up to ``max_iter`` rounds, since removing one spur can expose a new
+    endpoint one step further in. Degrees and node types are recomputed
+    afterward.
 
-    Returns a re-indexed copy (contiguous skeleton_point_id, remapped
-    neighbor_ids, recomputed degree / node_type).
+    :param df_connectivity: 3D skeleton graph with ``x``, ``y``, ``z``, and
+        ``neighbor_ids`` columns, from :func:`analyze_skeleton_connectivity`
+        or :func:`collapse_junction_clusters`.
+    :param tip_frac: Fraction of the stent's z-range, from each axial end,
+        protected as a real tip — endpoints in that band are never pruned.
+        ``0`` protects nothing, so every dead-end is prunable.
+    :param max_spur_len: Chains longer than this are kept as real branches
+        instead of being pruned. ``None`` prunes regardless of length.
+    :param max_iter: Maximum number of pruning rounds.
+    :param verbose: Print how many nodes/branches were removed, and how many
+        non-tip endpoints remain.
+    :returns: The skeleton graph with spurs removed, and
+        ``skeleton_point_id``, ``degree``, ``node_type``, ``neighbor_ids``
+        recomputed to match.
     """
     df  = df_connectivity.reset_index(drop=True).copy()
     pts = df[['x', 'y', 'z']].values
@@ -231,16 +284,25 @@ def collapse_junction_clusters(
     df_connectivity: pd.DataFrame,
     verbose: bool = True,
 ) -> pd.DataFrame:
-    """Collapse each connected blob of junction nodes into one centroid node.
+    """
+    Contract each blob of edge-connected junction nodes to a single centroid.
 
-    Thinning leaves a small blob of degree>=3 pixels at every strut crossing. This
-    takes the junction-only subgraph (edges whose both endpoints are junctions),
-    finds its connected components, and replaces each blob of two or more
-    junctions with a single node at their centroid, rewiring every attached strut.
-    Genuinely separate crossings are not edge-connected, so they stay distinct.
+    A real strut crossing should be one junction point, but the raster ->
+    thin -> lift pipeline can leave a small cluster of several
+    degree-3+ nodes sitting right next to each other instead. Every such
+    cluster (found by walking edges between junction nodes only) is
+    collapsed: one member survives at the cluster's centroid, every external
+    neighbour of any member is rewired to point at the survivor, and the
+    rest of the cluster is dropped. Degrees and node types are recomputed
+    afterward, since collapsing can turn a junction into a plain line point.
 
-    Returns a re-indexed copy (contiguous skeleton_point_id, remapped
-    neighbor_ids, recomputed degree / node_type).
+    :param df_connectivity: 3D skeleton graph with ``x``, ``y``, ``z``, and
+        ``neighbor_ids`` columns, from :func:`analyze_skeleton_connectivity`.
+    :param verbose: Print how many clusters were collapsed and the resulting
+        node counts.
+    :returns: The skeleton graph with junction clusters collapsed, and
+        ``skeleton_point_id``, ``degree``, ``node_type``, ``neighbor_ids``
+        recomputed to match.
     """
     df  = df_connectivity.reset_index(drop=True).copy()
     pts = df[['x', 'y', 'z']].values
@@ -341,17 +403,48 @@ def collapse_junction_clusters(
 
 
 
-def wrap_skeleton_to_3d(skel_arc, skel_z, skel_px, pixel_size, surf_df, r_mid,
-                        circumference, strut_thickness, output_dir, stent_name,
-                        wrap_max_surf=None,
-                        prune_tip_frac=0, max_display=500_000, random_seed=0):
-    """Wrap the 2D skeleton onto the local mid-surface and run graph cleanup (Step 6).
+def wrap_skeleton_to_3d(skel_arc: np.ndarray,
+                        skel_z: np.ndarray,
+                        skel_px: np.ndarray,
+                        surf_df: pd.DataFrame,
+                        r_mid: float,
+                        circumference: float,
+                        strut_thickness: float,
+                        output_dir: str,
+                        stent_name: str,
+                        wrap_max_surf: int | None = None,
+                        prune_tip_frac: float = 0,
+                        max_display: int = 500_000,
+                        random_seed: int = 0) -> pd.DataFrame:
+    """
+    Lift the flat 2D skeleton onto the 3D stent surface and clean up its graph.
 
-    Lifts each 2D point to 3D via a per-point local mid-surface radius, classifies
-    node degree, then contracts junction clusters and prunes short spurs. On a huge
-    cloud a downsampled throwaway copy is used for the radius estimate only
-    (``wrap_max_surf``). Saves ``skeleton_points.csv`` + ``skeleton_only.html`` and
-    returns the final SKELETON_DF.
+    Each point is lifted to 3D using a per-point local mid-surface radius
+    (:func:`adjust_skeleton_to_local_midsurface`), then the graph is
+    classified by node degree and its 3D KD-tree rejoins the coincident seam
+    ends (:func:`analyze_skeleton_connectivity`). Junction blobs are
+    contracted to a centroid (:func:`collapse_junction_clusters`) and short
+    dead-ends are pruned (:func:`prune_skeleton_spurs`). Saves
+    ``skeleton_points.csv`` and ``skeleton_only.html``.
+
+    :param skel_arc: Flat arc-coordinates of the assembled 2D skeleton.
+    :param skel_z: Flat z-coordinates of the assembled 2D skeleton.
+    :param skel_px: Per-point pixel size, from :func:`~stentfit.stent_skeleton_2d.assemble_2d_skeleton`.
+    :param surf_df: Stent surface point cloud, used to find each skeleton
+        point's local mid-surface radius.
+    :param r_mid: Mid-wall radius.
+    :param circumference: Full circumference at ``r_mid``.
+    :param strut_thickness: Strut thickness, used as the local-midsurface search radius.
+    :param output_dir: Folder the CSV and HTML view are written into.
+    :param stent_name: Name used to label outputs and plots.
+    :param wrap_max_surf: Maximum surface points used for the wrap. ``None``
+        uses every surface point.
+    :param prune_tip_frac: Fraction of each curve tip to prune as a spur.
+    :param max_display: Maximum number of points drawn in the HTML view.
+    :param random_seed: Seed for the surface downsampling, when ``wrap_max_surf`` applies.
+    :returns: The final 3D skeleton graph, with ``skeleton_point_id``, ``x``,
+        ``y``, ``z``, ``r``, ``theta``, ``node_type``, ``degree``, and
+        ``neighbor_ids`` columns.
     """
     if wrap_max_surf is not None and len(surf_df) > wrap_max_surf:
         wrap_surf = surf_df.sample(wrap_max_surf, random_state=random_seed)
@@ -364,11 +457,8 @@ def wrap_skeleton_to_3d(skel_arc, skel_z, skel_px, pixel_size, surf_df, r_mid,
         skel_arc, skel_z, wrap_surf, r_mid, circumference, search_radius=strut_thickness)
 
     df = analyze_skeleton_connectivity(skel3d['df_skeleton_3d'], skel_px)
-    # The periodic raster keeps every strut continuous across the seam, so no seam
-    # step is needed — analyze_skeleton_connectivity's 3D KD-tree already rejoins the
-    # two coincident seam ends.
     df = collapse_junction_clusters(df)
-    df = prune_skeleton_spurs(df, pixel_size, tip_frac=prune_tip_frac)
+    df = prune_skeleton_spurs(df, tip_frac=prune_tip_frac)
     
     skeleton_df = df[['skeleton_point_id', 'x', 'y', 'z', 'r', 'theta',
                       'node_type', 'degree', 'neighbor_ids']].copy()
@@ -388,15 +478,42 @@ def wrap_skeleton_to_3d(skel_arc, skel_z, skel_px, pixel_size, surf_df, r_mid,
 
 
 
-def save_stent_features_and_views(skeleton_df, stent_df, stent_features,
-                                  stent_centerline_direction, crown_edges, output_dir,
-                                  stent_name, max_display=500_000):
-    """Write the skeleton+cloud overlay and the final ``stent_features.json`` (Step 8).
+def save_stent_features_and_views(skeleton_df: pd.DataFrame,
+                                  stent_df: pd.DataFrame,
+                                  stent_features: dict,
+                                  stent_centerline_direction: np.ndarray,
+                                  ring_edges: np.ndarray | None,
+                                  output_dir: str,
+                                  max_display: int = 500_000) -> dict:
+    """
+    Write the final ``stent_features.json`` and the skeleton-with-cloud view.
 
-    Renders ``skeleton_with_cloud.html`` (sparse cloud underlay) and folds the
-    centreline direction + crown boundaries into ``stent_features.json``. Crown
-    boundaries prefer the detected ``crown_edges``, else are derived from the
-    per-point ``crown_id`` groups. Returns ``{features_path, crown_boundaries}``.
+    Draws the 3D skeleton overlaid on a sparse cloud of the original surface
+    points (``skeleton_with_cloud.html``), then folds
+    ``stent_centerline_direction`` and the ring z-boundaries into
+    ``stent_features.json``. Ring boundaries come from ``ring_edges`` if
+    given, else are derived from ``stent_df``'s ``ring_id`` groups (the
+    midpoint between each pair of neighbouring rings). Also prints a summary
+    of every file this pipeline run has produced — the skeleton CSV and
+    spline exports were already written by earlier steps
+    (:func:`wrap_skeleton_to_3d`, :func:`~stentfit.stent_splines.fit_skeleton_splines`);
+    only the JSON and cloud view are written here.
+
+    :param skeleton_df: Final 3D skeleton graph.
+    :param stent_df: Stent surface point cloud, used as the cloud underlay
+        and, if needed, to derive ring boundaries from its ``ring_id`` column.
+    :param stent_features: Stent features dict to write out (length,
+        diameter, strut_thickness, ...).
+    :param stent_centerline_direction: Stent centreline unit vector, folded
+        into the saved features.
+    :param ring_edges: Z-boundaries between rings. ``None`` (or fewer than 2
+        values) falls back to deriving them from ``stent_df``.
+    :param output_dir: Folder the JSON and HTML view are written into.
+    :param max_display: Maximum skeleton points drawn in the HTML view; the
+        surface cloud underlay is drawn at a fifth of this.
+    :returns: Dict with the path to the written JSON (``features_path``) and
+        the ring z-boundaries actually used (``ring_boundaries``, ``None``
+        if neither source was available).
     """
     # Keep the cloud underlay sparse so the skeleton stays easy to see.
     cloud_display = int(max_display / 5)
@@ -405,24 +522,24 @@ def save_stent_features_and_views(skeleton_df, stent_df, stent_features,
     plot_skeleton_with_cloud_html(skeleton_df, stent_df, skeleton_cloud_html,
                                   max_cloud=cloud_display)
 
-    # crown boundaries (z): prefer detected crown_edges; else derive from crown_id groups.
-    if crown_edges is not None and len(np.asarray(crown_edges).ravel()) >= 2:
-        crown_boundaries = np.asarray(crown_edges, float).ravel()
-    elif 'crown_id' in stent_df.columns:
-        _g = (stent_df.groupby('crown_id')['z'].agg(['min', 'max', 'mean'])
+    # ring boundaries (z): prefer detected ring_edges; else derive from ring_id groups.
+    if ring_edges is not None and len(np.asarray(ring_edges).ravel()) >= 2:
+        ring_boundaries = np.asarray(ring_edges, float).ravel()
+    elif 'ring_id' in stent_df.columns:
+        _g = (stent_df.groupby('ring_id')['z'].agg(['min', 'max', 'mean'])
                       .sort_values('mean'))
         _lo, _hi = _g['min'].to_numpy(), _g['max'].to_numpy()
-        crown_boundaries = np.concatenate([[_lo[0]], 0.5 * (_hi[:-1] + _lo[1:]), [_hi[-1]]])
+        ring_boundaries = np.concatenate([[_lo[0]], 0.5 * (_hi[:-1] + _lo[1:]), [_hi[-1]]])
     else:
-        crown_boundaries = None
+        ring_boundaries = None
 
     features_path = os.path.join(output_dir, 'stent_features.json')
     features_out = {k: (float(v) if isinstance(v, (np.floating, np.integer)) else v)
                     for k, v in stent_features.items()}
     features_out['stent_centerline_direction'] = [
         float(v) for v in np.asarray(stent_centerline_direction).ravel()]
-    features_out['crown_boundaries'] = (None if crown_boundaries is None
-                                        else [float(e) for e in crown_boundaries])
+    features_out['ring_boundaries'] = (None if ring_boundaries is None
+                                        else [float(e) for e in ring_boundaries])
     with open(features_path, 'w') as f:
         json.dump(features_out, f, indent=2)
 
@@ -433,11 +550,11 @@ def save_stent_features_and_views(skeleton_df, stent_df, stent_features,
     for p in (skeleton_csv, splines_html, splines_json, skeleton_cloud_html,
               features_path):
         print(f"   {p}")
-    print(f"   crown_boundaries: "
-          f"{0 if crown_boundaries is None else len(crown_boundaries)} values "
+    print(f"   ring_boundaries: "
+          f"{0 if ring_boundaries is None else len(ring_boundaries)} values "
           f"folded into stent_features.json")
     print(f"\nThe results of the skeletonization and spline fitting have been saved "
           f"in {output_dir}. Please check the results. The stent 1D wireframe is now "
           f"ready for the simulation.")
-    return {'features_path': features_path, 'crown_boundaries': crown_boundaries}
+    return {'features_path': features_path, 'ring_boundaries': ring_boundaries}
 

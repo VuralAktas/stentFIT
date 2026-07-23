@@ -1,4 +1,5 @@
 import numpy as np
+import pandas as pd
 import ast
 import json
 import os
@@ -13,9 +14,23 @@ from beamme.four_c.element_beam import Beam3rHerm2Line3, Beam3rLine2Line2
 from beamme.mesh_creation_functions.beam_splinepy import create_beam_mesh_from_splinepy
 
 
-def group_skeleton_curves(skeleton_points_df):
-    """Split the skeleton into curves (degree-2 chains bounded by junctions /
-    endpoints, or closed degree-2 loops). Returns lists of skeleton_point_ids."""
+def group_skeleton_curves(skeleton_points_df: pd.DataFrame) -> list[list[int]]:
+    """
+    Split the skeleton graph into curves: chains between junctions/endpoints,
+    plus closed loops.
+
+    A "special" node is anything with degree != 2 (an endpoint, junction, or
+    isolated point). From every special node, each unvisited edge is walked
+    until it reaches another special node, tracing out one curve. Any edges
+    left unvisited afterward belong to a closed loop with no special node
+    at all (every node on it has degree 2), so those are walked separately,
+    starting anywhere on the loop and ending back where they started.
+
+    :param skeleton_points_df: 3D skeleton graph with ``skeleton_point_id``
+        and ``neighbor_ids`` columns.
+    :returns: List of curves, each a list of point IDs in path order. A
+        closed loop's first and last ID are the same point.
+    """
     dfc = skeleton_points_df.reset_index(drop=True)
     adj = {}
     for _, row in dfc.iterrows():
@@ -56,18 +71,20 @@ def group_skeleton_curves(skeleton_points_df):
 
 
 
-def prune_spur_curves(curves):
-    """Drop spur curves left over after grouping (Step 7 double-check).
+def prune_spur_curves(curves: list[list[int]]) -> list[list[int]]:
+    """
+    Drop curves that end in a free (unshared) endpoint, iteratively.
 
-    Each curve is a chain of skeleton_point_ids whose endpoints (first / last id) are
-    the junctions or dead-ends it meets. A curve is kept only if BOTH of its endpoints
-    are shared with at least one other curve; a curve with a free endpoint (an id that
-    no other curve touches) is a dangling spur and is removed. Closed loops
-    (first id == last id) are always kept. Pruning iterates because removing one spur
-    can turn a neighbouring segment into a new spur (a chain of dead-end pieces).
+    A closed loop (same start and end point) is always kept. Otherwise, a
+    curve is dropped if either end is "free" — touched by only that one
+    curve, meaning it's a dead-end rather than a real junction shared with
+    another curve. This repeats until a full pass drops nothing, since
+    removing one spur can free up the endpoint of its neighbour, exposing a
+    new spur to drop next round.
 
-    Complements the node-level `prune_skeleton_spurs` in the 3D graph cleanup.
-    Returns the filtered list of curves.
+    :param curves: Curves from :func:`group_skeleton_curves`, each a list of
+        point IDs in path order.
+    :returns: The curves that survived pruning.
     """
     curves = [list(c) for c in curves]
     while True:
@@ -95,9 +112,38 @@ def prune_spur_curves(curves):
 
 
 
-def fit_curve_spline(point_ids, coords, every, k, s):
-    """Fit a B-spline through every Nth point of a curve; fall back to the raw
-    control polyline (tck=None) if the fit fails."""
+def fit_curve_spline(point_ids: list[int],
+                     coords: pd.DataFrame,
+                     every: int,
+                     k: int,
+                     s: float) -> dict | None:
+    """
+    Fit one B-spline to a single curve's skeleton points.
+
+    Consecutive duplicate points are dropped first. Every ``every``-th point
+    is kept as a spline control point (always including the last), with
+    ``every`` reduced automatically if the curve is too short to leave
+    enough control points for degree ``k``. A closed loop is fit as a
+    periodic spline, dropping its duplicated start/end control point first;
+    if that leaves too few points to close the loop, it falls back to an
+    open curve. If ``scipy.interpolate.splprep`` fails (or there aren't
+    enough control points for any spline), the control points themselves are
+    returned as a polyline fallback instead.
+
+    :param point_ids: One curve's point IDs in path order, from
+        :func:`group_skeleton_curves`.
+    :param coords: Skeleton points' ``x``, ``y``, ``z`` coordinates, indexed
+        by point ID.
+    :param every: Take every Nth point as a control point.
+    :param k: Target B-spline degree.
+    :param s: Smoothing factor passed to ``splprep``. ``0`` interpolates the
+        control points exactly.
+    :returns: ``None`` if fewer than 2 distinct points remain. Otherwise a
+        dict with the fitted ``tck``/``u`` (``None`` if fitting failed or
+        wasn't attempted), the ``ctrl`` points used, ``n_ctrl``, the actual
+        degree ``k`` used, whether it closed as a loop (``is_loop``), and
+        the curve's physical ``length``.
+    """
     pts  = coords.loc[point_ids].to_numpy()
     keep = np.r_[True, np.any(np.diff(pts, axis=0) != 0, axis=1)]
     pts  = pts[keep]
@@ -127,9 +173,20 @@ def fit_curve_spline(point_ids, coords, every, k, s):
 
 
 
-def _spline_record(spl):
-    """Neutral (degree, knot_vector, control_points) record for one curve, ready
-    to rebuild as splinepy.BSpline. tck=None -> degree-1 control polyline."""
+def _spline_record(spl: dict | None) -> dict | None:
+    """
+    Convert one :func:`fit_curve_spline` result into a JSON-serializable record.
+
+    Unpacks scipy's ``tck`` tuple into plain ``degree``/``knot_vector``/
+    ``control_points`` fields. Where ``tck`` is ``None`` (the polyline
+    fallback), records ``degree=1`` and ``knot_vector=None`` with the raw
+    control points instead.
+
+    :param spl: One curve's fit result from :func:`fit_curve_spline`, or ``None``.
+    :returns: ``None`` if ``spl`` is ``None``. Otherwise a dict with
+        ``degree``, ``knot_vector`` (``None`` for the polyline fallback),
+        ``control_points`` (as a plain nested list), ``is_loop``, and ``length``.
+    """
     if spl is None:
         return None
     if spl['tck'] is not None:
@@ -147,16 +204,39 @@ def _spline_record(spl):
 
 
 
-def fit_skeleton_splines(skeleton_df, output_dir, spline_every=10, spline_degree=3,
-                         smooth=0.0, prune_spurs=True):
-    """Group the skeleton graph into curves and fit a B-spline per curve (Step 7).
+def fit_skeleton_splines(skeleton_df: pd.DataFrame,
+                         output_dir: str,
+                         spline_every: int = 10,
+                         spline_degree: int = 3,
+                         smooth: float = 0.0,
+                         prune_spurs: bool = True) -> dict:
+    """
+    Group the skeleton graph into curves and fit a B-spline to each.
 
-    With ``prune_spurs=True`` (default), a curve-level double-check removes dangling
-    spur curves (a curve with a free endpoint no other curve shares) before fitting.
+    Groups the 3D skeleton into curves with :func:`group_skeleton_curves`
+    (degree-2 chains between junctions/endpoints, plus closed loops), drops
+    any spur curve with a free end if ``prune_spurs`` (via
+    :func:`prune_spur_curves`), then fits each remaining curve with
+    :func:`fit_curve_spline`. Saves ``splines.html`` and
+    ``skeleton_splines.json`` (per-curve degree, knot vector, control points
+    — with a plain polyline as the fallback where a curve is too short to
+    fit a spline to).
 
-    Renders the smooth curves to ``splines.html`` and exports ``skeleton_splines.json``
-    (per-curve degree / knot_vector / control_points), which rebuilds directly as a
-    ``splinepy.BSpline`` for BeamMe. Returns ``{curves, splines}``.
+    :param skeleton_df: 3D skeleton graph with ``skeleton_point_id``, ``x``,
+        ``y``, ``z``, and ``neighbor_ids`` columns, from
+        :func:`~stentfit.stent_skeleton_3d.wrap_skeleton_to_3d`.
+    :param output_dir: Folder the HTML view and JSON export are written into.
+    :param spline_every: Take every Nth skeleton point as a spline control
+        point, to keep the control polygon from being one point per sample.
+    :param spline_degree: Target B-spline degree, reduced automatically for
+        short curves.
+    :param smooth: Smoothing factor passed to ``scipy.interpolate.splprep``.
+        ``0`` interpolates the control points exactly.
+    :param prune_spurs: Drop curves with a free (non-junction, non-loop) end,
+        instead of fitting a spline to them.
+    :returns: Dict with the grouped point-id curves (``curves``) and their
+        fitted splines (``splines``, one entry per curve, ``None`` where
+        fitting failed).
     """
     coords  = skeleton_df.set_index('skeleton_point_id')[['x', 'y', 'z']]
     curves  = group_skeleton_curves(skeleton_df)
@@ -193,17 +273,37 @@ def fit_skeleton_splines(skeleton_df, output_dir, spline_every=10, spline_degree
 
 
 
-def _feat(stent_features, key):
-    """Read a feature value, unwrapping the {'value', 'unit'} form if present."""
+def _feat(stent_features: dict, key: str):
+    """
+    Read one stent feature, whichever of its two saved shapes it's stored in.
+
+    A feature is either a plain scalar or a ``{'value': ..., 'unit': ...}``
+    dict (the shape used for material parameters elsewhere in the
+    pipeline); this reads either the same way.
+
+    :param stent_features: Stent features dict (from ``stent_features.json``
+        or in-memory).
+    :param key: Feature name to read.
+    :returns: The feature's plain value.
+    """
     v = stent_features[key]
     return v['value'] if isinstance(v, dict) and 'value' in v else v
 
 
 
-def _bspline_from_record(rec):
-    """Rebuild a splinepy.BSpline from a skeleton_splines.json curve record.
-    knot_vector=None marks a degree-1 polyline fallback -> clamped uniform knots."""
+def _bspline_from_record(rec: dict) -> "splinepy.BSpline":
+    """
+    Rebuild a ``splinepy.BSpline`` from one :func:`_spline_record` entry.
 
+    Where ``knot_vector`` is ``None`` (the polyline fallback), builds a
+    degree-1 B-spline with a uniform clamped knot vector instead, so the
+    polyline can still be meshed the same way as a real spline.
+
+    :param rec: One curve's record, from ``skeleton_splines.json`` (or
+        :func:`_spline_record` directly) — with ``degree``, ``knot_vector``,
+        and ``control_points``.
+    :returns: The reconstructed B-spline.
+    """
     ctrl = np.asarray(rec['control_points'], float)
     if rec['knot_vector'] is not None:
         return splinepy.BSpline(degrees=[int(rec['degree'])],
@@ -215,17 +315,36 @@ def _bspline_from_record(rec):
 
 
 
-def mesh_skeleton_beams(input_dir, output_dir, l_el=0.1, youngs_modulus=2.0e5, poisson_ratio=0.3,
-                        density=0.0, beam_class_label='Beam3rHerm2Line3'):
-    """Mesh the fitted splines into a 1D Simo-Reissner beam mesh with BeamMe (Step 9).
-
-    Rebuilds each ``skeleton_splines.json`` curve as a ``splinepy.BSpline`` and meshes
-    it into one BeamMe ``Mesh`` (beam radius = strut_thickness / 2). Material +
-    element choices are provisional placeholders; only the geometry is final. Writes
-    ``skeleton_beam_mesh_beam.vtu`` and returns the mesh. Imports ``splinepy`` /
-    ``beamme`` lazily so the rest of ``stent_funcs`` runs without those heavy deps.
+def mesh_skeleton_beams(input_dir: str,
+                        l_el: float = 0.1,
+                        youngs_modulus: float = 2.0e5,
+                        poisson_ratio: float = 0.3,
+                        density: float = 0.0,
+                        beam_class_label: str = 'Beam3rHerm2Line3') -> Mesh:
     """
+    Build a BeamMe 1D beam mesh from a stent's saved splines.
 
+    Reads back ``stent_features.json`` (for the strut thickness, used as the
+    circular cross-section radius) and ``skeleton_splines.json`` (for the
+    per-curve splines) from ``input_dir``, then meshes each curve with
+    BeamMe's ``create_beam_mesh_from_splinepy``, using
+    :func:`_bspline_from_record` to rebuild each spline. A curve is skipped
+    if it has fewer than 2 control points or meshing raises. Each curve's
+    new elements are tagged with a ``curve_color`` VTK cell scalar (folded
+    into 16 bins) for ParaView inspection — this is visualisation-only and
+    has no effect on the 4C simulation input.
+
+    :param input_dir: Stent output folder to read ``stent_features.json``
+        and ``skeleton_splines.json`` from — normally the same folder
+        :func:`~stentfit.stent_pipeline.stent_pipeline` wrote them to.
+    :param l_el: Target element length, in mm.
+    :param youngs_modulus: Beam material Young's modulus, in MPa.
+    :param poisson_ratio: Beam material Poisson's ratio.
+    :param density: Beam material density.
+    :param beam_class_label: BeamMe beam element type, either
+        ``'Beam3rHerm2Line3'`` or ``'Beam3rLine2Line2'``.
+    :returns: The assembled BeamMe ``Mesh``.
+    """
     beam_classes = {'Beam3rHerm2Line3': Beam3rHerm2Line3,
                     'Beam3rLine2Line2': Beam3rLine2Line2}
     beam_class = beam_classes[beam_class_label]

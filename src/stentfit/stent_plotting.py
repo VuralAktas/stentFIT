@@ -15,11 +15,22 @@ from trimesh.viewer import notebook as _tvn
 import plotly.graph_objects as go
 import plotly.io as pio
 import plotly.colors as pcolors
+from plotly.subplots import make_subplots
 
 
-def _downsample_df(df: pd.DataFrame, max_display: int, random_state: int = 0) -> pd.DataFrame:
-    """Return df unchanged if small, else a random subset of ``max_display`` rows
-    (ids preserved). Display-only — never used for processing."""
+def _downsample_df(
+        df: pd.DataFrame,
+        max_display: int | None,
+        random_state: int = 0) -> pd.DataFrame:
+    """
+    Randomly subsample rows so a plot draws at most ``max_display`` points.
+
+    :param df: Rows to subsample.
+    :param max_display: Maximum rows to keep. ``None`` or a value at least as
+        large as ``len(df)`` returns ``df`` unchanged.
+    :param random_state: Seed for the row sampling, for repeatable plots.
+    :returns: ``df`` itself, or a random ``max_display``-row subset of it.
+    """
     if max_display is None or len(df) <= max_display:
         return df
     return df.sample(max_display, random_state=random_state)
@@ -30,24 +41,30 @@ def plot_points_3d_html(
     df: pd.DataFrame,
     id_col: str,
     out_path: str,
-    color_col: str = None,
+    color_col: str | None = None,
     max_display: int = 40000,
     title: str = "",
     point_size: float = 1,
-    categorical: bool = False,
-) -> str:
-    """Write an interactive Plotly 3D scatter of a point cloud to ``out_path`` (HTML).
+    categorical: bool = False) -> str:
+    """
+    Draw a point cloud as an interactive 3D scatter and save it as HTML.
 
-    Hovering a point shows its ``id_col`` (e.g. point_id / skeleton_point_id) and,
-    when ``color_col`` is given, that value too (e.g. crown_id, used for colour).
-    The view is downsampled to ``max_display`` points for browser performance, but
-    every displayed point keeps its true id so outlier removal stays valid.
+    ``df`` is downsampled to ``max_display`` points first, so large clouds
+    stay responsive in the browser. Coloring has three modes: no ``color_col``
+    draws every point in one flat color; ``color_col`` with ``categorical=True``
+    draws one trace per label with its own legend entry; ``color_col`` without
+    ``categorical`` draws a single trace with a continuous colorbar.
 
-    ``categorical=True`` treats ``color_col`` as discrete labels (e.g. crown_id):
-    each label gets its own high-contrast qualitative colour and legend entry, so
-    neighbouring groups are easy to tell apart (a continuous scale like Turbo makes
-    adjacent crowns look nearly identical). ``categorical=False`` keeps the
-    continuous colour scale.
+    :param df: Point cloud with at least ``x``, ``y``, ``z``, and ``id_col`` columns.
+    :param id_col: Column shown as the point ID on hover.
+    :param out_path: File path the HTML view is written to.
+    :param color_col: Column used to color the points. ``None`` disables coloring.
+    :param max_display: Maximum number of points drawn, downsampled if ``df`` is larger.
+    :param title: Plot title. The shown/total point count is appended automatically.
+    :param point_size: Marker size for the scatter points.
+    :param categorical: Treat ``color_col`` as discrete labels instead of a
+        continuous value.
+    :returns: ``out_path``, for chaining into a caller's own return value.
     """
 
     disp = _downsample_df(df, max_display)
@@ -102,9 +119,20 @@ def plot_points_3d_html(
 
 
 
-def _skeleton_edge_segments(skeleton_df: pd.DataFrame):
-    """Return (xe, ye, ze) line arrays with NaN separators for all unique edges,
-    built from the explicit ``neighbor_ids`` graph (ids = skeleton_point_id)."""
+def _skeleton_edge_segments(skeleton_df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Build the x/y/z arrays to draw every skeleton edge as one Plotly line trace.
+
+    Each edge contributes its two endpoints followed by a ``NaN``, which
+    breaks the line so Plotly draws many disconnected segments from a single
+    ``Scatter3d`` trace instead of one per edge. Each undirected edge
+    (``neighbor_ids`` is stored both ways) is only emitted once.
+
+    :param skeleton_df: Skeleton graph with ``skeleton_point_id``, ``x``,
+        ``y``, ``z``, and ``neighbor_ids`` columns.
+    :returns: ``(xe, ye, ze)`` coordinate arrays, ``NaN``-separated, ready to
+        pass straight to ``go.Scatter3d(mode='lines')``.
+    """
     coords = skeleton_df.set_index('skeleton_point_id')[['x', 'y', 'z']]
     xe, ye, ze = [], [], []
     seen = set()
@@ -134,12 +162,22 @@ def plot_skeleton_html(
     title: str = "Skeleton",
     max_display: int = 40000,
 ) -> str:
-    """Write an interactive Plotly 3D view of the skeleton alone to ``out_path``.
+    """
+    Draw the 3D skeleton graph as edges and node-type markers, save as HTML.
 
-    Draws every edge as grey lines (from ``neighbor_ids``) and overlays the nodes
-    as markers grouped/coloured by ``node_type``; hovering a node shows its
-    ``skeleton_point_id``, ``node_type`` and ``degree`` so the user can name the
-    points involved in any loop / wrong-connection error.
+    Every edge is drawn once as a single line trace
+    (:func:`_skeleton_edge_segments`); nodes are downsampled to
+    ``max_display`` and colored by ``node_type`` (``line``, ``junction``,
+    ``endpoint``, ``isolated``), each as its own legend-toggleable trace.
+
+    :param skeleton_df: Skeleton graph with ``x``, ``y``, ``z``,
+        ``skeleton_point_id``, ``degree``, ``node_type``, and
+        ``neighbor_ids`` columns.
+    :param out_path: File path the HTML view is written to.
+    :param title: Plot title.
+    :param max_display: Maximum number of nodes drawn, downsampled if
+        ``skeleton_df`` is larger. Edges are always drawn in full.
+    :returns: ``out_path``, for chaining into a caller's own return value.
     """
     fig = go.Figure()
 
@@ -181,9 +219,23 @@ def plot_skeleton_with_cloud_html(
     out_path: str,
     max_cloud: int = 40000,
 ) -> str:
-    """Write the final combined 3D view (skeleton edges + nodes over a faint,
-    downsampled point cloud) to ``out_path``. Hovering a skeleton node shows its
-    ``skeleton_point_id``; hovering a cloud point shows its ``point_id``."""
+    """
+    Draw the final 3D skeleton overlaid on a sparse stent surface cloud, as HTML.
+
+    Both the surface cloud and the skeleton nodes are downsampled to
+    ``max_cloud`` points; skeleton edges are always drawn in full
+    (:func:`_skeleton_edge_segments`). The cloud is drawn faint and small so
+    the skeleton stays the clear focal point.
+
+    :param skeleton_df: Final 3D skeleton graph with ``x``, ``y``, ``z``,
+        ``skeleton_point_id``, and ``neighbor_ids`` columns.
+    :param stent_df: Stent surface point cloud with ``x``, ``y``, ``z``, and
+        ``point_id`` columns.
+    :param out_path: File path the HTML view is written to.
+    :param max_cloud: Maximum number of points drawn for the surface cloud
+        and for the skeleton nodes, each downsampled independently.
+    :returns: ``out_path``, for chaining into a caller's own return value.
+    """
     cloud = _downsample_df(stent_df, max_cloud)
     fig = go.Figure()
 
@@ -217,11 +269,20 @@ def plot_skeleton_with_cloud_html(
 
 
 def plot_splines_html(splines: list, out_path: str, n_eval: int = 100) -> str:
-    """Write an interactive Plotly 3D view of the fitted skeleton splines.
+    """
+    Draw every fitted spline curve in 3D, each in its own color, as HTML.
 
-    ``splines`` is the list returned by the notebook's spline fitter (each item a
-    dict with a ``tck`` and ``ctrl`` polyline fallback, or None). Evaluates each
-    spline at ``n_eval`` samples and renders one coloured curve per spline.
+    Each spline is evaluated at ``n_eval`` points along its parameter range
+    (``scipy.interpolate.splev``); a curve with no fitted spline (the
+    polyline fallback from :func:`~stentfit.stent_splines.fit_curve_spline`)
+    is drawn from its raw control points instead. ``None`` entries (curves
+    where fitting produced nothing) are skipped.
+
+    :param splines: Per-curve fit results from
+        :func:`~stentfit.stent_splines.fit_skeleton_splines`.
+    :param out_path: File path the HTML view is written to.
+    :param n_eval: Number of points each spline is evaluated at for drawing.
+    :returns: ``out_path``, for chaining into a caller's own return value.
     """
     cmap    = plt.get_cmap('tab20')
     palette = [f"rgb({int(r*255)},{int(g*255)},{int(b*255)})"
@@ -251,20 +312,26 @@ def plot_splines_html(splines: list, out_path: str, n_eval: int = 100) -> str:
 
 
 
-def plot_crown_dips_html(crown_res: dict, out_path: str) -> str:
-    """Write the interactive crown dip-detection plot (HTML) from a find_crowns result.
-
-    Plots smoothed points/slice vs z; hovering any point shows its z and count.
-    Detected crown dips are marked, and the depth-cutoff threshold is drawn as a
-    horizontal line. Uses the diagnostic arrays returned by find_crowns
-    (dip_z_centers, dip_counts_smoothed, dip_indices, dip_depth_thresh, n_bands).
+def plot_ring_dips_html(ring_res: dict, out_path: str) -> str:
     """
-    zc     = np.asarray(crown_res['dip_z_centers'])
-    cnt    = np.asarray(crown_res['dip_counts_smoothed'])
-    dips   = np.asarray(crown_res['dip_indices'], dtype=int)
-    thresh = float(crown_res['dip_depth_thresh'])
-    n_bands = crown_res.get('n_bands', '?')
-    bounds = np.asarray(crown_res.get('boundary_z', []), dtype=float)
+    Draw the ring-boundary dip detection profile and save it as HTML.
+
+    Plots the smoothed points-per-slice curve along z, marks the candidate
+    dips and the depth cutoff used to filter them, and draws a vertical line
+    at each boundary that was actually used to cut the stent into rings.
+
+    :param ring_res: Dict returned by :func:`find_rings`; must have
+        ``dip_z_centers``, ``dip_counts_smoothed``, ``dip_indices``,
+        ``dip_depth_thresh``, and optionally ``n_bands`` / ``boundary_z``.
+    :param out_path: File path the HTML view is written to.
+    :returns: ``out_path``, for chaining into a caller's own return value.
+    """
+    zc     = np.asarray(ring_res['dip_z_centers'])
+    cnt    = np.asarray(ring_res['dip_counts_smoothed'])
+    dips   = np.asarray(ring_res['dip_indices'], dtype=int)
+    thresh = float(ring_res['dip_depth_thresh'])
+    n_bands = ring_res.get('n_bands', '?')
+    bounds = np.asarray(ring_res.get('boundary_z', []), dtype=float)
 
     fig = go.Figure()
     fig.add_trace(go.Scatter(
@@ -285,7 +352,7 @@ def plot_crown_dips_html(crown_res: dict, out_path: str) -> str:
                   annotation_text='depth cutoff', annotation_position='top left')
     fig.update_layout(
         template='plotly_white', height=420, margin=dict(l=40, r=20, t=50, b=40),
-        title=f"Crown boundaries -> {n_bands} crowns  "
+        title=f"Ring boundaries -> {n_bands} rings  "
               f"({len(bounds)} cuts from {len(dips)} candidate dips)",
         xaxis_title='z_cylindrical', yaxis_title='points / slice')
     pio.write_html(fig, out_path, auto_open=False, config={'scrollZoom': True})
@@ -293,16 +360,75 @@ def plot_crown_dips_html(crown_res: dict, out_path: str) -> str:
 
 
 
-def plot_crown_convergence_html(history, out_path, crown_id,
-                                quality_report=None, pps=None, dil_px=None):
-    """Save the per-crown tuning diagnostic (separate from the skeleton plot).
+def plot_thickness_diagnostics_html(df_thick: pd.DataFrame,
+                                    r: np.ndarray,
+                                    out_path: str,
+                                    strut_thickness: float) -> str:
+    z      = df_thick['z'].to_numpy()
+    r_in   = df_thick['r_inner'].to_numpy()
+    r_out  = df_thick['r_outer'].to_numpy()
+    thick  = df_thick['thickness'].to_numpy()
 
-    * auto-tune ON  (``history`` given): the tuning error convergence line plot;
-      hovering a step shows defect/quality/total error and the pps / dil_px tried.
-    * auto-tune OFF (``history`` None but ``quality_report`` given): a quality
-      summary bar chart — the count of each issue type (green when 0, red when >0)
-      for the fixed ``pps`` / ``dil_px`` used.
-    * neither available: a plain annotation.
+    fig = make_subplots(
+        rows=3, cols=1, shared_xaxes=False,
+        subplot_titles=('Inner and outer radius along stent axis',
+                        'Strut radial thickness along stent axis',
+                        'Global r distribution (two peaks = inner and outer wall)'))
+
+    fig.add_trace(go.Scatter(x=z, y=r_out, mode='lines', name='r_outer',
+                             line=dict(color='green')), row=1, col=1)
+    fig.add_trace(go.Scatter(x=z, y=r_in, mode='lines', name='r_inner',
+                             line=dict(color='red')), row=1, col=1)
+
+    fig.add_trace(go.Scatter(x=z, y=thick, mode='lines', name='thickness',
+                             line=dict(color='steelblue')), row=2, col=1)
+    fig.add_hline(y=strut_thickness, line=dict(color='orange', dash='dash'),
+                  annotation_text=f'mean = {strut_thickness:.4f}',
+                  annotation_position='top left', row=2, col=1)
+
+    fig.add_trace(go.Histogram(x=r, nbinsx=300, marker_color='steelblue',
+                               name='r', showlegend=False), row=3, col=1)
+
+    fig.update_xaxes(title_text='z_cylindrical', row=1, col=1)
+    fig.update_xaxes(title_text='z_cylindrical', row=2, col=1)
+    fig.update_xaxes(title_text='r (radial distance from stent axis)', row=3, col=1)
+    fig.update_yaxes(title_text='r', row=1, col=1)
+    fig.update_yaxes(title_text='thickness', row=2, col=1)
+    fig.update_yaxes(title_text='point count', row=3, col=1)
+    fig.update_layout(template='plotly_white', height=900,
+                      margin=dict(l=50, r=20, t=50, b=40),
+                      title='Strut thickness diagnostics')
+
+    pio.write_html(fig, out_path, auto_open=False, config={'scrollZoom': True})
+    return out_path
+
+
+
+def plot_ring_convergence_html(history: pd.DataFrame | None,
+                               out_path: str,
+                               ring_id: int,
+                               quality_report: dict | None = None,
+                               pps: float | None = None,
+                               dil_px: int | None = None) -> str:
+    """
+    Draw one ring's auto-tune convergence (or a quality summary) and save it as HTML.
+
+    Three cases: with a non-empty ``history`` (from
+    :func:`~stentfit.stent_skeleton_2d.tune_skeleton_params`), draws the
+    ``total``/``defect``/``quality`` error trajectory across tuning steps.
+    Without a history but with a ``quality_report``, draws a bar chart of the
+    defect counts instead (used for the fixed-params, no-auto-tune case).
+    With neither, draws a placeholder noting auto-tune was off.
+
+    :param history: Per-step tuning history from :func:`~stentfit.stent_skeleton_2d.tune_skeleton_params`.
+        ``None`` or empty falls back to the quality-summary or placeholder case.
+    :param out_path: File path the HTML view is written to.
+    :param ring_id: Ring identifier, used in the plot title.
+    :param quality_report: Dict from :func:`~stentfit.stent_skeleton_2d.check_skeleton_quality`,
+        used for the quality-summary bar chart when ``history`` is unavailable.
+    :param pps: ``pixels_per_strut`` used, shown in the quality-summary title if given.
+    :param dil_px: ``dilate_px`` used, shown in the quality-summary title if given.
+    :returns: ``out_path``, for chaining into a caller's own return value.
     """
     fig = go.Figure()
 
@@ -324,7 +450,7 @@ def plot_crown_convergence_html(history, out_path, crown_id,
                 x=step, y=yv, mode='lines+markers', name=name,
                 line=dict(color=col), marker=dict(size=5, color=col),
                 customdata=cdata, hovertemplate=htmpl))
-        fig.update_layout(title=f'Crown {crown_id} — error convergence',
+        fig.update_layout(title=f'Ring {ring_id} — error convergence',
                           xaxis_title='tuning step', yaxis_title='error')
     elif quality_report is not None:
         cats = ['bad connections', 'region loops', 'border loops', 'empty regions']
@@ -337,12 +463,12 @@ def plot_crown_convergence_html(history, out_path, crown_id,
             x=cats, y=vals, marker_color=colors, text=vals, textposition='outside',
             hovertemplate="%{x}: %{y}<extra></extra>", showlegend=False))
         ptag = f' (pps={pps}, dil_px={dil_px})' if pps is not None else ''
-        fig.update_layout(title=f'Crown {crown_id} — quality summary{ptag}',
+        fig.update_layout(title=f'Ring {ring_id} — quality summary{ptag}',
                           yaxis=dict(title='count', rangemode='tozero'))
     else:
         fig.add_annotation(text='no tuning history (auto-tune off)',
                            xref='paper', yref='paper', x=0.5, y=0.5, showarrow=False)
-        fig.update_layout(title=f'Crown {crown_id} — tuning')
+        fig.update_layout(title=f'Ring {ring_id} — tuning')
 
     fig.update_layout(template='plotly_white', height=450,
                       margin=dict(l=50, r=20, t=50, b=40))
@@ -351,18 +477,42 @@ def plot_crown_convergence_html(history, out_path, crown_id,
 
 
 
-def plot_crown_skeleton_2d_html(arc, z, surface_arc, surface_z, out_path, crown_label,
-                                crown_band=None, changed_idx=None, quality_report=None,
-                                title=""):
-    """Single-panel interactive 2D view of a crown skeleton (crown_XX.html + editor).
+def plot_ring_skeleton_2d_html(arc: np.ndarray,
+                               z: np.ndarray,
+                               surface_arc: np.ndarray,
+                               surface_z: np.ndarray,
+                               out_path: str,
+                               ring_label: str,
+                               ring_band: tuple[float, float] | None = None,
+                               changed_idx: np.ndarray | None = None,
+                               quality_report: dict | None = None,
+                               title: str = "") -> str:
+    """
+    Draw one ring's flat 2D skeleton over its surface points, with any
+    flagged defects overlaid, and save it as HTML.
 
-    x=z, y=arc. Surface points grey (halo cut when crown_band is given), skeleton
-    points red; hovering a skeleton point shows its local index i and (arc, z).
-    Scroll/drag zoom enabled (no equal-aspect lock). ``changed_idx`` points are
-    ringed to show what an edit changed. When ``quality_report`` is given, the
-    detected issues INSIDE the crown band are overlaid — bad connections (blue x),
-    loops (magenta open circles), empty regions (black open squares) — and the
-    title shows the in-band issue count.
+    The surface points are cropped to ``ring_band`` first, if given, so a
+    ring skeletonised with a z-halo is shown next to only its own surface
+    band. When ``quality_report`` is passed, its bad connections, loops, and
+    empty regions are drawn as markers, tagged with the nearest skeleton
+    point's index so they line up with the manual-edit prompts. When
+    ``changed_idx`` is passed, those skeleton points are highlighted, useful
+    for showing what a manual edit changed.
+
+    :param arc: Flat arc-coordinates of the ring's 2D skeleton.
+    :param z: Flat z-coordinates of the ring's 2D skeleton.
+    :param surface_arc: Flat arc-coordinates of the ring's surface points.
+    :param surface_z: Flat z-coordinates of the ring's surface points.
+    :param out_path: File path the HTML view is written to.
+    :param ring_label: Ring label used in the default title.
+    :param ring_band: ``(z_lo, z_hi)`` the surface points are cropped to.
+        ``None`` shows every surface point passed in.
+    :param changed_idx: Skeleton point indices to highlight as changed.
+    :param quality_report: Dict from :func:`~stentfit.stent_skeleton_2d.check_skeleton_quality`;
+        its ``bad_edge_xy``, ``loop_points_xy``, and ``empty_xy`` are drawn as
+        defect markers, and the issue count is appended to the title.
+    :param title: Plot title. ``ring_label`` and the issue count are used if empty.
+    :returns: ``out_path``, for chaining into a caller's own return value.
     """
     arc   = np.asarray(arc)
     z     = np.asarray(z)
@@ -370,9 +520,9 @@ def plot_crown_skeleton_2d_html(arc, z, surface_arc, surface_z, out_path, crown_
     s_z   = np.asarray(surface_z)
 
     def _in_band(xy_arc, xy_z):
-        if crown_band is None:
+        if ring_band is None:
             return xy_arc, xy_z
-        lo, hi = float(crown_band[0]), float(crown_band[1])
+        lo, hi = float(ring_band[0]), float(ring_band[1])
         m = (xy_z >= lo) & (xy_z <= hi)
         return xy_arc[m], xy_z[m]
 
@@ -440,7 +590,7 @@ def plot_crown_skeleton_2d_html(arc, z, surface_arc, surface_z, out_path, crown_
                 marker=dict(symbol='square-open', size=8, color='black', line=dict(width=1)),
                 hovertemplate="EMPTY REGION<br>arc=%{y:.4f}<br>z=%{x:.4f}<extra></extra>"))
 
-    ttl = title or f'{crown_label} — 2D skeleton'
+    ttl = title or f'{ring_label} — 2D skeleton'
     if n_issues is not None:
         ttl += '  (clean)' if n_issues == 0 else f'  ({n_issues} issue marker(s))'
 
@@ -465,29 +615,71 @@ def plot_crown_skeleton_2d_html(arc, z, surface_arc, surface_z, out_path, crown_
 
 
 
-def _render_crown_2d(crown_2d, label, plots_dir, changed_idx=None, suffix=None):
-    """Render one crown's current 2D skeleton to ``crown_XX[_edited_N].html``."""
-    rec  = crown_2d[label]
+def _render_ring_2d(ring_2d: dict,
+                    label: str,
+                    plots_dir: str,
+                    changed_idx: np.ndarray | None = None,
+                    suffix: str | None = None) -> str:
+    """
+    Render one ring's current 2D skeleton via :func:`plot_ring_skeleton_2d_html`.
+
+    Used by the interactive edit loop to preview a tentative edit: with
+    ``suffix='edited'``, the file is named
+    ``<label>_edited_<rec['n_edits']>.html`` instead of ``<label>.html``, so
+    each edit gets its own preview without overwriting the original.
+
+    :param ring_2d: Per-ring 2D skeletons, keyed by ``label``.
+    :param label: Ring label to render (e.g. ``"ring_01"``).
+    :param plots_dir: Folder the HTML view is written into.
+    :param changed_idx: Skeleton point indices to highlight as changed.
+    :param suffix: ``'edited'`` names the file after the ring's current edit
+        count instead of its plain label.
+    :returns: Path to the written HTML file.
+    """
+    rec  = ring_2d[label]
     name = f"{label}_edited_{rec['n_edits']}" if suffix == 'edited' else label
     out  = os.path.join(plots_dir, f"{name}.html")
-    plot_crown_skeleton_2d_html(
+    plot_ring_skeleton_2d_html(
         rec['arc'], rec['z'], rec['surf_arc'], rec['surf_z'], out, label,
-        crown_band=(rec['z_lo'], rec['z_hi']), changed_idx=changed_idx,
+        ring_band=(rec['z_lo'], rec['z_hi']), changed_idx=changed_idx,
         title=f"{name} — 2D skeleton")
     return out
 
 
 
-def _to_arc_z(x, y, z, r_mid):
-    """3D (x, y, z) -> unrolled (z_axial, arc) with arc = r_mid * atan2(y, x)."""
+def _to_arc_z(x: np.ndarray, y: np.ndarray, z: np.ndarray, r_mid: float) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Unroll 3D points onto the (z, arc) plane, recomputing angle from x/y.
+
+    Unlike :func:`~stentfit.stent_skeleton_2d.open_stent_to_plane`, which
+    reads a ``theta`` column directly, this recomputes it from ``x``/``y``
+    via ``arctan2`` — used for spline points, which only have xyz coordinates.
+
+    :param x: X-coordinates.
+    :param y: Y-coordinates.
+    :param z: Z-coordinates.
+    :param r_mid: Mid-wall radius, used to convert angle to arc length.
+    :returns: ``(z, arc)`` coordinate arrays.
+    """
     return np.asarray(z, float), r_mid * np.arctan2(np.asarray(y, float),
                                                     np.asarray(x, float))
 
 
 
-def _break_seam(z_ax, arc, thresh):
-    """Insert NaNs where arc jumps across the theta seam so the polyline does not
-    draw a spurious wrap-around segment across the plot."""
+def _break_seam(z_ax: np.ndarray, arc: np.ndarray, thresh: float) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Insert a NaN wherever an unrolled curve jumps across the arc seam.
+
+    A curve that crosses the seam (e.g. from ``+circumference/2`` back to
+    ``-circumference/2``) would otherwise be drawn as one long spurious line
+    all the way across the plot. Any gap in ``arc`` wider than ``thresh`` is
+    cut by inserting a ``NaN`` at that point in both arrays.
+
+    :param z_ax: Z-coordinates (or another axial coordinate) of the unrolled curve.
+    :param arc: Arc-coordinates of the unrolled curve.
+    :param thresh: Minimum arc jump between consecutive points that counts as a seam crossing.
+    :returns: ``(z_ax, arc)``, each with a ``NaN`` inserted at every seam crossing.
+    """
     z_ax = np.asarray(z_ax, float).copy()
     arc  = np.asarray(arc, float).copy()
     for j in np.where(np.abs(np.diff(arc)) > thresh)[0][::-1]:
@@ -497,8 +689,19 @@ def _break_seam(z_ax, arc, thresh):
 
 
 
-def _plotly_decode(o):
-    """Decode a Plotly typed-array ({'bdata','dtype'[, 'shape']}) or a plain list."""
+def _plotly_decode(o: dict | list) -> np.ndarray:
+    """
+    Decode one Plotly-exported array back into a plain numpy array.
+
+    Plotly's HTML export sometimes stores array data compactly as
+    base64-encoded typed arrays (a dict with ``bdata``/``dtype``, optionally
+    ``shape``) instead of a plain JSON list. This reverses that encoding;
+    anything else is passed straight to ``np.asarray``.
+
+    :param o: A trace's raw ``x``/``y`` value from the parsed Plotly JSON —
+        either a typed-array dict or a plain list.
+    :returns: The decoded array.
+    """
     if isinstance(o, dict) and 'bdata' in o:
         dt = {'f8': '<f8', 'f4': '<f4', 'i1': 'i1', 'i2': '<i2', 'i4': '<i4',
               'u1': 'u1', 'u4': '<u4'}[o['dtype']]
@@ -510,12 +713,26 @@ def _plotly_decode(o):
 
 
 
-def _load_convergence(path):
-    """Pull trace data from a saved crown_XX_convergence.html.
-    Returns one of:
-      {'kind':'convergence', 'total':(x,y), 'defect':(x,y), 'quality':(x,y)}
-      {'kind':'quality_bar', 'x':labels, 'y':counts, 'colors':colors}
-    or None on failure."""
+def _load_convergence(path: str) -> dict | None:
+    """
+    Re-extract the tuning data plotted in a saved ring convergence HTML file.
+
+    Reads the Plotly figure written by :func:`plot_ring_convergence_html`
+    back off disk: finds its embedded ``Plotly.newPlot(...)`` call with a
+    string-aware bracket scan (so brackets inside trace names don't confuse
+    it), parses that JSON, and pulls out either the ``total``/``defect``/
+    ``quality`` trajectory traces (auto-tune on) or the single quality-summary
+    bar trace (auto-tune off), decoding any typed-array values via
+    :func:`_plotly_decode`. Used to redraw those tuning plots as small
+    matplotlib strips in :func:`plot_skeleton_splines_2d`, without needing
+    the original tuning history in memory.
+
+    :param path: Path to a ``ring_XX_convergence.html`` file.
+    :returns: ``None`` if the file can't be read or parsed. Otherwise a dict
+        with ``kind`` set to ``'convergence'`` (plus ``total``/``defect``/
+        ``quality`` as ``(x, y)`` arrays) or ``'quality_bar'`` (plus ``x``,
+        ``y``, ``colors``).
+    """
     try:
         html = open(path, encoding='utf-8').read()
         i = html.rfind('Plotly.newPlot(')
@@ -559,17 +776,49 @@ def _load_convergence(path):
 
 
 
-def _hue_gap(a, b):
+def _hue_gap(a: float, b: float) -> float:
+    """
+    Circular distance between two hues in ``[0, 1)``.
+
+    Hue wraps around (0 and 1 are the same color), so a plain difference
+    would overstate the gap between hues on opposite sides of the wrap.
+
+    :param a: First hue, in ``[0, 1)``.
+    :param b: Second hue, in ``[0, 1)``.
+    :returns: The shorter of the two distances around the circle.
+    """
     d = abs(a - b) % 1.0
     return min(d, 1.0 - d)
 
 
 
-def _band_conv(k, crown_order, n_bands, conv_files, conv_dir):
-    """Map unrolled band k to its crown_XX_convergence.html path + crown id."""
-    if crown_order is not None and len(crown_order) == n_bands:
-        cid = int(crown_order[k])
-        return os.path.join(conv_dir, f'crown_{cid:02d}_convergence.html'), cid
+def _band_conv(k: int,
+              ring_order: list | None,
+              n_bands: int,
+              conv_files: list[str],
+              conv_dir: str) -> tuple[str | None, int | None]:
+    """
+    Resolve the convergence-plot file and ring ID for the k-th ring band.
+
+    If ``ring_order`` is available and matches ``n_bands``, the file path is
+    built directly from the k-th ring's ID. Otherwise, falls back to
+    indexing into ``conv_files`` (sorted by filename) and parsing the ring
+    ID back out of that file's name.
+
+    :param k: Index of the ring band, in axial order.
+    :param ring_order: Ring IDs in axial order, from
+        :func:`~stentfit.stent_rings.detect_rings` / :func:`~stentfit.stent_skeleton_2d.skeletonize_rings_2d`.
+        ``None`` or a length mismatch falls back to ``conv_files``.
+    :param n_bands: Total number of ring bands.
+    :param conv_files: Sorted list of ``ring_XX_convergence.html`` paths, used as the fallback.
+    :param conv_dir: Folder the convergence files live in, used to build the
+        path when ``ring_order`` is available.
+    :returns: ``(path, ring_id)``, or ``(None, None)`` if neither source
+        could resolve this band.
+    """
+    if ring_order is not None and len(ring_order) == n_bands:
+        cid = int(ring_order[k])
+        return os.path.join(conv_dir, f'ring_{cid:02d}_convergence.html'), cid
     if k < len(conv_files):
         base = os.path.basename(conv_files[k])
         cid  = int(base.split('_')[1])
@@ -578,18 +827,49 @@ def _band_conv(k, crown_order, n_bands, conv_files, conv_dir):
 
 
 
-def plot_skeleton_splines_2d(skeleton_curves, skeleton_splines, stent_df, r_mid,
-                             circumference, crown_edges, crown_order, output_dir,
-                             stent_name):
-    """Render the unrolled 2D skeleton with a per-crown tuning strip (Steps 9-10).
-
-    Draws every fitted spline on an unrolled (z, arc) plane (touching curves given
-    different hues), overlays the point cloud + crown boundaries, and puts each
-    crown's tuning-convergence curves (read back from its convergence HTML) above
-    its band. Saves ``skeleton_splines_2d.png`` and a self-contained
-    ``skeleton_splines_2d.html``.
+def plot_skeleton_splines_2d(skeleton_curves: list[list[int]],
+                             skeleton_splines: list[dict | None],
+                             stent_df: pd.DataFrame,
+                             r_mid: float,
+                             circumference: float,
+                             ring_edges: np.ndarray | None,
+                             ring_order: list | None,
+                             output_dir: str,
+                             stent_name: str) -> dict:
     """
-    # --- varied colours, touching curves differ in HUE (rotating greedy colouring) ---
+    Draw the unrolled 2D splines over the stent cloud, with per-ring tuning
+    plots stacked above their band, and save it as a static PNG + HTML.
+
+    Curves are colored with a greedy rotating palette so any two curves that
+    share a point differ in hue. Ring boundaries are read from
+    ``stent_features.json`` if present (else ``ring_edges``, else derived
+    from ``stent_df``'s ``ring_id`` groups) and drawn as vertical dashed
+    lines; each ring's saved convergence/quality-summary HTML
+    (:func:`plot_ring_convergence_html`) is parsed back out
+    (:func:`_load_convergence`) and redrawn as a small matplotlib strip
+    above that ring's band. The figure is saved as a PNG, embedded as a
+    self-contained HTML page, and also shown inline.
+
+    :param skeleton_curves: Grouped point-id curves, from
+        :func:`~stentfit.stent_splines.group_skeleton_curves`.
+    :param skeleton_splines: Per-curve fit results, from
+        :func:`~stentfit.stent_splines.fit_skeleton_splines`.
+    :param stent_df: Stent surface point cloud, drawn as a grey underlay.
+    :param r_mid: Mid-wall radius, used to unroll splines and the cloud to
+        (z, arc) coordinates.
+    :param circumference: Full circumference at ``r_mid``, used to detect
+        and break the seam when unrolling each spline.
+    :param ring_edges: Z-boundaries between rings, used if
+        ``stent_features.json`` has no ``ring_boundaries``.
+    :param ring_order: Ring IDs in axial order, used to match each band to
+        its convergence file. ``None`` falls back to parsing the ring ID
+        from each convergence file's name.
+    :param output_dir: Folder the PNG/HTML are written into, and where
+        ``stent_features.json`` and the per-ring convergence plots are read from.
+    :param stent_name: Name used to label the plot title.
+    :returns: Dict with the paths to the written PNG and HTML (``png``, ``html``).
+    """
+    #  varied colours, touching curves differ in HUE (rotating greedy colouring)
     palette = []
     for _nm in ('tab20', 'tab20b', 'tab20c'):
         _cm = plt.get_cmap(_nm)
@@ -631,31 +911,31 @@ def plot_skeleton_splines_2d(skeleton_curves, skeleton_splines, stent_df, r_mid,
         curve_color_idx[ci] = chosen
         ptr = (chosen + 1) % n_pal
 
-    # --- crown boundaries (z) for the vertical dashed lines ---------------------------
+    # ring boundaries (z) for the vertical dashed lines 
     features_path = os.path.join(output_dir, 'stent_features.json')
-    crown_lines   = None
+    ring_lines   = None
     if os.path.exists(features_path):
         with open(features_path) as f:
-            cb = json.load(f).get('crown_boundaries')
+            cb = json.load(f).get('ring_boundaries')
         if cb is not None:
-            crown_lines = np.asarray(cb, float).ravel()
-    if crown_lines is None and crown_edges is not None \
-            and len(np.asarray(crown_edges).ravel()) >= 2:
-        crown_lines = np.asarray(crown_edges, float).ravel()
-    if crown_lines is None and 'crown_id' in stent_df.columns:
-        g   = (stent_df.groupby('crown_id')['z'].agg(['min', 'max', 'mean'])
+            ring_lines = np.asarray(cb, float).ravel()
+    if ring_lines is None and ring_edges is not None \
+            and len(np.asarray(ring_edges).ravel()) >= 2:
+        ring_lines = np.asarray(ring_edges, float).ravel()
+    if ring_lines is None and 'ring_id' in stent_df.columns:
+        g   = (stent_df.groupby('ring_id')['z'].agg(['min', 'max', 'mean'])
                        .sort_values('mean'))
         lo  = g['min'].to_numpy()
         hi  = g['max'].to_numpy()
-        crown_lines = np.concatenate([[lo[0]], 0.5 * (hi[:-1] + lo[1:]), [hi[-1]]])
-    crown_lines = None if crown_lines is None else np.sort(np.asarray(crown_lines, float))
+        ring_lines = np.concatenate([[lo[0]], 0.5 * (hi[:-1] + lo[1:]), [hi[-1]]])
+    ring_lines = None if ring_lines is None else np.sort(np.asarray(ring_lines, float))
 
-    # --- map each crown band to its convergence file ---
+    #  map each ring band to its convergence file 
     conv_dir   = os.path.join(output_dir, 'skeleton_plots')
-    conv_files = sorted(glob.glob(os.path.join(conv_dir, 'crown_*_convergence.html')))
-    n_bands    = 0 if crown_lines is None else len(crown_lines) - 1
+    conv_files = sorted(glob.glob(os.path.join(conv_dir, 'ring_*_convergence.html')))
+    n_bands    = 0 if ring_lines is None else len(ring_lines) - 1
 
-    # --- figure: main unrolled plot (bottom) + per-crown tuning strip (top) ------------
+    #  figure: main unrolled plot (bottom) + per-ring tuning strip (top) 
     L, B, W, H = 0.05, 0.06, 0.93, 0.52            # main axes box (figure coords)
     TY0, TH    = 0.66, 0.28                         # tuning strip band (figure coords)
 
@@ -681,34 +961,34 @@ def plot_skeleton_splines_2d(skeleton_curves, skeleton_splines, stent_df, r_mid,
         ax.plot(z_ax, arc, '-', lw=1.8, color=palette[curve_color_idx[ci]], zorder=2)
         n_drawn += 1
 
-    if crown_lines is not None:
-        xlo, xhi = float(crown_lines[0]), float(crown_lines[-1])
+    if ring_lines is not None:
+        xlo, xhi = float(ring_lines[0]), float(ring_lines[-1])
         span = (xhi - xlo) or 1.0
         xlo -= 0.01 * span
         xhi += 0.01 * span
         ax.set_xlim(xlo, xhi)
-        for e in crown_lines:
+        for e in ring_lines:
             ax.axvline(e, ls='--', lw=1.6, color='k', alpha=0.9, zorder=10)
     else:
         xlo, xhi = ax.get_xlim()
         span = (xhi - xlo) or 1.0
 
-    fig.suptitle(f'{stent_name} — unrolled 2D skeleton + per-crown tuning',
+    fig.suptitle(f'{stent_name} — unrolled 2D skeleton + per-ring tuning',
                  fontsize=11, y=0.995)
     ax.set_xlabel('z  (axial position, mm)')
     ax.set_ylabel('arc = r_mid · θ  (circumferential, mm)')
 
-    # per-crown tuning plots above their bands
+    # per-ring tuning plots above their bands
     tune_colors = (('total', 'black'), ('defect', 'royalblue'), ('quality', 'orange'))
     tax = None
     n_tuned = 0
     for k in range(n_bands):
-        a, b = float(crown_lines[k]), float(crown_lines[k + 1])
+        a, b = float(ring_lines[k]), float(ring_lines[k + 1])
         fx0  = L + (a - xlo) / (xhi - xlo) * W
         fw   = (b - a) / (xhi - xlo) * W
         pad  = 0.14 * fw
         tax  = fig.add_axes([fx0 + pad, TY0, max(fw - 2 * pad, 1e-3), TH])
-        path, cid = _band_conv(k, crown_order, n_bands, conv_files, conv_dir)
+        path, cid = _band_conv(k, ring_order, n_bands, conv_files, conv_dir)
         conv = _load_convergence(path) if path and os.path.exists(path) else None
         if conv is None:
             tax.axis('off')
@@ -723,7 +1003,7 @@ def plot_skeleton_splines_2d(skeleton_curves, skeleton_splines, stent_df, r_mid,
             short_x = [l.replace(' ', '\n') for l in conv['x']]
             tax.bar(short_x, conv['y'], color=conv['colors'], width=0.6)
             tax.set_ylim(bottom=0)
-        tax.set_title(f'crown {cid}', fontsize=7, pad=2)
+        tax.set_title(f'ring {cid}', fontsize=7, pad=2)
         tax.tick_params(labelsize=5, length=2, pad=1)
         n_tuned += 1
 
@@ -752,27 +1032,34 @@ def plot_skeleton_splines_2d(skeleton_curves, skeleton_splines, stent_df, r_mid,
         )
     plt.show()
     print(f"[saved] {unrolled_png}  ({n_drawn} curves, "
-          f"{0 if crown_lines is None else len(crown_lines)} crown boundaries, "
-          f"{n_tuned}/{n_bands} crown tuning plots)")
+          f"{0 if ring_lines is None else len(ring_lines)} ring boundaries, "
+          f"{n_tuned}/{n_bands} ring tuning plots)")
     print(f"[saved] {unrolled_html}")
     return {'png': unrolled_png, 'html': unrolled_html}
 
 
 
-def plot_skeleton_splines_trimesh(skeleton_splines, output_dir, show=False, tube_radius=None, sections=6):
-    """Export the fitted splines as a coloured 3D tube mesh (.glb + trimesh .html).
+def plot_skeleton_splines_trimesh(skeleton_splines: list[dict | None],
+                                  output_dir: str,
+                                  show: bool = False,
+                                  tube_radius: float | None = None,
+                                  sections: int = 6) -> trimesh.Trimesh | None:
+    """
+    Build a 3D tube mesh of every fitted spline and save it as GLB + HTML.
 
-    Evaluates each spline into a polyline and builds a solid tube (chained
-    cylinder segments) per curve rather than a ``Path3D`` of GL lines: exported
-    glTF ``LINES`` are rendered with a hairline width by most browsers (three.js
-    ignores ``linewidth`` on most GL backends), so real geometry is the only
-    reliable way to get a visibly thick curve in the exported HTML. Writes a
-    portable ``skeleton_splines.glb`` and a self-contained
-    ``skeleton_splines_trimesh.html``, and (when ``show``) opens the interactive
-    trimesh window. ``show`` defaults to ``False`` so the function stays
-    headless-safe (opening the window needs a GUI backend such as ``pyglet``);
-    the ``.html`` file is the portable view. ``tube_radius`` defaults to ~0.3%
-    of the overall bounding-box diagonal when not given.
+    Each spline is evaluated (or, for the polyline fallback, taken as-is)
+    and turned into a chain of cylinder segments, colored per-curve. The
+    combined mesh is exported as a ``.glb`` and, where the trimesh notebook
+    viewer supports it, as a self-contained HTML page.
+
+    :param skeleton_splines: Per-curve fit results, from
+        :func:`~stentfit.stent_splines.fit_skeleton_splines`.
+    :param output_dir: Folder the GLB and HTML are written into.
+    :param show: Open an interactive trimesh viewer window.
+    :param tube_radius: Cylinder radius for each curve. ``None`` picks it
+        automatically as a fraction of the mesh's bounding-box diagonal.
+    :param sections: Number of sides on each cylinder's cross-section.
+    :returns: The combined mesh, or ``None`` if there were no curves to draw.
     """
     _curves = []
     _cmap = plt.get_cmap('tab20')

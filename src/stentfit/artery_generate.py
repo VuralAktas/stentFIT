@@ -7,47 +7,48 @@ from scipy.ndimage import gaussian_filter1d, gaussian_filter
 # ---------------------------------------------------------------------------
 
 def _make_circle_points(radius: float, n_circumference: int) -> np.ndarray:
-    """Generate points on a unit circle in the XY plane, centred at origin."""
+    """
+    Sample evenly-spaced points around a circle in the XY plane, at z=0.
+
+    :param radius: Circle radius.
+    :param n_circumference: Number of points around the circle.
+    :returns: ``(n_circumference, 3)`` array of points.
+    """
     theta = np.linspace(0, 2 * np.pi, n_circumference, endpoint=False)
     points = np.column_stack([np.cos(theta), np.sin(theta), np.zeros_like(theta)])
     return points * radius
 
 
 def _build_tube_mesh(
-    centerline: np.ndarray,
-    radii: np.ndarray,
-    n_circumference: int = 32,
-    cap_ends: bool = True,
-    noise_amplitude: float = 0.0,
-    noise_seed: int | None = None,
-) -> trimesh.Trimesh:
+        centerline: np.ndarray,
+        radii: np.ndarray,
+        n_circumference: int = 32,
+        cap_ends: bool = True,
+        noise_amplitude: float = 0.0,
+        noise_seed: int | None = None,
+    ) -> trimesh.Trimesh:
     """
-    Build a watertight tube mesh around a 3D centerline with varying radii.
+    Sweep a circular cross-section along a centreline into a tube mesh.
 
-    Parameters
-    ----------
-    centerline : (M, 3) array
-        Ordered 3D points defining the vessel centreline.
-    radii : (M,) array
-        Cross-sectional radius at each centreline point.
-    n_circumference : int
-        Number of vertices around each cross-section ring.
-    cap_ends : bool
-        If True, close both ends with triangulated caps.
-    noise_amplitude : float
-        Biological wall irregularity as a fraction of the local radius
-        (0 = perfectly smooth, 0.05 = ±5% radius variation).
-        Combines a smooth axial component (stenosis/dilatation-like lumen
-        variation) with a smaller high-frequency surface roughness component.
-    noise_seed : int or None
-        Random seed for reproducibility. None = non-deterministic.
+    A local frame (tangent, normal, binormal) is propagated along the
+    centreline by parallel-transporting the normal at each step (a
+    rotation-minimising-frame approximation), so the cross-section doesn't
+    twist. If ``noise_amplitude`` is positive, a "biological" wall-roughness
+    field is added as a fractional radius deviation: a smooth low-frequency
+    component along the length (75% weight, mimicking natural
+    stenosis/dilatation) plus a small-scale per-vertex component (25%
+    weight, mimicking endothelial texture), clamped so the radius never
+    drops below 10% of its nominal value. Both ends are capped with a
+    triangle fan if ``cap_ends``.
 
-    Returns
-    -------
-    trimesh.Trimesh
-        Watertight triangulated surface mesh of the tube.
+    :param centerline: ``(n, 3)`` points along the tube's centreline.
+    :param radii: Per-section radius, one value per centreline point.
+    :param n_circumference: Number of vertices around each cross-section.
+    :param cap_ends: Close both ends of the tube with a triangle fan.
+    :param noise_amplitude: Fractional wall-roughness noise, as a fraction of the radius.
+    :param noise_seed: Seed for the wall noise. ``None`` draws a fresh pattern each call.
+    :returns: The tube surface mesh, with normals fixed to point outward.
     """
-
     n_sections = len(centerline)
     nc = n_circumference
 
@@ -180,20 +181,27 @@ def _build_tube_mesh(
 
 
 def _add_outer_wall(
-    inner_mesh: trimesh.Trimesh,
-    centerline: np.ndarray,
-    radii: np.ndarray,
-    wall_thickness: float,
-    n_circumference: int,
-) -> trimesh.Trimesh:
+        inner_mesh: trimesh.Trimesh,
+        centerline: np.ndarray,
+        radii: np.ndarray,
+        wall_thickness: float,
+        n_circumference: int) -> trimesh.Trimesh:
     """
-    Give a lumen surface a wall of finite thickness.
+    Turn a lumen-only tube mesh into a hollow-walled tube.
 
-    Builds an outer shell at ``radii + wall_thickness``, flips the inner
-    (lumen) surface normals so they point into the wall, and concatenates the
-    two shells into a single two-surface mesh. This is the inner/outer boundary
-    representation of the artery wall; the volumetric (tet/hex) fill between the
-    shells is produced later by the 3D solid mesher.
+    Builds a second, larger, independently-capped tube at
+    ``radii + wall_thickness`` as the outer wall, flips ``inner_mesh``'s
+    normals so they face into the wall material instead of outward, and
+    concatenates both into one mesh representing the wall's inner and outer
+    boundary together.
+
+    :param inner_mesh: The lumen surface, from :func:`_build_tube_mesh`.
+    :param centerline: ``(n, 3)`` points along the tube's centreline, matching
+        ``inner_mesh``.
+    :param radii: Per-section lumen radius, matching ``inner_mesh``.
+    :param wall_thickness: Wall thickness added to ``radii`` for the outer surface.
+    :param n_circumference: Number of vertices around each cross-section.
+    :returns: The combined outer + inner (inverted) surface mesh.
     """
     outer_radii = radii + wall_thickness
     outer = _build_tube_mesh(centerline, outer_radii, n_circumference)
@@ -206,33 +214,38 @@ def _add_outer_wall(
 # ---------------------------------------------------------------------------
 
 def straight_centreline(length: float, n_points: int = 100) -> np.ndarray:
-    """Straight centreline along the Z-axis."""
+    """
+    Build a straight centreline of the given length along the z-axis.
+
+    :param length: Centreline length, in mm.
+    :param n_points: Number of points along the centreline.
+    :returns: ``(n_points, 3)`` array of points, at ``x = y = 0``.
+    """
     z = np.linspace(0, length, n_points)
     return np.column_stack([np.zeros(n_points), np.zeros(n_points), z])
 
 
 def curved_centreline(
-    length: float,
-    bend_radius: float,
-    bend_angle_deg: float = 45.0,
-    n_points: int = 100,
-) -> np.ndarray:
+        length: float,
+        bend_radius: float,
+        bend_angle_deg: float = 45.0,
+        n_points: int = 100) -> np.ndarray:
     """
-    Centreline with a single circular bend in the XZ plane.
+    Build a straight → arc → straight centreline, in the XZ plane.
 
-    The vessel starts straight along Z, bends through `bend_angle_deg`,
-    then continues straight in the new direction.
+    The middle section is a circular arc of ``bend_radius`` sweeping
+    ``bend_angle_deg``; the two straight segments before and after it are
+    equal length, sized so the whole centreline's arc length adds up to
+    ``length``. Points are sampled at even arc-length steps along the whole
+    path.
 
-    Parameters
-    ----------
-    length : float
-        Total arc-length of the centreline (mm).
-    bend_radius : float
-        Radius of curvature at the bend (mm).
-    bend_angle_deg : float
-        Total bend angle in degrees.
-    n_points : int
-        Number of discretisation points.
+    :param length: Total centreline arc length, in mm.
+    :param bend_radius: Radius of the circular arc, in mm.
+    :param bend_angle_deg: Total bend angle, in degrees.
+    :param n_points: Number of points along the centreline.
+    :raises ValueError: If the arc alone (``bend_radius * bend_angle``) is
+        longer than ``length``, leaving no room for the two straight segments.
+    :returns: ``(n_points, 3)`` array of points.
     """
     bend_angle = np.radians(bend_angle_deg)
     arc_length = bend_radius * bend_angle
@@ -281,15 +294,28 @@ def curved_centreline(
 
 
 def s_bend_centreline(
-    length: float,
-    bend_radius: float,
-    bend_angle_deg: float = 30.0,
-    n_points: int = 100,
-) -> np.ndarray:
+        length: float,
+        bend_radius: float,
+        bend_angle_deg: float = 30.0,
+        n_points: int = 100) -> np.ndarray:
     """
-    S-shaped centreline: two opposite bends separated by a straight section.
+    Build an S-shaped centreline: straight → arc right → straight → arc left → straight.
 
-    The bends are symmetric and lie in the XZ plane.
+    Walked piecewise in 3D, tracking position and heading segment by
+    segment, so each arc continues smoothly from where the previous segment
+    left off. The two arcs both use ``bend_radius``/``bend_angle_deg`` but
+    curve in opposite directions; the three straight segments share what's
+    left of ``length`` equally. Each of the 5 segments gets roughly
+    ``n_points / 5`` points (floored at 10), so the actual point count may
+    come out slightly different from ``n_points``.
+
+    :param length: Total centreline arc length, in mm.
+    :param bend_radius: Radius of each circular arc, in mm.
+    :param bend_angle_deg: Bend angle of each arc, in degrees.
+    :param n_points: Target number of points along the centreline.
+    :raises ValueError: If the two arcs alone are longer than ``length``,
+        leaving no room for the three straight segments.
+    :returns: Array of points along the centreline.
     """
     # Build as: straight → bend_right → straight → bend_left → straight
     bend_angle = np.radians(bend_angle_deg)
@@ -366,33 +392,32 @@ def s_bend_centreline(
 # ---------------------------------------------------------------------------
 
 def generate_straight_artery(
-    radius: float = 1.5,
-    length: float = 25.0,
-    wall_thickness: float = 0.0,
-    n_circumference: int = 32,
-    n_axial: int = 100,
-    noise_amplitude: float = 0.0,
-    noise_seed: int | None = None,
-) -> trimesh.Trimesh:
+        radius: float = 1.5,
+        length: float = 25.0,
+        wall_thickness: float = 0.0,
+        n_circumference: int = 32,
+        n_axial: int = 100,
+        noise_amplitude: float = 0.0,
+        noise_seed: int | None = None,
+    ) -> trimesh.Trimesh:
     """
-    Generate a straight cylindrical artery.
+    Build a straight tube mesh of constant radius.
 
-    Parameters
-    ----------
-    radius : float
-        Inner lumen radius in mm (typical coronary: 1.25–2.0 mm).
-    length : float
-        Vessel length in mm.
-    wall_thickness : float
-        If > 0, generates a hollow tube (outer - inner). If 0, single-wall surface.
-    n_circumference : int
-        Vertices around each ring.
-    n_axial : int
-        Number of cross-section rings along the length.
-    noise_amplitude : float
-        Biological wall irregularity as a fraction of radius (0 = smooth, 0.05 = ±5%).
-    noise_seed : int or None
-        Random seed for reproducibility.
+    The simplest of the three artery shapes: a :func:`straight_centreline`
+    with a uniform radius, tubed by :func:`_build_tube_mesh`. If
+    ``wall_thickness`` is positive, a second, larger tube is added as the
+    outer wall (:func:`_add_outer_wall`); otherwise the mesh is the lumen
+    surface only.
+
+    :param radius: Lumen radius, in mm.
+    :param length: Artery length, in mm.
+    :param wall_thickness: Wall thickness, in mm. ``0`` builds the lumen
+        surface only, with no separate wall.
+    :param n_circumference: Number of vertices around each cross-section.
+    :param n_axial: Number of cross-sections along the length.
+    :param noise_amplitude: Fractional wall-roughness noise, as a fraction of the radius.
+    :param noise_seed: Seed for the wall noise. ``None`` draws a fresh pattern each call.
+    :returns: The artery wall mesh.
     """
     cl = straight_centreline(length, n_axial)
     radii = np.full(n_axial, radius)
@@ -417,22 +442,23 @@ def generate_curved_artery(
     noise_seed: int | None = None,
 ) -> trimesh.Trimesh:
     """
-    Generate a curved artery with a single bend.
+    Build a tube mesh of constant radius along a single-bend centreline.
 
-    Parameters
-    ----------
-    radius : float
-        Lumen radius in mm.
-    length : float
-        Total arc-length in mm.
-    bend_radius : float
-        Radius of curvature at the bend in mm.
-    bend_angle_deg : float
-        Bend angle in degrees.
-    noise_amplitude : float
-        Biological wall irregularity as a fraction of radius (0 = smooth, 0.05 = ±5%).
-    noise_seed : int or None
-        Random seed for reproducibility.
+    Same construction as :func:`generate_straight_artery`, but tubed along a
+    :func:`curved_centreline` (straight → arc → straight) instead of a
+    straight line.
+
+    :param radius: Lumen radius, in mm.
+    :param length: Total artery length along the centreline, in mm.
+    :param bend_radius: Radius of the circular arc, in mm.
+    :param bend_angle_deg: Total bend angle, in degrees.
+    :param wall_thickness: Wall thickness, in mm. ``0`` builds the lumen
+        surface only, with no separate wall.
+    :param n_circumference: Number of vertices around each cross-section.
+    :param n_axial: Number of cross-sections along the length.
+    :param noise_amplitude: Fractional wall-roughness noise, as a fraction of the radius.
+    :param noise_seed: Seed for the wall noise. ``None`` draws a fresh pattern each call.
+    :returns: The artery wall mesh.
     """
     cl = curved_centreline(length, bend_radius, bend_angle_deg, n_axial)
     radii = np.full(n_axial, radius)
@@ -455,22 +481,25 @@ def generate_s_bend_artery(
     noise_seed: int | None = None,
 ) -> trimesh.Trimesh:
     """
-    Generate an S-shaped artery with two opposite bends.
+    Build a tube mesh of constant radius along an S-shaped centreline.
 
-    Parameters
-    ----------
-    radius : float
-        Lumen radius in mm.
-    length : float
-        Total arc-length in mm.
-    bend_radius : float
-        Radius of curvature for each bend in mm.
-    bend_angle_deg : float
-        Bend angle for each curve segment in degrees.
-    noise_amplitude : float
-        Biological wall irregularity as a fraction of radius (0 = smooth, 0.05 = ±5%).
-    noise_seed : int or None
-        Random seed for reproducibility.
+    Same construction as :func:`generate_straight_artery`, but tubed along a
+    :func:`s_bend_centreline` (two opposite bends). ``n_axial`` is only a
+    target: the S-bend centreline's actual point count can come out
+    slightly different, so the radius array is sized to match the
+    centreline it actually returns rather than ``n_axial`` directly.
+
+    :param radius: Lumen radius, in mm.
+    :param length: Total artery length along the centreline, in mm.
+    :param bend_radius: Radius of each circular arc, in mm.
+    :param bend_angle_deg: Bend angle of each arc, in degrees.
+    :param wall_thickness: Wall thickness, in mm. ``0`` builds the lumen
+        surface only, with no separate wall.
+    :param n_circumference: Number of vertices around each cross-section.
+    :param n_axial: Target number of cross-sections along the length.
+    :param noise_amplitude: Fractional wall-roughness noise, as a fraction of the radius.
+    :param noise_seed: Seed for the wall noise. ``None`` draws a fresh pattern each call.
+    :returns: The artery wall mesh.
     """
     cl = s_bend_centreline(length, bend_radius, bend_angle_deg, n_axial)
     radii = np.full(len(cl), radius)
@@ -491,27 +520,29 @@ def generate_artery_for_stent(
     wall_thickness: float = 0.5,
 ) -> tuple:
     """
-    Generate an artery mesh and centreline sized to match the given stent features.
+    Build a parametric test artery sized to fit a given stent.
 
-    Bend radii are chosen so the full arc fits within the artery length with
-    a 10% margin.
+    The artery's lumen radius is the stent's outer radius plus
+    ``inner_margin`` clearance; its length is a multiple of the stent length
+    (1.5x for ``'straight'``/``'curved'``, 2x for ``'s_bend'``, so the stent
+    always sits well inside it), and any bend radius is picked so the
+    artery's arc roughly matches its length at the given bend angle. Builds
+    both the wall mesh (:func:`generate_straight_artery`,
+    :func:`generate_curved_artery`, or :func:`generate_s_bend_artery`) and
+    the matching centreline (:func:`straight_centreline`,
+    :func:`curved_centreline`, or :func:`s_bend_centreline`) for whichever
+    ``artery_type`` is requested, then prints a summary comparing the two.
 
-    Parameters
-    ----------
-    features       : dict  each key maps to {"value": ..., "unit": "..."}
-    artery_type    : "straight" | "curved" | "s_bend"
-    noise_amplitude: fractional radius perturbation (0 = smooth, 0.05 = ±5%)
-    noise_seed     : int for reproducibility, or None for random
-    bend_angle_deg : bend angle [deg]; only used for "curved" and "s_bend"
-    wall_thickness : artery wall thickness [mm]; 0 = lumen surface only, >0 adds
-                     an outer shell at (lumen_radius + wall_thickness) so the mesh
-                     carries the inner+outer wall boundary for the 3D solid mesher.
-
-    Returns
-    -------
-    artery_mesh  : trimesh.Trimesh
-    artery_cl    : (M, 3) ndarray  centreline points
-    artery_radius: float  nominal lumen radius [mm]
+    :param features: Stent features, each entry wrapped as ``{"value": ...}``
+        (only ``r_outer`` and ``length`` are read).
+    :param artery_type: Artery shape: ``'straight'``, ``'curved'``, or ``'s_bend'``.
+    :param noise_amplitude: Fractional wall-roughness noise, as a fraction of the radius.
+    :param noise_seed: Seed for the wall noise. ``None`` draws a fresh pattern each call.
+    :param bend_angle_deg: Total bend angle, in degrees, for ``'curved'``/``'s_bend'``.
+    :param inner_margin: Extra clearance, in mm, between the stent and the artery lumen.
+    :param wall_thickness: Artery wall thickness, in mm. ``0`` builds the lumen surface only.
+    :returns: ``(artery_mesh, artery_cl, artery_radius)`` — the wall
+        ``trimesh.Trimesh``, the centreline points, and the lumen radius.
     """
     artery_radius = features["r_outer"]["value"] + inner_margin
     stent_length  = features["length"]["value"]

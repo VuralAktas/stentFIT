@@ -1,18 +1,19 @@
 import numpy as np
 import gmsh
 from pathlib import Path
-from pathlib import Path
 
 from beamme.four_c.model_importer import (import_cubitpy_model,
                                           import_four_c_model)
 from beamme.core.conf import bme
+from beamme.core.mesh import Mesh
 from beamme.core.geometry_set import GeometrySet
+from beamme.four_c.input_file import InputFile
 from beamme.four_c.beam_interaction_conditions import add_beam_interaction_condition
 from beamme.four_c.header_functions import set_beam_to_solid_meshtying
 
 
 # ---------------------------------------------------------------------------
-# 1. Artery solid meshing (GMSH) — Mac-native, writes a 4C .yaml solid
+# 1. Artery solid meshing (GMSH)
 # ---------------------------------------------------------------------------
 
 # gmsh element type -> (4C keyword, nodes/elem, gmsh->4C node permutation).
@@ -27,12 +28,26 @@ _MESH_SPEC = {
 }
 
 
-def _apply_radial_noise(coords, length, amplitude, seed):
-    """Fractional radial perturbation of node radii in the straight (+Z) config.
+def _apply_radial_noise(coords: np.ndarray,
+                        length: float,
+                        amplitude: float,
+                        seed: int | None) -> np.ndarray:
+    """
+    Perturb a straight tube mesh's radius with a smooth, organic-looking pattern.
 
-    A smooth low-frequency field of the axial position and angle, tapered to zero
-    over the outer 10% at each end so the inlet/outlet faces stay clean rings.
-    ``amplitude`` is the fractional radius variation (e.g. 0.1 = +/-10%).
+    Sums 4 sinusoidal modes, each oscillating along both the axial (z) and
+    circumferential (phi) directions with a random amplitude sign and phase,
+    to build a wall-roughness field that reads as smooth and undulating
+    rather than uniform per-vertex noise. The field is normalised to peak at
+    1 before scaling by ``amplitude``, and tapered to zero within the last
+    10% of the length at each end, so the flat inlet/outlet caps stay flat.
+    Only the radius changes; ``z`` is left untouched.
+
+    :param coords: ``(n, 3)`` node coordinates of the straight tube mesh.
+    :param length: Tube length along z, used to scale the noise wavelengths and end taper.
+    :param amplitude: Fractional radial noise, as a fraction of the local radius.
+    :param seed: Seed for the noise pattern. ``None`` draws a fresh pattern each call.
+    :returns: The perturbed coordinates.
     """
     x, y, z = coords[:, 0], coords[:, 1], coords[:, 2]
     r = np.hypot(x, y)
@@ -52,8 +67,21 @@ def _apply_radial_noise(coords, length, amplitude, seed):
     return out
 
 
-def _compute_rmf(cl: np.ndarray):
-    """Rotation-minimising frame (Bishop frame) along a polyline centreline."""
+def _compute_rmf(cl: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Propagate a rotation-minimising frame (tangent, normal, binormal) along a centreline.
+
+    The tangent is the local curve direction; the normal starts
+    perpendicular to the first tangent and is then parallel-transported
+    along the curve (projected onto each new tangent's perpendicular plane
+    and renormalised), so the frame doesn't twist. The binormal completes
+    the frame. Same construction as
+    :func:`~stentfit.artery_generate._build_tube_mesh`'s frame.
+
+    :param cl: ``(n, 3)`` centreline points.
+    :returns: ``(T, N, B)`` — the per-point tangent, normal, and binormal,
+        each ``(n, 3)``.
+    """
     n   = len(cl)
     T   = np.zeros_like(cl, dtype=float)
     T[0]    = cl[1] - cl[0]
@@ -75,18 +103,22 @@ def _compute_rmf(cl: np.ndarray):
 
     return T, N, np.cross(T, N)
 
-def _warp_coords_to_centreline(coords, centreline):
-    """Warp straight (+Z) node coordinates onto a 3D centreline with a
-    rotation-minimising frame (``_compute_rmf``): each node's z is its
-    arc-length coordinate, and its (x, y) cross-section is placed via the
-    local normal / binormal.
-
-    The artery wall's cross-section is a circle, so the azimuthal orientation of
-    the frame does not change the solid — the tube simply follows the centreline
-    path and stays co-located with the stent (also warped onto ``artery_cl``). A
-    straight centreline along +Z leaves the tube unchanged. Returns (N, 3).
+def _warp_coords_to_centreline(coords: np.ndarray, centreline: np.ndarray) -> np.ndarray:
     """
+    Bend a straight tube mesh's node coordinates onto an artery centreline.
 
+    Each node's ``z`` is treated as its arc-length position along the
+    straight tube (clamped to the centreline's own arc range), used to
+    interpolate that point's position and rotation-minimising frame
+    (:func:`_compute_rmf`) on ``centreline``. The node's local ``x``/``y``
+    offset is then re-expressed along the interpolated normal/binormal
+    instead of the original straight-tube axes — the same warping
+    convention used for the stent beam mesh, so the two stay aligned.
+
+    :param coords: ``(n, 3)`` node coordinates of the straight tube mesh.
+    :param centreline: Points the straight tube is warped onto.
+    :returns: The warped coordinates.
+    """
     cl = np.asarray(centreline, dtype=float)
     seg = np.linalg.norm(np.diff(cl, axis=0), axis=1)
     arc = np.concatenate([[0.0], np.cumsum(seg)])       # arc length at each cl point
@@ -101,8 +133,22 @@ def _warp_coords_to_centreline(coords, centreline):
     return cl_s + coords[:, 0:1] * N_s + coords[:, 1:2] * B_s
 
 
-def _count_inverted(coords, conn, mesh_type):
-    """Number of negative-Jacobian elements (corner orientation check)."""
+def _count_inverted(coords: np.ndarray, conn: np.ndarray, mesh_type: str) -> int:
+    """
+    Count elements that ended up inverted (negative signed volume).
+
+    For each element, takes the scalar triple product of the first three
+    edge vectors from one corner node (nodes 0,1,2,3 for a tet; nodes
+    0,1,3,4 for a hex, treating one corner as a representative tetrahedron).
+    A negative value means that element's node ordering now describes a
+    flipped, degenerate shape — a sign that a large warp or noise amplitude
+    has folded the mesh over on itself.
+
+    :param coords: ``(n, 3)`` node coordinates.
+    :param conn: ``(n_elem, nnode)`` element connectivity, with 1-based node IDs.
+    :param mesh_type: Element type: any ``'TET*'`` label, or ``'HEX8'``.
+    :returns: Number of elements with negative signed volume.
+    """
     P = coords[conn - 1]
     if mesh_type.startswith("TET"):
         v = np.einsum("ij,ij->i", P[:, 1] - P[:, 0],
@@ -116,9 +162,8 @@ def _count_inverted(coords, conn, mesh_type):
 def mesh_artery_gmsh(
     r_inner: float,
     r_outer: float,
-    centreline,
-    out_path,
-    *,
+    centreline: np.ndarray,
+    out_path: str | Path,
     mesh_type: str = "TET4",
     element_size: float | None = None,
     noise_amplitude: float = 0.0,
@@ -127,55 +172,40 @@ def mesh_artery_gmsh(
     youngs_modulus: float = 1.0,
     poisson_ratio: float = 0.3,
     density: float = 1.0,
-):
-    """Mesh a hollow artery wall along a centreline with GMSH; write a 4C ``.yaml`` solid.
-
-    Builds the wall between the lumen radius ``r_inner`` and outer radius ``r_outer``
-    as a straight hollow tube (length = arc length of ``centreline``), optionally adds
-    biological wall roughness, then **warps it onto ``centreline``** so the solid
-    follows any straight / curved / s-bend artery — using the same ``CosseratCurve``
-    convention as the stent warp, so the solid stays aligned with the warped stent.
-    Writes a 4C input file with:
-
-    * ``NODE COORDS`` and ``STRUCTURE ELEMENTS`` (``SOLID <TYPE> ... MAT n KINEM nonlinear``),
-    * ``DSURF-NODE TOPOLOGY`` with **DSURFACE 1 = lumen** (inner surface — the
-      beam-to-solid coupling target), **2 = inlet**, **3 = outlet** (end faces, for BCs),
-    * a placeholder ``MAT_Struct_StVenantKirchhoff`` material (upgrade to HGO-C later).
-
-    The resulting file feeds ``import_artery_solid`` unchanged.
-
-    ``mesh_type`` selects the solid element:
-
-    * ``"TET4"``  — linear tets (unstructured; fast, fine for the placeholder material).
-    * ``"TET10"`` — quadratic tets (unstructured; use for the near-incompressible HGO
-      artery material, where linear tets lock).
-    * ``"HEX8"``  — structured hexahedra (transfinite sectors swept along the axis;
-      matches the reference papers, fewest elements, best for the wall material).
-
-    Parameters
-    ----------
-    r_inner, r_outer : float   lumen and outer wall radii [mm] (r_outer > r_inner)
-    centreline       : (M, 3) array   artery centreline the wall is warped onto
-                               (``artery_cl`` from ``generate_artery_for_stent``)
-    out_path         : path    where to write the 4C ``.yaml`` solid
-    mesh_type        : str     "TET4" | "TET10" | "HEX8"
-    element_size     : float   target element edge length [mm]; default = wall
-                               thickness. Sets tet size, and the structured hex
-                               divisions (circumference / radial / axial). Tune vs.
-                               beam length so the solid/beam element ratio stays
-                               ~2.5-5 and the solid element size >= the beam diameter
-    noise_amplitude  : float   fractional wall roughness (0 = smooth; 0.1 = +/-10% of
-                               radius), tapered to zero at the inlet / outlet ends
-    noise_seed       : int     RNG seed for reproducible roughness
-    material_id      : int     4C material id referenced by the solid elements
-    youngs_modulus, poisson_ratio, density : placeholder solid material values
-
-    Returns
-    -------
-    out_path : the written 4C ``.yaml`` file path
+) -> Path:
     """
+    Mesh the artery wall as a hollow 3D solid with GMSH and write it as a 4C ``.yaml``.
 
+    Builds a straight annular tube between ``r_inner`` and ``r_outer`` —
+    unstructured tets (``TET4``/``TET10``, via an OCC cylinder-minus-cylinder
+    boolean cut) or structured hexahedra (``HEX8``, via transfinite annular
+    sectors extruded along the tube) — then classifies its boundary nodes
+    into ``DSURFACE`` sets purely from their coordinates: the inner surface
+    is the lumen (``DSURFACE 1``), and the two flat ends are the inlet/outlet
+    (``DSURFACE 2``/``3``). Optional radial wall-roughness noise is applied,
+    then the whole straight tube is warped onto ``centreline`` using the same
+    frame convention as the stent warp, so the solid stays aligned with the
+    beam mesh. Elements that end up inverted by the warp or noise are
+    counted and reported as a warning. Writes the mesh plus a placeholder
+    ``MAT_Struct_StVenantKirchhoff`` material as a 4C solid input file.
 
+    :param r_inner: Lumen (inner) radius, in mm.
+    :param r_outer: Outer wall radius, in mm.
+    :param centreline: Points the straight tube is warped onto.
+    :param out_path: File path the 4C ``.yaml`` solid is written to.
+    :param mesh_type: Element type: ``'TET4'``, ``'TET10'``, or ``'HEX8'``.
+    :param element_size: Target element size, in mm. ``None`` uses roughly
+        one element across the wall thickness (``r_outer - r_inner``).
+    :param noise_amplitude: Fractional radial wall-roughness noise.
+    :param noise_seed: Seed for the wall noise. ``None`` draws a fresh pattern each call.
+    :param material_id: Material ID written into the 4C input.
+    :param youngs_modulus: Placeholder material Young's modulus, in MPa.
+    :param poisson_ratio: Placeholder material Poisson's ratio.
+    :param density: Placeholder material density.
+    :raises ValueError: If ``r_outer <= r_inner`` or ``r_inner <= 0``, or if
+        ``mesh_type`` isn't one of the supported keys.
+    :returns: ``out_path``, for chaining into a caller's own return value.
+    """
     if not (r_outer > r_inner > 0):
         raise ValueError(f"Need r_outer > r_inner > 0, got {r_inner=} {r_outer=}")
     mesh_type = mesh_type.upper()
@@ -320,15 +350,22 @@ def mesh_artery_gmsh(
 # 2. Import the artery solid into BeamMe (4C .yaml file *or* a CubitPy model)
 # ---------------------------------------------------------------------------
 
-def import_artery_solid(source):
-    """Import an artery solid mesh into BeamMe.
-
-    ``source`` is either a path to a 4C ``.yaml`` file (from ``mesh_artery_gmsh``)
-    or a ``cubitpy.CubitPy`` instance. Returns ``(input_file, solid_mesh)`` where
-    ``solid_mesh`` carries the volume elements plus the surface geometry sets
-    (index 0 = lumen, 1 = inlet, 2 = outlet).
+def import_artery_solid(source) -> tuple[InputFile, Mesh]:
     """
+    Import the artery solid mesh into BeamMe, from a 4C ``.yaml`` or a CubitPy model.
 
+    Duck-types ``source``: a CubitPy model (detected by a ``cmd`` attribute
+    or class name) is imported via ``import_cubitpy_model``; anything else
+    is treated as a path to a 4C ``.yaml`` solid (e.g. from
+    :func:`mesh_artery_gmsh`) and imported via ``import_four_c_model``. The
+    CubitPy path is legacy — Cubit Coreform is no longer used in this
+    project (no macOS build), so in practice ``source`` is always a
+    ``.yaml`` path.
+
+    :param source: A CubitPy model, or a path to a 4C ``.yaml`` solid.
+    :returns: ``(input_file, solid)`` — the BeamMe ``InputFile`` and the
+        imported solid ``Mesh``.
+    """
     if hasattr(source, "cmd") or type(source).__name__ == "CubitPy":
         input_file, solid = import_cubitpy_model(source, convert_input_to_mesh=True)
     else:
@@ -346,41 +383,50 @@ def import_artery_solid(source):
 # ---------------------------------------------------------------------------
 
 def assemble_beam_solid(
-    input_file,
-    solid_mesh,
-    beam_mesh,
-    *,
+    input_file: InputFile,
+    solid_mesh: Mesh,
+    beam_mesh: Mesh,
     lumen_surface_index: int = 0,
     bc_type=None,
     contact_discretization: str = "mortar",
     mortar_shape: str = "line2",
     n_gauss_points: int = 6,
-    output_path=None,
-):
-    """Combine the artery solid with the warped stent beams and tie them.
-
-    Adds ``beam_mesh`` to ``solid_mesh`` ("add the beam elements to the solid"),
-    creates a beam-to-solid coupling between the beam curves and the lumen surface
-    set, adds the interaction header options, and — if ``output_path`` is given —
-    dumps the assembled ``.4C.yaml``.
-
-    Parameters
-    ----------
-    input_file            : BeamMe InputFile from ``import_artery_solid``
-    solid_mesh, beam_mesh : BeamMe Meshes (solid = artery, beam = warped stent)
-    lumen_surface_index   : which imported surface set is the lumen (default 0)
-    bc_type               : coupling type; default
-                            ``bme.bc.beam_to_solid_surface_meshtying``. Switch to
-                            ``bme.bc.beam_to_solid_surface_contact`` for a real
-                            deployment (allows separation).
-    contact_discretization, mortar_shape, n_gauss_points : mortar options
-    output_path           : if set, dump the assembled 4C input file here
-
-    Returns
-    -------
-    (input_file, mesh) : ready to dump / extend with materials, BCs, solver
+    output_path: str | Path | None = None,
+) -> tuple[InputFile, Mesh]:
     """
+    Tie the stent beam mesh to the artery solid's lumen surface and write the combined 4C input.
 
+    Merges ``beam_mesh`` into ``solid_mesh``, couples the beam elements to
+    the solid's lumen surface set (``lumen_surface_index``) via BeamMe's
+    mortar beam-to-solid method (``add_beam_interaction_condition``), and —
+    for the meshtying variants — writes the matching header options
+    (``set_beam_to_solid_meshtying``). Contact uses a different header
+    setter, not yet wired up here. If ``output_path`` is given, dumps the
+    assembled input file there.
+
+    :param input_file: BeamMe ``InputFile`` the solid (and, once merged, the
+        beams) is added to.
+    :param solid_mesh: Artery solid mesh, from
+        :func:`import_artery_solid`. Modified in place: the beam elements
+        are merged into it.
+    :param beam_mesh: Warped stent beam mesh, from
+        :func:`~stentfit.sim_setup.stent_meshing_alignment`.
+    :param lumen_surface_index: Index into the solid's surface geometry sets
+        for the lumen surface the beams couple to.
+    :param bc_type: BeamMe beam-to-solid coupling type. ``None`` defaults to
+        tied meshtying (``bme.bc.beam_to_solid_surface_meshtying``).
+    :param contact_discretization: Mortar discretization passed to
+        ``set_beam_to_solid_meshtying``.
+    :param mortar_shape: Mortar shape function passed to
+        ``set_beam_to_solid_meshtying``.
+    :param n_gauss_points: Number of Gauss points passed to
+        ``set_beam_to_solid_meshtying``.
+    :param output_path: File path to dump the assembled 4C input to.
+        ``None`` skips writing.
+    :raises ValueError: If ``solid_mesh`` has no surface geometry set to couple to.
+    :returns: ``(input_file, solid_mesh)`` — the input file with the solid
+        (and merged beams) added, and the combined mesh.
+    """
     if bc_type is None:
         bc_type = bme.bc.beam_to_solid_surface_meshtying
 

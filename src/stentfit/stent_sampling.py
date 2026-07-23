@@ -1,19 +1,28 @@
 import numpy as np
 import trimesh
-import matplotlib.pyplot as plt
 import pandas as pd
-import ast
-import pathlib
-import json
+from pathlib import Path
 import os
 from sklearn.cluster import DBSCAN
 from skimage.morphology import closing
 
-from .stent_plotting import plot_points_3d_html
+from .stent_plotting import plot_points_3d_html, plot_thickness_diagnostics_html
 
 
-def compute_pre_stent_size_ratio(mesh: trimesh.Trimesh) -> dict:
-    """Estimate stent length, diameter and their ratio from the raw mesh."""
+def compute_pre_stent_size_ratio(
+        mesh: trimesh.Trimesh) -> dict:
+    """
+    Estimate the stent length and diameter from the raw mesh vertices.
+
+    This is a quick, cheap pre-check run before any sampling. It fits a PCA
+    axis to the mesh vertices, measures the length along that axis and the
+    diameter across it, and returns their ratio. :func:`sample_stent_points`
+    uses this ratio to pick how many points to sample.
+
+    :param mesh: The stent surface mesh, already loaded as a ``trimesh`` object.
+    :returns: Dict with the stent ``length``, ``diameter``, and their
+        ``size_ratio`` (length / diameter).
+    """
     pts      = mesh.vertices
     centered = pts - pts.mean(axis=0)
 
@@ -37,29 +46,47 @@ def compute_pre_stent_size_ratio(mesh: trimesh.Trimesh) -> dict:
 
 
 def preprocess_stent(
-    mesh: trimesh.Trimesh,
-    n_samples: int,
-    samples_per_face: int,
-    n_thickness_slices: int,
-    slice_cutoff: int,
-    thickness_calc_plot: bool,
-    remove_supports: bool,
-    random_seed: int = None,
-) -> dict:
-    """Sample the mesh, align it to z, and extract stent features.
-
-    Samples a point cloud from the surface, rotates the PCA axis onto [0,0,1],
-    builds a cylindrical-coordinate DataFrame, optionally strips the end
-    supports, then measures length, diameter, radii and strut thickness.
+        mesh: trimesh.Trimesh,
+        n_samples: int,
+        samples_per_face: int,
+        n_thickness_slices: int,
+        slice_cutoff: int,
+        remove_supports: bool,
+        random_seed: int | None = None,
+        out_dir: Path | None = None) -> dict:
     """
+    Sample the mesh, align it, and extract the stent point cloud and features.
 
-    # Step 1: sample the surface (random_seed=None draws fresh; int = reproducible)
+    This does the main sampling work behind :func:`sample_stent_points`. It
+    samples points on the mesh surface, fits a PCA axis and rotates it onto
+    ``[0, 0, 1]``, then builds a cylindrical-coordinate point cloud. Along the
+    axis it measures the length, diameter, and strut thickness. Thickness is
+    read per axial slice and averaged over the middle of the stent. Support
+    points can be trimmed first.
+
+    :param mesh: The stent surface mesh, already loaded as a ``trimesh`` object.
+    :param n_samples: Number of points to sample. ``None`` uses one sample per
+        face, scaled by ``samples_per_face``.
+    :param samples_per_face: Samples per mesh face when ``n_samples`` is ``None``.
+    :param n_thickness_slices: Number of axial slices used to measure thickness.
+    :param slice_cutoff: Slices dropped from each axial end before averaging,
+        so the closed stent ends do not skew the thickness.
+    :param remove_supports: Trim print-support points before extracting features.
+    :param random_seed: Seed for the surface sampling. ``None`` draws a fresh
+        cloud each call; an int makes it reproducible.
+    :param out_dir: Folder to write ``thickness_diagnostics.html`` into. ``None``
+        skips the diagnostic plot.
+    :returns: Dict with the point cloud (``stent_df``), the ``stent_features``
+        (length, diameter, radius, strut_thickness, z-bounds, inner/outer/mid
+        radii, center_cylinder_radius, num_points), and the
+        ``stent_centerline_direction`` (the PCA axis before rotation).
+    """
 
     if n_samples is None:
         n_samples = len(mesh.faces) * samples_per_face
     pts, face_idx = trimesh.sample.sample_surface(mesh, n_samples, seed=random_seed)
 
-    # Step 2: PCA centroid and main axis
+    # PCA centroid and main axis
     pca_mean  = pts.mean(axis=0)
     centered  = pts - pca_mean
     cov       = np.cov(centered.T)
@@ -68,7 +95,7 @@ def preprocess_stent(
 
     center_cylinder_radius = np.linalg.norm(centered, axis=1).min() * 0.5
 
-    # Step 3: rotation matrix mapping pca_axis onto [0, 0, 1]
+    # Rotation matrix mapping pca_axis onto [0, 0, 1]
     z_hat = np.array([0.0, 0.0, 1.0])
     v     = np.cross(pca_axis, z_hat)
     s     = np.linalg.norm(v)
@@ -82,22 +109,24 @@ def preprocess_stent(
                        [-v[1],  v[0],   0  ]])
         R = np.eye(3) + vx + vx @ vx * ((1.0 - c) / s**2)
 
-    # Step 4: build the cylindrical-coordinate point cloud
+    # Build the cylindrical-coordinate point cloud
     shifted = (R @ centered.T).T
 
     r     = np.sqrt(shifted[:, 0]**2 + shifted[:, 1]**2)
     theta = np.arctan2(shifted[:, 1], shifted[:, 0])
     z_cyl = shifted[:, 2]
 
+    # Removing support points is optional and it is hard coded for a specific stent design. 
     if remove_supports:
-        # Step 4a: inner wall radius from the central band, drop points inside it
+        
+        # Drop the -z support by keeping only the middle band of points and the outer radial points
         z_mid_center = 0.5 * (z_cyl.min() + z_cyl.max())
         z_span       = z_cyl.max() - z_cyl.min()
         middle_band  = np.abs(z_cyl - z_mid_center) < 0.20 * z_span
         r_inner_mid  = np.percentile(r[middle_band], 1)
         radial_keep  = r >= r_inner_mid * 0.8
 
-        '''# Step 4b: drop the +z support by keeping only the largest DBSCAN cluster
+        '''# Drop the +z support by keeping only the largest DBSCAN cluster
         strut_est = np.percentile(r, 98) - r_inner_mid
 
         kept_idx = np.flatnonzero(radial_keep)
@@ -116,7 +145,7 @@ def preprocess_stent(
         theta   = theta[keep_mask]
         z_cyl   = z_cyl[keep_mask]
 
-        # Step 4c: trim the solid closing ring at the -z end (walk in until lattice)
+        # Trim the solid closing ring at the -z end (walk in until lattice)
         n_az_slices = 200
         cov_solid   = 0.9           # theta coverage above this counts as a solid ring
         gap_deg     = 15.0          # theta gap wider than this counts as an open cell
@@ -151,7 +180,7 @@ def preprocess_stent(
         theta   = theta[band_keep]
         z_cyl   = z_cyl[band_keep]'''
 
-        # Step 4d: hard axial clamp for this stent
+        # Hard axial clamp for this stent
         pts     = pts[z_cyl > -9.8]
         shifted = shifted[z_cyl > -9.8]
         r       = r[z_cyl > -9.8]
@@ -177,16 +206,12 @@ def preprocess_stent(
         'z'            : shifted[:, 2],
     })
 
-    # Step 5: bounding box (plots only)
+    # Bounding box (plots only)
     z_cyl_min, z_cyl_max = z_cyl.min(), z_cyl.max()
     stent_length   = z_cyl_max - z_cyl_min
     stent_diameter = 2.0 * r.max()
 
-    # Step 6: strut thickness (robust percentile + per-slice mean)
-    r_inner_pct = np.percentile(r, 2)
-    r_outer_pct = np.percentile(r, 98)
-    strut_thick_robust = r_outer_pct - r_inner_pct
-
+    # Strut thickness: read per axial slice, averaged over the middle of the stent
     z_edges   = np.linspace(z_cyl_min, z_cyl_max, n_thickness_slices + 1)
     z_centers = 0.5 * (z_edges[:-1] + z_edges[1:])
     bin_idx   = np.clip(np.digitize(z_cyl, z_edges) - 1, 0, n_thickness_slices - 1)
@@ -208,8 +233,12 @@ def preprocess_stent(
                 .iloc[slice_cutoff: n_thickness_slices - slice_cutoff]
                 .dropna()
                 .reset_index(drop=True))
-    strut_thick_slice_mean = df_thick['thickness'].mean()
-    strut_thick_final = strut_thick_slice_mean if not df_thick.empty else strut_thick_robust
+    if df_thick.empty:
+        raise ValueError(
+            "No valid thickness slices: every slice was empty or below the point "
+            "cutoff. Try more sample points, fewer thickness slices, or a smaller "
+            "slice_cutoff.")
+    strut_thick_final = df_thick['thickness'].mean()
 
     stent_features = {
         'length'                : stent_length,
@@ -225,42 +254,10 @@ def preprocess_stent(
         'num_points'            : len(df),
     }
 
-    # Step 7: optional thickness plots
-    if thickness_calc_plot and not df_thick.empty:
-        fig, axes = plt.subplots(2, 1, figsize=(10, 9), sharex=True)
-
-        axes[0].plot(df_thick['z'], df_thick['r_outer'], color='green', label='r_outer')
-        axes[0].plot(df_thick['z'], df_thick['r_inner'], color='red',   label='r_inner')
-        axes[0].set_ylabel('r (radial distance)')
-        axes[0].set_title('Inner and outer radius along stent axis')
-        axes[0].legend()
-        axes[0].grid(True)
-
-        mean_t = df_thick['thickness'].mean()
-        axes[1].plot(df_thick['z'], df_thick['thickness'], color='steelblue')
-        axes[1].axhline(mean_t, color='orange', linestyle='--',
-                        label=f'mean = {mean_t:.4f}')
-        axes[1].set_ylabel('Thickness (r_outer - r_inner)')
-        axes[1].set_xlabel('z_cylindrical (axial position)')
-        axes[1].set_title('Strut radial thickness along stent axis')
-        axes[1].legend()
-        axes[1].grid(True)
-
-        plt.tight_layout()
-        plt.show()
-
-        fig, ax = plt.subplots(figsize=(9, 4))
-        ax.hist(r, bins=300, color='steelblue', edgecolor='none')
-        ax.axvline(r_inner_pct, color='red',   linestyle='--',
-                   label=f'r_inner = {r_inner_pct:.4f}  (2nd pct)')
-        ax.axvline(r_outer_pct, color='green', linestyle='--',
-                   label=f'r_outer = {r_outer_pct:.4f}  (98th pct)')
-        ax.set_xlabel('r  (radial distance from stent axis)')
-        ax.set_ylabel('Point count')
-        ax.set_title('Global r distribution - two peaks = inner and outer strut wall')
-        ax.legend()
-        plt.tight_layout()
-        plt.show()
+    if out_dir is not None:
+        thickness_html = os.path.join(out_dir, 'thickness_diagnostics.html')
+        plot_thickness_diagnostics_html(df_thick, r, thickness_html, strut_thick_final)
+        print(f"[plot] {thickness_html}  (inspect the strut thickness)")
 
     return {
         'stent_df'                   : df,
@@ -270,109 +267,37 @@ def preprocess_stent(
 
 
 
-def load_update_stent_data(stent_dir, material_name, youngs_modulus, poissons_ratio,
-                    density, max_elastic_strain):
-    """Load stent geometry/skeleton data and extend features with material parameters.
-
-    ``stent_dir`` is the per-stent output folder (e.g.
-    ``outputs/stent_skeleton/<STENT_NAME>/``), mirroring the ``output_dir`` argument
-    of ``sample_stent_points``. Each key in the returned features dict maps to
-    {"value": ..., "unit": "..."}.
-    Density is stored in kg/m³; callers using the mm-N-tonne system must convert to t/mm³.
-    stent_features.json is updated only when material parameters are new or have changed.
-    The JSON stores {"value", "unit"} wrapped entries for all keys.
+def sample_stent_points(
+        mesh: trimesh.Trimesh,
+        stent_name: str,
+        output_dir: Path,
+        n_points: int = None,
+        samples_per_face: int = 1,
+        max_display: int = 500_000,
+        remove_supports: bool = False,
+        random_seed: int = 0) -> dict:
     """
-    _GEO_UNITS = {
-        "length":                 "mm",
-        "diameter":               "mm",
-        "radius":                 "mm",
-        "strut_thickness":        "mm",
-        "z_min":                  "mm",
-        "z_max":                  "mm",
-        "r_inner":                "mm",
-        "r_outer":                "mm",
-        "r_mid":                  "mm",
-        "center_cylinder_radius": "mm",
-        "connection_radius":      "mm",
-        "conn_radius_3d":         "mm",
-        "num_points":             "-",
-        "n_regions":              "-",
-    }
-    _MAT_KEYS = {"material_name", "youngs_modulus", "poissons_ratio",
-                 "shear_modulus", "density", "max_elastic_strain"}
+    Turn the stent mesh into a cleaned, aligned point cloud.
 
-    stent_dir = pathlib.Path(stent_dir)
-    print(f"Loading stent data from: {stent_dir.resolve()}")
+    This is the first step of the pipeline. When ``n_points`` is not given,
+    it first picks a sample count from the stent size (small or short stents
+    get fewer points). It then calls :func:`preprocess_stent` to align the
+    PCA axis to ``[0, 0, 1]``, extract the stent features, and build a
+    cylindrical-coordinate point cloud. The cloud is saved as
+    ``sampling_points.csv`` and drawn to ``sampling_points.html``, and the
+    strut thickness is drawn to ``thickness_diagnostics.html``.
 
-    with open(stent_dir / "stent_features.json") as f:
-        raw = json.load(f)
-
-    # unwrap any {"value": ..., "unit": ...} entries (handles previously wrapped JSON)
-    def _unwrap(v):
-        while isinstance(v, dict) and "value" in v:
-            v = v["value"]
-        return v
-    raw = {k: _unwrap(v) for k, v in raw.items()}
-
-    with open(stent_dir / "stent_centerline_direction.json") as f:
-        cl_dir = np.array(json.load(f))
-
-    sk = pd.read_csv(stent_dir / "skeleton_points.csv")
-    sk["neighbor_ids"] = sk["neighbor_ids"].apply(ast.literal_eval)
-
-    # Material params as flat raw values (for comparison + JSON storage)
-    new_mat = {
-        "material_name":      material_name,
-        "youngs_modulus":     youngs_modulus,
-        "poissons_ratio":     poissons_ratio,
-        "shear_modulus":      youngs_modulus / (2.0 * (1.0 + poissons_ratio)),
-        "density":            density,
-        "max_elastic_strain": max_elastic_strain,
-    }
-
-    _MAT_UNITS = {
-        "material_name": "-", "youngs_modulus": "MPa", "poissons_ratio": "-",
-        "shear_modulus": "MPa", "density": "kg/m³", "max_elastic_strain": "-",
-    }
-
-    # Write JSON only when material params are absent or have changed
-    needs_update = any(raw.get(k) != v for k, v in new_mat.items())
-    if needs_update:
-        geo_raw_flat = {k: v for k, v in raw.items() if k not in _MAT_KEYS}
-        geo_wrapped  = {k: {"value": v, "unit": _GEO_UNITS.get(k, "-")} for k, v in geo_raw_flat.items()}
-        mat_wrapped  = {k: {"value": v, "unit": _MAT_UNITS[k]} for k, v in new_mat.items()}
-        with open(stent_dir / "stent_features.json", "w") as f:
-            json.dump({**geo_wrapped, **mat_wrapped}, f, indent=4)
-        print(f"  stent_features.json updated with material parameters.")
-    else:
-        print(f"  Material parameters unchanged - stent_features.json not rewritten.")
-
-    # Wrap for in-memory use
-    geo_raw = {k: v for k, v in raw.items() if k not in _MAT_KEYS}
-    feats = {k: {"value": v, "unit": _GEO_UNITS.get(k, "-")} for k, v in geo_raw.items()}
-    feats.update({
-        "material_name":      {"value": material_name,           "unit": "-"},
-        "youngs_modulus":     {"value": youngs_modulus,          "unit": "MPa"},
-        "poissons_ratio":     {"value": poissons_ratio,          "unit": "-"},
-        "shear_modulus":      {"value": new_mat["shear_modulus"],"unit": "MPa"},
-        "density":            {"value": density,                 "unit": "kg/m³"},
-        "max_elastic_strain": {"value": max_elastic_strain,      "unit": "-"},
-    })
-
-    return feats, cl_dir, sk
-
-
-
-def sample_stent_points(mesh, stent_name, output_dir, n_points=None,
-                        samples_per_face=1, max_display=500_000,
-                        remove_supports=False, random_seed=0):
-    """Sample the STL surface into a cylindrical-coordinate point cloud (Steps 1-2).
-
-    Auto-decides the sample count from the stent size (small/short stents -> ~1e6,
-    large ones -> ~1e7, scaled from the mesh face count) unless ``n_points`` forces
-    a count. Aligns the PCA axis to [0,0,1] via ``preprocess_stent``, renders an
-    HTML scatter (hover shows point_id) and saves ``sampling_points.csv``. Returns
-    ``{stent_df, stent_features, stent_centerline_direction}``.
+    :param mesh: The stent surface mesh, already loaded as a ``trimesh`` object.
+    :param stent_name: Name used to label outputs and plots.
+    :param output_dir: Folder where the CSV and HTML view are written.
+    :param n_points: Number of points to sample. ``None`` picks the count
+        automatically from the stent size.
+    :param samples_per_face: Number of samples taken per mesh face.
+    :param max_display: Maximum number of points drawn in the HTML view.
+    :param remove_supports: Drop print-support points during sampling.
+    :param random_seed: Seed for the sampling, for repeatable runs.
+    :returns: Dict with the point cloud (``stent_df``), the extracted
+        ``stent_features``, and the ``stent_centerline_direction`` unit vector.
     """
     pre_stent_info = compute_pre_stent_size_ratio(mesh)
     pre_size_ratio = pre_stent_info['size_ratio']
@@ -397,8 +322,8 @@ def sample_stent_points(mesh, stent_name, output_dir, n_points=None,
 
     pre = preprocess_stent(
         mesh=mesh, n_samples=n_use, samples_per_face=samples_per_face,
-        n_thickness_slices=100, slice_cutoff=5, thickness_calc_plot=False,
-        remove_supports=remove_supports, random_seed=random_seed)
+        n_thickness_slices=100, slice_cutoff=5,
+        remove_supports=remove_supports, random_seed=random_seed, out_dir=output_dir)
     stent_df       = pre['stent_df']
     stent_features = pre['stent_features']
     centerline_dir = pre['stent_centerline_direction']
