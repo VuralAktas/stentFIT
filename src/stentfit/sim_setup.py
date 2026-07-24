@@ -4,6 +4,7 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 from plotly import graph_objects as go
+from plotly import io as pio
 from scipy.spatial import cKDTree
 
 
@@ -26,7 +27,7 @@ from beamme.four_c.header_functions import (set_header_static, set_runtime_outpu
 
 
 
-def stent_feature_extraction(stent_dir: Path) -> dict:
+def stent_feature_extraction(stent_dir: str | Path) -> dict:
     """
     Load a stent's skeletonisation output and print a summary of its features.
 
@@ -44,6 +45,7 @@ def stent_feature_extraction(stent_dir: Path) -> dict:
         values (``stent_length``, ``stent_diameter``, ``stent_r_outer``,
         ``stent_strut_thickness``, ``stent_z_min``, ``stent_z_max``).
     """
+    stent_dir = Path(stent_dir)
     if not stent_dir.is_dir():
         raise FileNotFoundError(
             f"Stent folder not found: {stent_dir}"
@@ -89,7 +91,7 @@ def stent_feature_extraction(stent_dir: Path) -> dict:
 
 
 
-def stent_meshing_alignment(stent_dir: Path, sim_input_dir: Path, features: dict, artery_cl: np.ndarray,
+def stent_meshing_alignment(stent_dir: str | Path, sim_input_dir: str | Path, features: dict, artery_cl: np.ndarray,
                             youngs_modulus: float, poisson_ratio: float, density: float,
                             beam_class_label: str, beam_element_size: float) -> dict:
     """
@@ -118,6 +120,9 @@ def stent_meshing_alignment(stent_dir: Path, sim_input_dir: Path, features: dict
         warped node coordinates (``stent_warped``), the ``beam_element_size``
         passed through, and the path to the written ``stent_yaml``.
     """
+    stent_dir = Path(stent_dir)
+    sim_input_dir = Path(sim_input_dir)
+
     # 1. Build the straight stent as a BeamMe beam mesh from the fitted splines in the folder.
     beam_mesh = mesh_skeleton_beams(input_dir=str(stent_dir),
                                       l_el=beam_element_size,
@@ -156,9 +161,9 @@ def stent_meshing_alignment(stent_dir: Path, sim_input_dir: Path, features: dict
     }
 
 
-def create_assembly_mesh(artery_solid_yaml: Path | None,
+def create_assembly_mesh(artery_solid_yaml: str | Path | None,
                          beam_mesh: Mesh,
-                         sim_input_dir: Path,
+                         sim_input_dir: str | Path,
                          lumen_surface_index: int = 0,
                          bc_type=None,
                          output_filename: str = "artery_stent.4C.yaml"):
@@ -194,6 +199,7 @@ def create_assembly_mesh(artery_solid_yaml: Path | None,
         print("No artery solid mesh from the previous cell — skipping assembly.")
         return None, None
 
+    sim_input_dir = Path(sim_input_dir)
     input_file, solid = import_artery_solid(artery_solid_yaml)
 
     out_path = sim_input_dir / output_filename
@@ -212,7 +218,7 @@ def create_assembly_mesh(artery_solid_yaml: Path | None,
 
 
 def paraview_mesh_files(full_mesh: Mesh | None,
-                        sim_input_dir: Path,
+                        sim_input_dir: str | Path,
                         output_name: str = "artery_stent_mesh") -> tuple[Path, Path] | None:
     """
     Export the assembled beam+solid mesh as separate ``.vtu`` files for ParaView.
@@ -231,6 +237,7 @@ def paraview_mesh_files(full_mesh: Mesh | None,
         print("No assembled mesh — run the meshing / assembly cells first.")
         return None
 
+    sim_input_dir = Path(sim_input_dir)
     full_mesh.write_vtk(output_name=output_name, output_directory=str(sim_input_dir))
     beam_vtu  = sim_input_dir / f"{output_name}_beam.vtu"
     solid_vtu = sim_input_dir / f"{output_name}_solid.vtu"
@@ -495,8 +502,8 @@ def build_smoketest_input(
     return out_path
 
 def build_smoketest_pipeline(   stent_name: str,
-                                    stent_dir: Path,
-                                    sim_input_dir: Path,
+                                    stent_dir: str | Path,
+                                    sim_input_dir: str | Path,
                                     artery_type: str = 'straight',
                                     inner_margin: float = 0.5,
                                     wall_thickness: float = 0.5,
@@ -556,6 +563,9 @@ def build_smoketest_pipeline(   stent_name: str,
         exports, and — only if the coupling checks pass — ``simulation.4C.yaml``,
         all into ``sim_input_dir``. Also displays an inline Plotly figure.
     """
+    stent_dir = Path(stent_dir)
+    sim_input_dir = Path(sim_input_dir)
+
     # Extract stent features for test_artery generation
     print("\nStent features")
     print("--------------")
@@ -665,7 +675,13 @@ def build_smoketest_pipeline(   stent_name: str,
         scene=dict(aspectmode="data"),
         margin=dict(l=0, r=0, t=40, b=0),
     )
-    fig.show()
+    stent_artery_html = sim_input_dir / "stent_artery_view.html"
+    pio.write_html(fig, str(stent_artery_html), auto_open=False)
+    print(f"[saved] {stent_artery_html}")
+    try:
+        fig.show()
+    except Exception as e:
+        print(f"[plotly] interactive view skipped ({e}); use {stent_artery_html.name} instead")
 
     # Build the runnable 4C simulation input: static solver + boundary conditions + a radial
     # "balloon" expansion force on the stent, on top of the assembled beam-to-solid mesh.

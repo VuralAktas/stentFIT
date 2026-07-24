@@ -4,7 +4,7 @@ build-backend = "poetry.core.masonry.api"
 
 [tool.poetry]
 name = "stentfit"
-version = "0.1.0"
+version = "0.1.1"
 description = "Semi-automated virtual stent implantation via contact simulation"
 authors = ["Vural Aktas <vuralaktas6741@gmail.com>"]
 license = "MIT"

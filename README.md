@@ -10,11 +10,32 @@ Full documentation, including the API reference and workflow diagrams, is hosted
 
 ## Installation
 
+Requires **Python 3.13** (pinned to match [BeamMe](https://beamme-py.github.io/beamme/)'s supported range) and **Git** installed and available on your `PATH` — BeamMe uses the `git` executable to write commit metadata into generated 4C input files, and raises an error at runtime if it can't find one. Git is not a Python package, so `pip`/`poetry` cannot install it for you — the steps below install it via conda alongside everything else.
+
+**Option A — Just use the package**
+
+Same steps on macOS, Linux, and Windows (PowerShell) — on Windows, just make sure to run `python`/`pip`, not the `py` launcher, which ignores the active conda environment:
+
 ```bash
+conda create -n stentfit-env python=3.13
+conda activate stentfit-env
+conda install -c conda-forge git
 pip install stentfit
 ```
 
-Requires **Python 3.13** (pinned to match [BeamMe](https://beamme-py.github.io/beamme/)'s supported range). Core dependencies such as `beamme` (stent beam meshing and artery solid meshing), `gmsh` (artery solid meshing), and `fourcipp` are installed automatically. Running the generated simulation input files additionally requires a compiled **4C** executable, which is not included in this package. 
+Core dependencies such as `beamme` (stent beam meshing and artery solid meshing), `gmsh` (artery solid meshing), and `fourcipp` are installed automatically by `pip`. Running the generated simulation input files additionally requires a compiled **4C** executable, which is not included in this package.
+
+**Option B — Clone the repo and start developing**
+
+```bash
+git clone https://github.com/VuralAktas/stentFIT.git
+cd stentFIT
+conda env create -f environment.yml   # Python 3.13 + pip + git
+conda activate env_stentfit
+poetry install                        # installs stentfit + all dependency groups
+```
+
+This path pulls `git` in automatically via `environment.yml`, and also gives you the example notebooks, tests, and locked dependency versions (`poetry.lock`) matching the rest of the project.
 
 ## What it does & How to use it
 

@@ -4,10 +4,12 @@
 # 2. Activate it:             conda activate env_stentfit
 # 3. Install stentFIT + deps: poetry install
 #
-# This file only sets up Python + pip. All package dependencies live in
-# pyproject.toml / poetry.lock and are installed with `poetry install`
-# (the single source of truth). To change Python versions, edit the one
-# `python=` line and recreate/update the environment.
+# This file sets up Python + pip, plus git (a system tool pip cannot install,
+# required by BeamMe to write commit metadata into 4C input file headers).
+# All package dependencies live in pyproject.toml / poetry.lock and are
+# installed with `poetry install` (the single source of truth). To change
+# Python versions, edit the one `python=` line and recreate/update the
+# environment.
 name: env_stentfit
 channels:
   - conda-forge
@@ -15,3 +17,4 @@ channels:
 dependencies:
   - python=3.13
   - pip
+  - git
