@@ -1,5 +1,7 @@
 # stentFIT
 
+[![Documentation Status](https://readthedocs.org/projects/stentfit/badge/?version=latest)](https://stentfit.readthedocs.io/en/latest/?badge=latest)
+
 Semi-automated virtual stent implantation with mixed-dimensional modelling
 
 `stentFIT` turns a stent surface mesh (`.stl`) into a 1D beam-element model ready for beam-to-solid contact simulation. It samples the stent surface, detects its rings, extracts a 2D skeleton per ring, wraps that skeleton back onto the 3D mid-surface, fits a B-spline to each strut curve, and meshes the result into Simo–Reissner beams with [BeamMe](https://beamme-py.github.io/beamme/). Extracting the stent's 1D wireframe is a semi-automated process: it allows manual edits of intermediate steps such as ring detection and 2D skeletonisation. It also provides a smoke test that verifies the quality of the 1D stent model inside a generated pipe-like 3D vessel.

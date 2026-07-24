@@ -31,3 +31,9 @@ dev = [
     "ipython (>=9.15.0,<10.0.0)",
     "jupyter (>=1.1.1,<2.0.0)"
 ]
+docs = [
+    "myst-nb (>=1.4.0,<2.0.0)",
+    "sphinx-autoapi (>=3.8.0,<4.0.0)",
+    "sphinx-rtd-theme (>=3.1.0,<4.0.0)",
+    "sphinxcontrib-mermaid (>=2.1.0,<3.0.0)"
+]

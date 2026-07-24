@@ -20,8 +20,26 @@ extensions = [
     "autoapi.extension",
     "sphinx.ext.napoleon",
     "sphinx.ext.viewcode",
+    "sphinxcontrib.mermaid",
 ]
 autoapi_dirs = ["../src"]
+
+# Render Mermaid diagrams at their natural aspect ratio (not squashed into a
+# fixed-height box) and let readers pan/zoom the busier workflow diagrams.
+mermaid_height = "auto"
+mermaid_d3_zoom = True
+mermaid_init_config = {
+    "startOnLoad": True,
+    "theme": "neutral",
+    "themeVariables": {"fontSize": "18px"},
+}
+
+# The example notebooks are pre-executed copies (symlinked from examples/):
+# the real pipeline needs an STL file that isn't in the repo (data/ is
+# git-ignored) and calls GMSH / long-running skeletonisation, so it isn't
+# safe or fast to re-execute on every docs build. Their stored outputs are
+# rendered as-is.
+nb_execution_mode = "off"
 
 # List of patterns, relative to source directory, that match files and
 # directories to ignore when looking for source files.
