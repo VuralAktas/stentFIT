@@ -27,7 +27,7 @@ Requires **Python 3.13** (pinned to match [BeamMe](https://beamme-py.github.io/b
 
 Each stage writes `skeleton_points.csv`, `skeleton_splines.json`, `stent_features.json`, and interactive HTML views into the output directory.
 
-![Unrolled 2D skeleton with per-ring tuning diagnostics](docs/images/skeleton_splines_2d.png)
+![Unrolled 2D skeleton with per-ring tuning diagnostics](https://raw.githubusercontent.com/VuralAktas/stentFIT/main/docs/images/skeleton_splines_2d.png)
 
 **2. Test artery generation & simulation setup** ([`examples/test_sim_generation.ipynb`](examples/test_sim_generation.ipynb))
 
@@ -40,7 +40,7 @@ A synthetic/parametric smoke test exercises the full mixed-dimensional chain end
 
 This confirms the stent-to-artery mapping and 4C input generation work end-to-end, using placeholder materials and tied meshtying rather than real contact such as full deployment physics (contact, HGO-C artery material, elasto-plastic beam bending) is planned but not yet implemented.
 
-![Stent beam mesh warped into a curved artery, viewed in ParaView](docs/images/paraview_stent_artery.png)
+![Stent beam mesh warped into a curved artery, viewed in ParaView](https://raw.githubusercontent.com/VuralAktas/stentFIT/main/docs/images/paraview_stent_artery.png)
 
 ## License
 
