@@ -317,8 +317,10 @@ def plot_ring_dips_html(ring_res: dict, out_path: str) -> str:
     Draw the ring-boundary dip detection profile and save it as HTML.
 
     Plots the smoothed points-per-slice curve along z, marks the candidate
-    dips and the depth cutoff used to filter them, and draws a vertical line
-    at each boundary that was actually used to cut the stent into rings.
+    dips and the depth cutoff used to filter them, shades each detected ring
+    as an alternating background band labelled ``ring i``, and draws a
+    vertical line at each boundary that was actually used to cut the stent
+    into rings.
 
     :param ring_res: Dict returned by :func:`find_rings`; must have
         ``dip_z_centers``, ``dip_counts_smoothed``, ``dip_indices``,
@@ -334,6 +336,20 @@ def plot_ring_dips_html(ring_res: dict, out_path: str) -> str:
     bounds = np.asarray(ring_res.get('boundary_z', []), dtype=float)
 
     fig = go.Figure()
+
+    # Alternating background bands, one per detected ring, each labelled with
+    # its ring number so the boundary lines don't need a per-line caption.
+    edges = np.concatenate([[zc.min()], bounds, [zc.max()]])
+    for i in range(len(edges) - 1):
+        z0, z1 = float(edges[i]), float(edges[i + 1])
+        if i % 2:
+            fig.add_vrect(x0=z0, x1=z1, fillcolor='rgba(15,23,42,0.05)',
+                          line_width=0, layer='below')
+        fig.add_annotation(
+            x=0.5 * (z0 + z1), y=1.0, xref='x', yref='paper',
+            yanchor='bottom', showarrow=False, text=f"ring {i + 1}",
+            font=dict(size=11, color='rgba(15,23,42,0.55)'))
+
     fig.add_trace(go.Scatter(
         x=zc, y=cnt, mode='lines+markers', name='points / slice',
         line=dict(color='gray'), marker=dict(size=4, color='gray'),
@@ -344,17 +360,26 @@ def plot_ring_dips_html(ring_res: dict, out_path: str) -> str:
             marker=dict(size=10, color='lightgray', symbol='triangle-down',
                         line=dict(color='gray', width=1)),
             hovertemplate="candidate dip<br>z=%{x:.4f}<br>points/slice=%{y:.1f}<extra></extra>"))
-    for i, zb in enumerate(bounds):
-        fig.add_vline(x=float(zb), line=dict(color='red', width=1.5),
-                      annotation_text='boundary' if i == 0 else None,
-                      annotation_position='top')
-    fig.add_hline(y=thresh, line=dict(color='red', dash='dot', width=1),
-                  annotation_text='depth cutoff', annotation_position='top left')
+
+    for zb in bounds:
+        fig.add_vline(x=float(zb), line=dict(color='crimson', width=1.5))
+    fig.add_hline(y=thresh, line=dict(color='crimson', dash='dot', width=1))
+
+    # add_vline/add_hline draw shapes, not traces, so they never get a legend
+    # entry on their own; these invisible traces give them one.
+    fig.add_trace(go.Scatter(
+        x=[None], y=[None], mode='lines', name='ring boundary',
+        line=dict(color='crimson', width=1.5)))
+    fig.add_trace(go.Scatter(
+        x=[None], y=[None], mode='lines', name=f'depth cutoff ({thresh:.0f})',
+        line=dict(color='crimson', width=1, dash='dot')))
+
     fig.update_layout(
-        template='plotly_white', height=420, margin=dict(l=40, r=20, t=50, b=40),
+        template='plotly_white', height=420, margin=dict(l=40, r=140, t=60, b=40),
         title=f"Ring boundaries -> {n_bands} rings  "
               f"({len(bounds)} cuts from {len(dips)} candidate dips)",
-        xaxis_title='z_cylindrical', yaxis_title='points / slice')
+        xaxis_title='z_cylindrical', yaxis_title='points / slice',
+        legend=dict(yanchor='top', y=1, xanchor='left', x=1.01))
     pio.write_html(fig, out_path, auto_open=False, config={'scrollZoom': True})
     return out_path
 
