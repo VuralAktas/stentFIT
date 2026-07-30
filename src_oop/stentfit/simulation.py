@@ -13,7 +13,6 @@ from beamme.core.boundary_condition import BoundaryCondition
 from beamme.core.conf import bme
 from beamme.core.function import Function
 from beamme.core.geometry_set import GeometrySet
-from beamme.core.mesh import Mesh
 from beamme.core.rotation import Rotation
 from beamme.cosserat_curve.cosserat_curve import CosseratCurve
 from beamme.cosserat_curve.warping_along_cosserat_curve import warp_mesh_along_curve
