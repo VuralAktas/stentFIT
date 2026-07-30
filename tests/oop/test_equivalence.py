@@ -137,12 +137,15 @@ def normalise_4c_yaml(text: str) -> list[str]:
     BeamMe stamps every file it writes with a ``TITLE.BeamMe`` block holding the
     creation timestamp and the calling script's path and git sha. Those differ
     between the golden capture and any later run without the mesh differing at
-    all, so they are dropped before comparing.
+    all, so they are dropped before comparing. The enclosing ``Application:``
+    key goes too: BeamMe omits the whole block when it cannot resolve a calling
+    script (running from stdin, say), which would otherwise show up as a
+    spurious one-line difference.
 
     :param text: Full contents of a ``.4C.yaml`` file.
     :returns: The remaining lines, with the provenance fields removed.
     """
-    volatile = ("creation_date:", "path:", "git_sha:", "git_date:")
+    volatile = ("creation_date:", "Application:", "path:", "git_sha:", "git_date:")
     return [line for line in text.splitlines()
             if not line.strip().startswith(volatile)]
 
