@@ -6,7 +6,7 @@ import os
 from collections import Counter
 from scipy.interpolate import splprep
 
-from ..plotting import plot_splines_html
+from .plotting import plot_splines_html
 import splinepy 
 from beamme.core.mesh import Mesh
 from beamme.four_c.material import MaterialReissner
@@ -224,7 +224,7 @@ def fit_skeleton_splines(skeleton_df: pd.DataFrame,
 
     :param skeleton_df: 3D skeleton graph with ``skeleton_point_id``, ``x``,
         ``y``, ``z``, and ``neighbor_ids`` columns, from
-        :func:`~stentfit.kernels.skeleton_3d.wrap_skeleton_to_3d`.
+        :func:`~stentfit.core.skeleton_3d.wrap_skeleton_to_3d`.
     :param output_dir: Folder the HTML view and JSON export are written into.
     :param spline_every: Take every Nth skeleton point as a spline control
         point, to keep the control polygon from being one point per sample.

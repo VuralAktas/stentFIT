@@ -274,12 +274,12 @@ def plot_splines_html(splines: list, out_path: str, n_eval: int = 100) -> str:
 
     Each spline is evaluated at ``n_eval`` points along its parameter range
     (``scipy.interpolate.splev``); a curve with no fitted spline (the
-    polyline fallback from :func:`~stentfit.kernels.splines.fit_curve_spline`)
+    polyline fallback from :func:`~stentfit.core.splines.fit_curve_spline`)
     is drawn from its raw control points instead. ``None`` entries (curves
     where fitting produced nothing) are skipped.
 
     :param splines: Per-curve fit results from
-        :func:`~stentfit.kernels.splines.fit_skeleton_splines`.
+        :func:`~stentfit.core.splines.fit_skeleton_splines`.
     :param out_path: File path the HTML view is written to.
     :param n_eval: Number of points each spline is evaluated at for drawing.
     :returns: ``out_path``, for chaining into a caller's own return value.
@@ -439,17 +439,17 @@ def plot_ring_convergence_html(history: pd.DataFrame | None,
     Draw one ring's auto-tune convergence (or a quality summary) and save it as HTML.
 
     Three cases: with a non-empty ``history`` (from
-    :func:`~stentfit.kernels.skeleton_2d.tune_skeleton_params`), draws the
+    :func:`~stentfit.core.skeleton_2d.tune_skeleton_params`), draws the
     ``total``/``defect``/``quality`` error trajectory across tuning steps.
     Without a history but with a ``quality_report``, draws a bar chart of the
     defect counts instead (used for the fixed-params, no-auto-tune case).
     With neither, draws a placeholder noting auto-tune was off.
 
-    :param history: Per-step tuning history from :func:`~stentfit.kernels.skeleton_2d.tune_skeleton_params`.
+    :param history: Per-step tuning history from :func:`~stentfit.core.skeleton_2d.tune_skeleton_params`.
         ``None`` or empty falls back to the quality-summary or placeholder case.
     :param out_path: File path the HTML view is written to.
     :param ring_id: Ring identifier, used in the plot title.
-    :param quality_report: Dict from :func:`~stentfit.kernels.skeleton_2d.check_skeleton_quality`,
+    :param quality_report: Dict from :func:`~stentfit.core.skeleton_2d.check_skeleton_quality`,
         used for the quality-summary bar chart when ``history`` is unavailable.
     :param pps: ``pixels_per_strut`` used, shown in the quality-summary title if given.
     :param dil_px: ``dilate_px`` used, shown in the quality-summary title if given.
@@ -533,7 +533,7 @@ def plot_ring_skeleton_2d_html(arc: np.ndarray,
     :param ring_band: ``(z_lo, z_hi)`` the surface points are cropped to.
         ``None`` shows every surface point passed in.
     :param changed_idx: Skeleton point indices to highlight as changed.
-    :param quality_report: Dict from :func:`~stentfit.kernels.skeleton_2d.check_skeleton_quality`;
+    :param quality_report: Dict from :func:`~stentfit.core.skeleton_2d.check_skeleton_quality`;
         its ``bad_edge_xy``, ``loop_points_xy``, and ``empty_xy`` are drawn as
         defect markers, and the issue count is appended to the title.
     :param title: Plot title. ``ring_label`` and the issue count are used if empty.
@@ -676,7 +676,7 @@ def _to_arc_z(x: np.ndarray, y: np.ndarray, z: np.ndarray, r_mid: float) -> tupl
     """
     Unroll 3D points onto the (z, arc) plane, recomputing angle from x/y.
 
-    Unlike :func:`~stentfit.kernels.skeleton_2d.open_stent_to_plane`, which
+    Unlike :func:`~stentfit.core.skeleton_2d.open_stent_to_plane`, which
     reads a ``theta`` column directly, this recomputes it from ``x``/``y``
     via ``arctan2`` — used for spline points, which only have xyz coordinates.
 
@@ -832,7 +832,7 @@ def _band_conv(k: int,
 
     :param k: Index of the ring band, in axial order.
     :param ring_order: Ring IDs in axial order, from
-        :func:`~stentfit.kernels.rings.detect_rings` / :func:`~stentfit.kernels.skeleton_2d.skeletonize_rings_2d`.
+        :func:`~stentfit.core.rings.detect_rings` / :func:`~stentfit.core.skeleton_2d.skeletonize_rings_2d`.
         ``None`` or a length mismatch falls back to ``conv_files``.
     :param n_bands: Total number of ring bands.
     :param conv_files: Sorted list of ``ring_XX_convergence.html`` paths, used as the fallback.
@@ -876,9 +876,9 @@ def plot_skeleton_splines_2d(skeleton_curves: list[list[int]],
     self-contained HTML page, and also shown inline.
 
     :param skeleton_curves: Grouped point-id curves, from
-        :func:`~stentfit.kernels.splines.group_skeleton_curves`.
+        :func:`~stentfit.core.splines.group_skeleton_curves`.
     :param skeleton_splines: Per-curve fit results, from
-        :func:`~stentfit.kernels.splines.fit_skeleton_splines`.
+        :func:`~stentfit.core.splines.fit_skeleton_splines`.
     :param stent_df: Stent surface point cloud, drawn as a grey underlay.
     :param r_mid: Mid-wall radius, used to unroll splines and the cloud to
         (z, arc) coordinates.
@@ -1078,7 +1078,7 @@ def plot_skeleton_splines_trimesh(skeleton_splines: list[dict | None],
     viewer supports it, as a self-contained HTML page.
 
     :param skeleton_splines: Per-curve fit results, from
-        :func:`~stentfit.kernels.splines.fit_skeleton_splines`.
+        :func:`~stentfit.core.splines.fit_skeleton_splines`.
     :param output_dir: Folder the GLB and HTML are written into.
     :param show: Open an interactive trimesh viewer window.
     :param tube_radius: Cylinder radius for each curve. ``None`` picks it

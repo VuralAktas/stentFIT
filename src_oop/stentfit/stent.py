@@ -9,17 +9,12 @@ import shutil
 import numpy as np
 import trimesh
 
-from . import plotting
-from .kernels import rings as _rings
-from .kernels import sampling as _sampling
-from .kernels import skeleton_2d as _skeleton_2d
-from .kernels import skeleton_3d as _skeleton_3d
-from .kernels import splines as _splines
-
-#: Maximum surface points used when wrapping the 2D skeleton to 3D. Fixed here
-#: rather than exposed as a method argument: it is a memory guard on the
-#: KD-tree built during the wrap, not a modelling choice.
-_WRAP_MAX_SURF = 2_000_000
+from .core import plotting
+from .core import rings as _rings
+from .core import sampling as _sampling
+from .core import skeleton_2d as _skeleton_2d
+from .core import skeleton_3d as _skeleton_3d
+from .core import splines as _splines
 
 
 class Stent:
@@ -71,11 +66,10 @@ class Stent:
         reconnect across neighbouring rings.
     """
 
-    def __init__(self,
+    def __init__(self: "Stent",
                  stl_file: str,
                  stent_name: str,
                  output_dir: str,
-                 *,
                  n_points: int | None = None,
                  max_display: int = 500_000,
                  remove_supports: bool = False,
@@ -124,26 +118,10 @@ class Stent:
         self.skeleton_splines = None            # one fitted B-spline per curve
 
     # ------------------------------------------------------------------
-    # Derived geometry
-    # ------------------------------------------------------------------
-
-    @property
-    def circumference(self) -> float:
-        """
-        Full circumference at the stent's mid-wall radius.
-
-        Derived from :attr:`stent_features` rather than stored, so it can never
-        drift out of sync with ``r_mid``.
-
-        :returns: ``2 * pi * r_mid``, in mm.
-        """
-        return 2 * np.pi * self.stent_features['r_mid']
-
-    # ------------------------------------------------------------------
     # Output folder handling
     # ------------------------------------------------------------------
 
-    def _versioned_candidates(self) -> list[str]:
+    def _versioned_candidates(self: "Stent") -> list[str]:
         """
         List the existing output folders belonging to this stent.
 
@@ -160,15 +138,18 @@ class Stent:
             for name in os.listdir(parent)
             if pattern.match(name) and os.path.isdir(os.path.join(parent, name)))
 
-    def _pick_existing_output_dir(self) -> str:
+    def _pick_existing_output_dir(self: "Stent", action: str = "use") -> str:
         """
-        Resolve which versioned output folder to reuse for this stent.
+        Resolve which of this stent's versioned output folders to act on.
 
         With no candidate found, returns :attr:`output_dir` unchanged; with
         exactly one, returns it; with several, prints them and prompts the user
-        to pick one.
+        to pick one. Used for both reusing and overwriting, so a stent with
+        several versions never has one silently picked for it.
 
-        :returns: The resolved folder path to actually use.
+        :param action: Verb used in the prompt, so it reads as the operation
+            actually about to happen — ``"use"`` or ``"overwrite"``.
+        :returns: The resolved folder path to actually act on.
         """
         candidates = self._versioned_candidates()
         if len(candidates) <= 1:
@@ -178,12 +159,13 @@ class Stent:
         for i, path in enumerate(candidates, start=1):
             print(f"  [{i}] {os.path.basename(path)}")
         while True:
-            choice = input(f"Which folder to use? [1-{len(candidates)}]: ").strip()
+            choice = input(f"Which folder to {action}? "
+                           f"[1-{len(candidates)}]: ").strip()
             if choice.isdigit() and 1 <= int(choice) <= len(candidates):
                 return candidates[int(choice) - 1]
             print("  invalid choice, try again.")
 
-    def _resolve_output_dir(self) -> bool:
+    def _resolve_output_dir(self: "Stent") -> bool:
         """
         Settle on the output folder, asking the user if one already exists.
 
@@ -192,6 +174,11 @@ class Stent:
         (``<name>_v02``, ``_v03``, ...). Reusing loads that folder's checkpoint
         straight onto this object instead of recomputing anything. Updates
         :attr:`output_dir` in place, and creates the folder.
+
+        Reusing *and* overwriting both go through
+        :meth:`_pick_existing_output_dir`, so when several versions of this
+        stent exist the user is asked which one — an overwrite never silently
+        wipes the unversioned base folder while other versions sit alongside it.
 
         :returns: ``True`` if an existing checkpoint was loaded and the caller
             should skip recomputation, ``False`` to carry on with a fresh run.
@@ -202,6 +189,9 @@ class Stent:
                 f"  [e] use it as-is   [o] overwrite (wipe it first)   "
                 f"[n] make a new versioned folder\nChoose [e/o/n]: ").strip().lower()
             if choice.startswith('o'):
+                # Several versioned folders may exist for this stent; wipe the
+                # one the user names, not blindly the unversioned base folder.
+                self.output_dir = self._pick_existing_output_dir(action="overwrite")
                 shutil.rmtree(self.output_dir)
                 print(f"[output] wiped and reusing {self.output_dir}")
             elif choice.startswith('n'):
@@ -225,7 +215,7 @@ class Stent:
     # Checkpointing
     # ------------------------------------------------------------------
 
-    def save_checkpoint(self, verbose: bool = True) -> str:
+    def save_checkpoint(self: "Stent", verbose: bool = True) -> str:
         """
         Write the per-ring 2D skeletons and stent geometry to ``ring_2d.pkl``.
 
@@ -236,12 +226,13 @@ class Stent:
         :param verbose: Print the saved path and ring count.
         :returns: Path to the written ``ring_2d.pkl``.
         """
+        r_mid = self.stent_features['r_mid']
         return _skeleton_2d.save_ring_2d_checkpoint(
             self.ring_2d, self.stent_features, self.stent_centerline_direction,
-            self.stent_features['r_mid'], self.stent_features['strut_thickness'],
-            self.circumference, self.ring_edges, self.output_dir, verbose=verbose)
+            r_mid, self.stent_features['strut_thickness'],
+            2 * np.pi * r_mid, self.ring_edges, self.output_dir, verbose=verbose)
 
-    def _load_checkpoint_into(self, output_dir: str) -> None:
+    def _load_checkpoint_into(self: "Stent", output_dir: str) -> None:
         """
         Restore this object's state from an output folder's checkpoint.
 
@@ -256,7 +247,7 @@ class Stent:
         self.stent_df = state['stent_df']
 
     @classmethod
-    def load(cls,
+    def load(cls: type["Stent"],
              output_dir: str,
              stl_file: str = "",
              stent_name: str = "",
@@ -292,7 +283,7 @@ class Stent:
     # Pipeline phases
     # ------------------------------------------------------------------
 
-    def skeletonize_2d(self) -> "Stent":
+    def skeletonize_2d(self: "Stent") -> "Stent":
         """
         Sample the stent mesh, detect its rings, and 2D-skeletonise each ring.
 
@@ -351,7 +342,7 @@ class Stent:
         self.save_checkpoint()
         return self
 
-    def edit_and_assemble(self) -> "Stent":
+    def edit_and_assemble(self: "Stent") -> "Stent":
         """
         Apply the interactive manual 2D edits, then assemble the flat skeleton.
 
@@ -365,10 +356,11 @@ class Stent:
 
         :returns: ``self``, so phases can be chained.
         """
+        r_mid = self.stent_features['r_mid']
         self.ring_2d = _skeleton_2d.edit_rings_2d_interactive(
             self.ring_2d, self.stent_features, self.stent_centerline_direction,
-            self.stent_features['r_mid'], self.stent_features['strut_thickness'],
-            self.circumference, self.ring_edges, self.output_dir)
+            r_mid, self.stent_features['strut_thickness'],
+            2 * np.pi * r_mid, self.ring_edges, self.output_dir)
 
         assembled = _skeleton_2d.assemble_2d_skeleton(self.ring_2d)
         self.skel_arc = assembled['skel_arc']
@@ -377,8 +369,7 @@ class Stent:
         self.surf_df = self.stent_df
         return self
 
-    def finalize(self,
-                 *,
+    def finalize(self: "Stent",
                  prune_tip_frac: float = 0,
                  max_display: int = 500_000,
                  random_seed: int = 0) -> "Stent":
@@ -399,11 +390,15 @@ class Stent:
         :param random_seed: Seed for any subsampling during the 3D wrap.
         :returns: ``self``, so phases can be chained.
         """
+        r_mid = self.stent_features['r_mid']
         self.skeleton_df = _skeleton_3d.wrap_skeleton_to_3d(
             self.skel_arc, self.skel_z, self.skel_px, self.surf_df,
-            self.stent_features['r_mid'], self.circumference,
+            r_mid, 2 * np.pi * r_mid,
             self.stent_features['strut_thickness'], self.output_dir,
-            self.stent_name, wrap_max_surf=_WRAP_MAX_SURF,
+            # Ceiling on the surface points fed to the wrap's KD-tree: a memory
+            # guard, not a modelling choice, so it is not a public argument.
+            # Past this many points the cloud is randomly downsampled.
+            self.stent_name, wrap_max_surf=2_000_000,
             prune_tip_frac=prune_tip_frac, max_display=max_display,
             random_seed=random_seed)
 
@@ -420,7 +415,7 @@ class Stent:
         self.plot_splines_trimesh()
         return self
 
-    def skeletonize(self, *, prune_tip_frac: float = 0) -> "Stent":
+    def skeletonize(self: "Stent", prune_tip_frac: float = 0) -> "Stent":
         """
         Run the full skeletonisation, from the STL mesh to fitted splines.
 
@@ -449,18 +444,19 @@ class Stent:
     # Views
     # ------------------------------------------------------------------
 
-    def plot_splines_2d(self) -> None:
+    def plot_splines_2d(self: "Stent") -> None:
         """
         Draw the fitted splines on the unrolled (arc, z) plane.
 
         Writes ``skeleton_splines_2d.html`` / ``.png`` into :attr:`output_dir`.
         """
+        r_mid = self.stent_features['r_mid']
         plotting.plot_skeleton_splines_2d(
             self.skeleton_curves, self.skeleton_splines, self.stent_df,
-            self.stent_features['r_mid'], self.circumference, self.ring_edges,
+            r_mid, 2 * np.pi * r_mid, self.ring_edges,
             self.ring_order, self.output_dir, self.stent_name)
 
-    def plot_splines_trimesh(self) -> None:
+    def plot_splines_trimesh(self: "Stent") -> None:
         """
         Draw the fitted splines as 3D tubes with trimesh.
 
@@ -469,7 +465,7 @@ class Stent:
         """
         plotting.plot_skeleton_splines_trimesh(self.skeleton_splines, self.output_dir)
 
-    def __repr__(self) -> str:
+    def __repr__(self: "Stent") -> str:
         """:returns: A short summary of how far this stent has been processed."""
         stage = "empty"
         if self.skeleton_splines is not None:

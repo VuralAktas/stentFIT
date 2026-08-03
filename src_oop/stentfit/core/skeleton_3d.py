@@ -5,7 +5,7 @@ import json
 import os
 from scipy.spatial import cKDTree
 
-from ..plotting import plot_skeleton_html, plot_skeleton_with_cloud_html
+from .plotting import plot_skeleton_html, plot_skeleton_with_cloud_html
 
 
 def adjust_skeleton_to_local_midsurface(
@@ -88,7 +88,7 @@ def analyze_skeleton_connectivity(
     sit at the same 3D position once wrapped. ``pixel_size`` may be a single
     scalar (one skeletonisation resolution for the whole stent) or a
     per-point array (one entry per ring, from
-    :func:`~stentfit.kernels.skeleton_2d.assemble_2d_skeleton`), in which case
+    :func:`~stentfit.core.skeleton_2d.assemble_2d_skeleton`), in which case
     a pair only counts if it's within the coarser of the two points' radii.
     Each point's degree then sets its ``node_type``: 0 is ``isolated``, 1 is
     ``endpoint``, 2 is ``line``, and 3+ is ``junction``.
@@ -429,7 +429,7 @@ def wrap_skeleton_to_3d(skel_arc: np.ndarray,
 
     :param skel_arc: Flat arc-coordinates of the assembled 2D skeleton.
     :param skel_z: Flat z-coordinates of the assembled 2D skeleton.
-    :param skel_px: Per-point pixel size, from :func:`~stentfit.kernels.skeleton_2d.assemble_2d_skeleton`.
+    :param skel_px: Per-point pixel size, from :func:`~stentfit.core.skeleton_2d.assemble_2d_skeleton`.
     :param surf_df: Stent surface point cloud, used to find each skeleton
         point's local mid-surface radius.
     :param r_mid: Mid-wall radius.
@@ -496,7 +496,7 @@ def save_stent_features_and_views(skeleton_df: pd.DataFrame,
     midpoint between each pair of neighbouring rings). Also prints a summary
     of every file this pipeline run has produced — the skeleton CSV and
     spline exports were already written by earlier steps
-    (:func:`wrap_skeleton_to_3d`, :func:`~stentfit.kernels.splines.fit_skeleton_splines`);
+    (:func:`wrap_skeleton_to_3d`, :func:`~stentfit.core.splines.fit_skeleton_splines`);
     only the JSON and cloud view are written here.
 
     :param skeleton_df: Final 3D skeleton graph.

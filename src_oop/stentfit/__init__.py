@@ -11,8 +11,8 @@ Object-oriented API built around three domain classes:
   4C beam-to-solid input.
 
 Everything else in the package is module-level functions: the numerical
-kernels in :mod:`stentfit.kernels` and the Plotly views in
-:mod:`stentfit.plotting`.
+kernels in :mod:`stentfit.core` and the Plotly views in
+:mod:`stentfit.core.plotting`.
 """
 
 from .stent import Stent

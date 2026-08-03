@@ -32,7 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from params import (  # noqa: E402
     FINALIZE_PARAMS,
     SIMULATION_GOLDEN_FILES,
-    SIMULATION_PARAMS,
+    LEGACY_SIMULATION_PARAMS,
     SKELETON_GOLDEN_FILES,
     SKELETON_PARAMS,
     STENT_NAME,
@@ -139,7 +139,7 @@ def make_simulation_golden(stent_run_dir: Path, out_dir: Path) -> bool:
             stent_name=STENT_NAME,
             stent_dir=stent_run_dir,
             sim_input_dir=sim_dir,
-            **SIMULATION_PARAMS,
+            **LEGACY_SIMULATION_PARAMS,
         )
     except Exception as exc:  # pragma: no cover - environment dependent
         print(f"[golden] simulation side FAILED: {type(exc).__name__}: {exc}")

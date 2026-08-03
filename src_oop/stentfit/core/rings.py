@@ -8,7 +8,7 @@ from scipy.spatial import cKDTree
 from scipy.ndimage import uniform_filter1d
 from scipy.signal import find_peaks
 
-from ..plotting import plot_points_3d_html, plot_ring_dips_html
+from .plotting import plot_points_3d_html, plot_ring_dips_html
 
 
 def find_rings(
@@ -43,7 +43,7 @@ def find_rings(
         and the dip-detection diagnostics (``dip_z_centers``,
         ``dip_counts_smoothed``, ``dip_indices``, ``dip_depth_thresh``,
         ``boundary_z``, ``n_bands``) used by
-        :func:`~stentfit.plotting.plot_ring_dips_html`.
+        :func:`~stentfit.core.plotting.plot_ring_dips_html`.
     """
 
     pts3d     = stent_df[['x', 'y', 'z']].values
@@ -178,7 +178,7 @@ def segment_stent(
     region size is absorbed into its nearest normal-sized neighbour. The
     result is a per-point ``region`` label plus which region pairs are
     actually adjacent in 3D (``region_allowed``) — used later by
-    :func:`~stentfit.kernels.skeleton_2d.check_skeleton_quality` to tell a real
+    :func:`~stentfit.core.skeleton_2d.check_skeleton_quality` to tell a real
     strut connection from a false one bridging two unrelated regions.
 
     :param stent_df: Stent point cloud with a ``ring_id`` column (from

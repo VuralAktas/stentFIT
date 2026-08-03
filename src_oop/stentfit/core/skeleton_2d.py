@@ -10,7 +10,7 @@ from scipy.spatial import cKDTree
 from skimage.morphology import skeletonize, dilation, closing, disk
 
 from .rings import segment_stent
-from ..plotting import plot_ring_skeleton_2d_html, plot_ring_convergence_html, _render_ring_2d
+from .plotting import plot_ring_skeleton_2d_html, plot_ring_convergence_html, _render_ring_2d
 
 
 def open_stent_to_plane(stent_df: pd.DataFrame, r_mid: float) -> dict:
@@ -195,7 +195,7 @@ def check_skeleton_quality(
     :param stent_df: Ring's surface point cloud with a ``region`` column.
     :param r_mid: Mid-wall radius, used to unroll ``theta`` to arc length.
     :param region_allowed: Region-adjacency matrix from
-        :func:`~stentfit.kernels.rings.segment_stent`.
+        :func:`~stentfit.core.rings.segment_stent`.
     :param strut_thickness: Strut thickness, used to size the small-loop
         cutoff. ``None`` treats every loop as small (no size filtering).
     :param loop_size_factor: A loop wider than this many strut thicknesses is
@@ -430,7 +430,7 @@ def tune_skeleton_params(
     :param stent_df: Ring's surface point cloud with a ``region`` column.
     :param stent_features: Stent features dict (``r_mid``, ``strut_thickness``).
     :param region_allowed: Region-adjacency matrix from
-        :func:`~stentfit.kernels.rings.segment_stent`.
+        :func:`~stentfit.core.rings.segment_stent`.
     :param pps0: Starting ``pixels_per_strut``.
     :param dil0: Starting ``dilate_px``.
     :param pps_min: Lower bound on ``pixels_per_strut``.
@@ -956,7 +956,7 @@ def _downsample_surface_pair(a: np.ndarray,
     Randomly subsample two matching coordinate arrays down to ``n`` points.
 
     Used to shrink a ring's surface points before storing them for the 2D
-    skeleton plot, so :func:`~stentfit.plotting.plot_ring_skeleton_2d_html`
+    skeleton plot, so :func:`~stentfit.core.plotting.plot_ring_skeleton_2d_html`
     stays responsive.
 
     :param a: First coordinate array (e.g. arc).
@@ -989,7 +989,7 @@ def skeletonize_rings_2d(stent_df: pd.DataFrame,
     """
     2D-skeletonise every ring of the stent, one ring at a time.
 
-    Runs :func:`~stentfit.kernels.rings.segment_stent` once on the whole stent
+    Runs :func:`~stentfit.core.rings.segment_stent` once on the whole stent
     to get a shared region map, then for each ring: unrolls its points (plus
     a z-halo, so struts still reconnect across ring boundaries) to a flat
     (arc, z) plane with :func:`open_stent_to_plane`, skeletonises it (either a
@@ -1000,7 +1000,7 @@ def skeletonize_rings_2d(stent_df: pd.DataFrame,
     Writes per-ring plots and a CSV under ``output_dir/skeleton_plots/``.
 
     :param stent_df: Stent point cloud with a ``ring_id`` column (from
-        :func:`~stentfit.kernels.rings.detect_rings`).
+        :func:`~stentfit.core.rings.detect_rings`).
     :param stent_features: Stent features dict (``r_mid``, ``strut_thickness``, ...).
     :param ring_edges: Z-boundaries between rings, used to size each ring's halo.
     :param conn_radius_3d: 3D connectivity radius used for the region segmentation.
@@ -1274,7 +1274,7 @@ def edit_rings_2d_interactive(ring_2d: dict,
     point indices at the defect, and the matching fixer runs
     (:func:`fix_ring_loop_2d` or :func:`fix_ring_connection_2d`). Each edit is
     applied tentatively, rendered to a preview PNG/HTML via
-    :func:`~stentfit.plotting._render_ring_2d`, and only kept (and
+    :func:`~stentfit.core.plotting._render_ring_2d`, and only kept (and
     checkpointed to disk) if the user confirms it looks right — otherwise the
     ring is reverted to its state before that edit.
 

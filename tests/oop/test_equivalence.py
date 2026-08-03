@@ -22,6 +22,7 @@ import pandas as pd
 import pytest
 
 from params import (
+    ARTERY_PARAMS,
     FINALIZE_PARAMS,
     SIMULATION_PARAMS,
     SKELETON_PARAMS,
@@ -188,12 +189,13 @@ def simulation_run(tmp_path_factory, stent_run):
     :raises pytest.skip.Exception: If the environment cannot run the setup
         (no GMSH, BeamMe, or 4C schema).
     """
-    from stentfit import Simulation
+    from stentfit import Artery, Simulation
 
     stent, _ = stent_run
     sim_dir = tmp_path_factory.mktemp("oop_simulation")
     try:
-        sim = Simulation(stent, sim_input_dir=sim_dir, **SIMULATION_PARAMS).setup()
+        artery = Artery(stent, **ARTERY_PARAMS)
+        sim = Simulation(stent, artery, sim_dir, **SIMULATION_PARAMS).setup()
     except ImportError as exc:                      # pragma: no cover
         pytest.skip(f"simulation dependencies unavailable: {exc}")
     return sim, Path(sim_dir)
@@ -235,9 +237,9 @@ def test_stent_object_state(stent_run):
     """
     The finished object exposes the pipeline results, with no duplicated fields.
 
-    Guards the Section 4.1 decisions: ``r_mid``/``strut_thickness`` are read out
-    of ``stent_features`` rather than copied onto the instance, and
-    ``circumference`` is a derived property.
+    Guards the Section 4.1 decision that the scalar geometry lives only in
+    ``stent_features``: ``r_mid``, ``strut_thickness`` and the derived
+    circumference are read from there, never copied onto the instance.
     """
     stent, _ = stent_run
 
@@ -248,14 +250,11 @@ def test_stent_object_state(stent_run):
     assert len(stent.skeleton_curves) == len(stent.skeleton_splines)
     assert stent.ring_2d and stent.ring_order
 
-    # circumference is derived, never stored
-    assert "circumference" not in vars(stent)
-    assert np.isclose(stent.circumference,
-                      2 * np.pi * stent.stent_features["r_mid"])
-
-    # r_mid / strut_thickness live only in stent_features
-    assert "r_mid" not in vars(stent)
-    assert "strut_thickness" not in vars(stent)
+    # the scalar geometry lives only in stent_features, never duplicated
+    for duplicated in ("circumference", "r_mid", "strut_thickness"):
+        assert duplicated not in vars(stent)
+    assert "r_mid" in stent.stent_features
+    assert "strut_thickness" in stent.stent_features
 
 
 def test_stent_load_round_trip(stent_run):
@@ -272,7 +271,8 @@ def test_stent_load_round_trip(stent_run):
 
     assert reloaded.stent_name == STENT_NAME
     assert set(reloaded.ring_2d) == set(stent.ring_2d)
-    assert np.isclose(reloaded.circumference, stent.circumference)
+    assert np.isclose(reloaded.stent_features["r_mid"],
+                      stent.stent_features["r_mid"])
     assert np.allclose(reloaded.ring_edges, stent.ring_edges)
     assert len(reloaded.stent_df) == len(stent.stent_df)
     for label, rec in stent.ring_2d.items():
@@ -287,6 +287,80 @@ def test_stent_missing_stl_raises(tmp_path):
     stent = Stent(str(tmp_path / "nope.stl"), "nope", str(tmp_path / "out"))
     with pytest.raises(FileNotFoundError, match="No STL file"):
         stent.skeletonize_2d()
+
+
+# ---------------------------------------------------------------------------
+# Output-folder versioning
+# ---------------------------------------------------------------------------
+
+def _make_versions(tmp_path, *names):
+    """
+    Create one non-empty output folder per name.
+
+    :param tmp_path: Parent folder to create them under.
+    :param names: Folder names, e.g. ``"s01"``, ``"s01_v02"``.
+    :returns: The base folder path, as a string.
+    """
+    for name in names:
+        d = tmp_path / name
+        d.mkdir()
+        (d / "marker.txt").write_text(name)
+    return str(tmp_path / names[0])
+
+
+def test_overwrite_asks_which_version(tmp_path):
+    """
+    Overwriting with several versions present wipes the one the user picks.
+
+    The other versions must survive untouched — an overwrite should never take
+    out a sibling the user did not name.
+    """
+    from stentfit import Stent
+
+    base = _make_versions(tmp_path, "s01", "s01_v02", "s01_v03")
+    stent = Stent(str(tmp_path / "s01.stl"), "s01", base)
+
+    # "o" = overwrite, then "2" = the second listed folder (s01_v02)
+    with mock.patch("builtins.input", side_effect=["o", "2"]):
+        reused = stent._resolve_output_dir()
+
+    assert reused is False
+    assert Path(stent.output_dir).name == "s01_v02"
+    assert not (tmp_path / "s01_v02" / "marker.txt").exists()  # wiped
+    assert (tmp_path / "s01_v02").is_dir()                     # and recreated
+    # siblings untouched
+    assert (tmp_path / "s01" / "marker.txt").read_text() == "s01"
+    assert (tmp_path / "s01_v03" / "marker.txt").read_text() == "s01_v03"
+
+
+def test_overwrite_single_version_does_not_prompt(tmp_path):
+    """With only one folder there is nothing to disambiguate, so it just wipes."""
+    from stentfit import Stent
+
+    base = _make_versions(tmp_path, "s01")
+    stent = Stent(str(tmp_path / "s01.stl"), "s01", base)
+
+    with mock.patch("builtins.input", side_effect=["o"]):   # no second prompt
+        stent._resolve_output_dir()
+
+    assert Path(stent.output_dir).name == "s01"
+    assert not (tmp_path / "s01" / "marker.txt").exists()
+
+
+def test_new_version_branches_past_existing(tmp_path):
+    """Choosing a new folder skips every version number already taken."""
+    from stentfit import Stent
+
+    base = _make_versions(tmp_path, "s01", "s01_v02")
+    stent = Stent(str(tmp_path / "s01.stl"), "s01", base)
+
+    with mock.patch("builtins.input", side_effect=["n"]):
+        stent._resolve_output_dir()
+
+    assert Path(stent.output_dir).name == "s01_v03"
+    # nothing existing was touched
+    assert (tmp_path / "s01" / "marker.txt").exists()
+    assert (tmp_path / "s01_v02" / "marker.txt").exists()
 
 
 # ---------------------------------------------------------------------------

@@ -45,14 +45,17 @@ FINALIZE_PARAMS = dict(
     random_seed=0,
 )
 
-#: ``wrap_max_surf`` is a fixed constant in the OOP ``Stent.finalize()``
-#: (``stent._WRAP_MAX_SURF``); the old pipeline took it as an argument. Keep the
-#: two in sync so the golden comparison is apples-to-apples.
+#: ``wrap_max_surf`` is hardcoded inside the OOP ``Stent.finalize()`` — it is a
+#: memory guard, not a modelling knob, so it is not a public argument there. The
+#: old pipeline took it as an argument, so ``make_golden.py`` passes this value
+#: explicitly. Keep the two in sync so the golden comparison stays valid.
 WRAP_MAX_SURF = 2_000_000
 
-#: Keyword arguments shared by ``build_smoketest_pipeline`` (old) and
-#: ``Simulation`` (new).
-SIMULATION_PARAMS = dict(
+#: The old ``build_smoketest_pipeline`` took one flat parameter list. The class
+#: API splits it in two: artery shape and wall material on ``Artery``, stent
+#: material / element sizing / load stepping on ``Simulation``. Their union is
+#: still exactly the old set, so the golden comparison stays apples-to-apples.
+ARTERY_PARAMS = dict(
     artery_type="straight",
     inner_margin=0.5,
     wall_thickness=0.5,
@@ -61,15 +64,22 @@ SIMULATION_PARAMS = dict(
     bend_angle_deg=180.0,
     mesh_type="HEX8",
     artery_youngs=2.0,
-    factor_solid=1.5,
+)
+
+#: Keyword arguments for ``Simulation``.
+SIMULATION_PARAMS = dict(
     stent_youngs=2.0e5,
     stent_poisson=0.3,
     stent_density=0.0,
     beam_class_label="Beam3rHerm2Line3",
+    factor_solid=1.5,
     factor_beam=1.2,
     n_steps=10,
     expansion_force=1e-4,
 )
+
+#: The flat form the old procedural pipeline took, used by ``make_golden.py``.
+LEGACY_SIMULATION_PARAMS = {**ARTERY_PARAMS, **SIMULATION_PARAMS}
 
 #: Files copied into ``tests/oop/golden/<stent>/`` from a skeletonisation run.
 SKELETON_GOLDEN_FILES = (

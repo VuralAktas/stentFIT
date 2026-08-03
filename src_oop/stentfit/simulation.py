@@ -22,8 +22,9 @@ from beamme.four_c.header_functions import (set_beam_to_solid_meshtying,
 from beamme.four_c.input_file import InputFile
 
 from .artery import Artery
-from .kernels import artery_geom as _geom
-from .kernels import splines as _splines
+from .stent import Stent
+from .core import artery_geom as _geom
+from .core import splines as _splines
 
 
 def _radial_directions(points: np.ndarray, artery_cl: np.ndarray) -> np.ndarray:
@@ -65,10 +66,14 @@ class Simulation:
     static solver header, boundary conditions and a quasi-static radial
     expansion load are written out::
 
-        sim = Simulation(stent, sim_input_dir="outputs/simulation/input").setup()
+        artery = Artery(stent, artery_type="curved", inner_margin=0.5)
+        sim = Simulation(stent, artery, "outputs/simulation/input")
+        sim.setup()
 
-    Passing ``artery=None`` lets :meth:`setup` generate a parametric test artery
-    sized to the stent from the artery parameters below.
+    The artery is built first and passed in, so every artery-shape and
+    wall-material knob lives on :class:`~stentfit.artery.Artery` and everything
+    here concerns the stent, the coupling, and the load. Build both against the
+    *same* stent — the constructor rejects a mismatch.
 
     This is a **smoke test**, not the physics of the reference papers: the
     artery uses a placeholder ``StVenantKirchhoff`` material, coupling is tied
@@ -77,71 +82,51 @@ class Simulation:
 
     :param stent: The stent to deploy. Its skeletonisation must have run, since
         the beam mesh is built from the splines in its output folder.
-    :param artery: The artery to deploy into. ``None`` makes :meth:`setup`
-        generate one with :meth:`~stentfit.artery.Artery.for_stent`.
+    :param artery: The artery to deploy into, already built by
+        :class:`~stentfit.artery.Artery`. Every artery-shape and wall-material
+        parameter lives on that object, not here.
     :param sim_input_dir: Folder every generated ``.4C.yaml`` and ``.vtu`` is
         written into.
-    :param artery_type: Generated artery shape: ``'straight'``, ``'curved'``,
-        or ``'s_bend'``. Ignored if ``artery`` was given.
-    :param inner_margin: Extra clearance, in mm, between the stent and the
-        artery inner wall.
-    :param wall_thickness: Artery wall thickness, in mm.
-    :param noise_amplitude: Fractional wall-roughness noise added to the artery.
-    :param noise_seed: Seed for the artery wall noise, for repeatable runs.
-    :param bend_angle_deg: Total bend angle, in degrees, for a curved or
-        S-bend artery.
-    :param mesh_type: GMSH element type for the artery solid: ``'TET4'``,
-        ``'TET10'``, or ``'HEX8'``.
-    :param artery_youngs: Artery wall Young's modulus, in MPa (placeholder
-        StVenantKirchhoff material).
-    :param factor_solid: Safety factor sizing the artery solid element size
-        relative to the beam diameter.
     :param stent_youngs: Stent beam Young's modulus, in MPa.
     :param stent_poisson: Stent beam Poisson's ratio.
     :param stent_density: Stent beam material density.
     :param beam_class_label: BeamMe beam element type, either
         ``'Beam3rHerm2Line3'`` or ``'Beam3rLine2Line2'``.
+    :param factor_solid: Safety factor sizing the artery solid element size
+        relative to the beam diameter.
     :param factor_beam: Additional safety factor sizing the beam element length
         beyond ``factor_solid``.
     :param n_steps: Number of load steps for the balloon expansion ramp.
     :param expansion_force: Radial point-force magnitude for the balloon expansion.
+    :raises ValueError: If ``artery`` was built for a different stent.
     """
 
-    def __init__(self,
-                 stent,
-                 artery: "Artery | None" = None,
-                 *,
-                 sim_input_dir,
-                 artery_type: str = "straight",
-                 inner_margin: float = 0.5,
-                 wall_thickness: float = 0.5,
-                 noise_amplitude: float = 0.15,
-                 noise_seed: float = 0,
-                 bend_angle_deg: float = 180.0,
-                 mesh_type: str = "HEX8",
-                 artery_youngs: float = 2.0,
-                 factor_solid: float = 1.5,
+    def __init__(self: "Simulation",
+                 stent: Stent,
+                 artery: Artery,
+                 sim_input_dir: str | Path,
                  stent_youngs: float = 2.0e5,
                  stent_poisson: float = 0.3,
                  stent_density: float = 0.0,
                  beam_class_label: str = "Beam3rHerm2Line3",
+                 factor_solid: float = 1.5,
                  factor_beam: float = 1.2,
                  n_steps: int = 10,
                  expansion_force: float = 1e-4):
+        # An artery sized against a different stent would pass the coupling
+        # checks against one stent and be meshed around another, so catch it here.
+        if artery.stent is not stent:
+            raise ValueError(
+                "this artery was built for a different stent "
+                f"({artery.stent.stent_name!r} vs {stent.stent_name!r}) - build "
+                f"the artery with Artery(stent, ...) using the same stent.")
+
         # --- composed parts ---
         self.stent = stent
         self.artery = artery
         self.sim_input_dir = Path(sim_input_dir)
 
-        # --- artery generation / meshing parameters ---
-        self.artery_type = artery_type
-        self.inner_margin = inner_margin
-        self.wall_thickness = wall_thickness
-        self.noise_amplitude = noise_amplitude
-        self.noise_seed = noise_seed
-        self.bend_angle_deg = bend_angle_deg
-        self.mesh_type = mesh_type
-        self.artery_youngs = artery_youngs
+        # --- element sizing, both factors relative to the stent's strut ---
         self.factor_solid = factor_solid
 
         # --- stent beam material / discretisation ---
@@ -165,7 +150,7 @@ class Simulation:
     # ------------------------------------------------------------------
 
     @property
-    def beam_diameter(self) -> float:
+    def beam_diameter(self: "Simulation") -> float:
         """
         :returns: The beam cross-section diameter — the stent's strut
             thickness, read straight off the composed stent, in mm.
@@ -173,7 +158,7 @@ class Simulation:
         return self.stent.stent_features["strut_thickness"]
 
     @property
-    def solid_element_size(self) -> float:
+    def solid_element_size(self: "Simulation") -> float:
         """
         :returns: Target artery solid element size: the beam diameter with the
             ``factor_solid`` safety factor applied, in mm.
@@ -181,7 +166,7 @@ class Simulation:
         return self.beam_diameter * self.factor_solid
 
     @property
-    def beam_element_size(self) -> float:
+    def beam_element_size(self: "Simulation") -> float:
         """
         :returns: Target beam element length: the solid element size with the
             further ``factor_beam`` safety factor applied, in mm.
@@ -192,7 +177,7 @@ class Simulation:
     # Steps
     # ------------------------------------------------------------------
 
-    def print_stent_summary(self) -> None:
+    def print_stent_summary(self: "Simulation") -> None:
         """
         Print the stent's key dimensions, as a sanity check before meshing.
 
@@ -215,27 +200,21 @@ class Simulation:
         if self.stent.skeleton_df is not None:
             print(f"skeleton nodes  : {len(self.stent.skeleton_df):,}")
 
-    def build_artery(self) -> "Artery":
+    def mesh_artery(self: "Simulation") -> Path:
         """
-        Generate the parametric test artery this stent will be deployed into.
+        Mesh the artery wall as a 3D solid, sized to this simulation's stent.
 
-        Only used when no artery was passed to the constructor. Sets
-        :attr:`artery`.
+        Thin wrapper over :meth:`~stentfit.artery.Artery.mesh_solid` that fills
+        in the element size (which depends on the stent's strut thickness, so
+        the artery cannot work it out alone) and the output path.
 
-        :returns: The generated artery.
+        :returns: Path to the written ``artery_solid.4C.yaml``.
         """
-        self.artery = Artery.for_stent(
-            self.stent,
-            artery_type=self.artery_type,
-            inner_margin=self.inner_margin,
-            wall_thickness=self.wall_thickness,
-            noise_amplitude=self.noise_amplitude,
-            noise_seed=self.noise_seed,
-            bend_angle_deg=self.bend_angle_deg,
-        )
-        return self.artery
+        return self.artery.mesh_solid(
+            out_path=self.sim_input_dir / "artery_solid.4C.yaml",
+            element_size=self.solid_element_size)
 
-    def align(self) -> "Simulation":
+    def align(self: "Simulation") -> "Simulation":
         """
         Mesh the straight stent as beams and warp it onto the artery centreline.
 
@@ -247,13 +226,8 @@ class Simulation:
 
         Sets :attr:`beam_mesh`.
 
-        :raises ValueError: If no artery has been built or supplied yet.
         :returns: ``self``, so steps can be chained.
         """
-        if self.artery is None:
-            raise ValueError("no artery yet - pass one to Simulation(...) or call "
-                             "build_artery() first.")
-
         # 1. Build the straight stent as a BeamMe beam mesh from the fitted
         #    splines in the stent's output folder.
         self.beam_mesh = _splines.mesh_skeleton_beams(
@@ -287,8 +261,7 @@ class Simulation:
         print(f"[saved] {stent_yaml}")
         return self
 
-    def assemble(self,
-                 *,
+    def assemble(self: "Simulation",
                  lumen_surface_index: int = 0,
                  bc_type=None,
                  output_filename: str = "artery_stent.4C.yaml") -> "Simulation":
@@ -334,7 +307,7 @@ class Simulation:
               "driver, solver, run 4C.")
         return self
 
-    def export_paraview(self, output_name: str = "artery_stent_mesh") -> tuple | None:
+    def export_paraview(self: "Simulation", output_name: str = "artery_stent_mesh") -> tuple | None:
         """
         Export the assembled beam+solid mesh as separate ``.vtu`` files for ParaView.
 
@@ -358,8 +331,7 @@ class Simulation:
         print("Open the .vtu files in ParaView to inspect the meshes.")
         return beam_vtu, solid_vtu
 
-    def check_coupling(self,
-                       *,
+    def check_coupling(self: "Simulation",
                        stiffness_ratio_min: float = 10.0,
                        length_ratio_min: float = 1,
                        length_ratio_max: float = 6,
@@ -404,7 +376,7 @@ class Simulation:
             for el in self.beam_mesh.elements]))
 
         beam_youngs = self.stent_youngs
-        solid_youngs = self.artery_youngs
+        solid_youngs = self.artery.artery_youngs
         beam_diameter = self.beam_diameter
         solid_element_length = self.solid_element_size
 
@@ -483,7 +455,7 @@ class Simulation:
         self.coupling_report = checks
         return checks
 
-    def plot_overview(self, show: bool = True) -> Path:
+    def plot_overview(self: "Simulation", show: bool = True) -> Path:
         """
         Draw the artery surface, its centreline, and the warped stent together.
 
@@ -520,7 +492,7 @@ class Simulation:
             mode="lines", line=dict(color="crimson", width=2), name="stent beams",
         ))
         fig.update_layout(
-            title=f"Stent warped onto {self.artery_type} artery — "
+            title=f"Stent warped onto {self.artery.artery_type} artery — "
                   f"{self.stent.stent_name} "
                   f"({len(self.beam_mesh.elements):,} beam elements)",
             scene=dict(aspectmode="data"),
@@ -537,8 +509,7 @@ class Simulation:
                       f"use {stent_artery_html.name} instead")
         return stent_artery_html
 
-    def write_input(self,
-                    *,
+    def write_input(self: "Simulation",
                     out_path: str | Path | None = None,
                     total_time: float = 1.0,
                     inlet_surface_index: int = 1,
@@ -644,15 +615,14 @@ class Simulation:
     # Full chain
     # ------------------------------------------------------------------
 
-    def setup(self, show_plot: bool = True) -> "Simulation":
+    def setup(self: "Simulation", show_plot: bool = True) -> "Simulation":
         """
         Prepare a runnable 4C input, from the stent and artery through to the load.
 
-        Chains the whole synthetic pipeline: prints the stent summary, generates
-        the parametric test artery if none was supplied, meshes the stent as
-        beams and warps it onto the artery centreline (:meth:`align`), meshes
-        the artery wall as a 3D solid
-        (:meth:`~stentfit.artery.Artery.mesh_solid`), assembles the
+        Chains the whole synthetic pipeline: prints the stent summary, meshes
+        the stent as beams and warps it onto the artery centreline
+        (:meth:`align`), meshes the artery wall as a 3D solid
+        (:meth:`mesh_artery`), assembles the
         beam-to-solid mesh (:meth:`assemble`) and exports it for ParaView
         (:meth:`export_paraview`). It then checks the coupling assumptions
         (:meth:`check_coupling`), shows the overview plot, and — **only if those
@@ -672,12 +642,6 @@ class Simulation:
         print("--------------")
         self.print_stent_summary()
 
-        # Test artery generation
-        if self.artery is None:
-            print("\nTest_Artery features")
-            print("--------------")
-            self.build_artery()
-
         # Stent meshing and alignment with the artery
         print("\n Stent Meshing and Alignment")
         print("--------------")
@@ -686,14 +650,7 @@ class Simulation:
         # Mesh the artery WALL into a 3D solid with GMSH and write it as a 4C .yaml.
         print("\n Test_Artery Meshing")
         print("--------------")
-        self.artery.mesh_solid(
-            out_path=self.sim_input_dir / "artery_solid.4C.yaml",
-            element_size=self.solid_element_size,
-            mesh_type=self.mesh_type,
-            noise_amplitude=self.noise_amplitude,
-            noise_seed=self.noise_seed,
-            youngs_modulus=self.artery_youngs,
-        )
+        self.mesh_artery()
 
         # Create the assembly mesh for the stent and artery, and write it as a 4C .yaml.
         print('\n Assembly of Stent and Test_Artery')
@@ -729,7 +686,7 @@ class Simulation:
 
         return self
 
-    def __repr__(self) -> str:
+    def __repr__(self: "Simulation") -> str:
         """:returns: A short summary of how far this simulation has been set up."""
         bits = []
         if self.beam_mesh is not None:

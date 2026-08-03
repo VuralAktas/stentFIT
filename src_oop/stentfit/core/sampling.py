@@ -6,7 +6,7 @@ import os
 from sklearn.cluster import DBSCAN
 from skimage.morphology import closing
 
-from ..plotting import plot_points_3d_html, plot_thickness_diagnostics_html
+from .plotting import plot_points_3d_html, plot_thickness_diagnostics_html
 
 
 def compute_pre_stent_size_ratio(
