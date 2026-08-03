@@ -11,3 +11,7 @@
 - Fix Windows install crash when `git` isn't on `PATH` (BeamMe requires it to write commit metadata).
 - `sim_setup.py` functions now accept plain string paths, not just `pathlib.Path`.
 - Replace blocking `fig.show()` in `build_smoketest_pipeline` with a saved HTML file plus a guarded optional interactive view.
+
+## v0.1.2 (05/08/2026)
+
+- The pipeline is now driven by three classes which are `Stent`, `Artery` and `Simulation`, instead of the previous module-level functions but outputs are unchanged.

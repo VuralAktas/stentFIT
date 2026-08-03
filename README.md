@@ -35,9 +35,26 @@ conda activate env_stentfit
 poetry install                        # installs stentfit + all dependency groups
 ```
 
-This path pulls `git` in automatically via `environment.yml`, and also gives you the example notebooks, tests, and locked dependency versions (`poetry.lock`) matching the rest of the project.
+This path pulls `git` in automatically via `environment.yml`, and also gives you the example notebooks and locked dependency versions (`poetry.lock`) matching the rest of the project.
 
 ## What it does & How to use it
+
+```python
+from stentfit import Stent, Artery, Simulation
+
+# 1. STL -> 1D spline wireframe
+stent = Stent(stl_file="stent01.stl", stent_name="stent01", output_dir="outputs/stent01")
+stent.skeletonize()
+
+# 2. A test artery sized to that stent
+artery = Artery(stent, artery_type="curved")
+
+# 3. Warp, tie, check, and write the 4C input
+sim = Simulation(stent, artery, sim_input_dir="outputs/simulation")
+sim.setup()
+```
+
+Just note that, this example is just a simplified version of the full workflow. Each call runs a fixed sequence of steps, and every step is also callable on its own — see [Workflows](https://stentfit.readthedocs.io/en/latest/workflow.html) for the breakdown.
 
 **1. Stent skeletonisation** ([`examples/stent_skeleton.ipynb`](examples/stent_skeleton.ipynb))
 
