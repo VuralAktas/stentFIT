@@ -64,20 +64,16 @@ class Artery:
                  artery_type: str = "straight",
                  inner_margin: float = 0.5,
                  wall_thickness: float = 0.5,
-                 noise_amplitude: float = 0.15,
+                 noise_amplitude: float = 0.05,
                  noise_seed: float = 0,
                  bend_angle_deg: float = 180.0,
                  mesh_type: str = "HEX8",
                  artery_youngs: float = 2.0,
                  n_circumference: int = 64,
                  n_axial: int = 150):
-        # What each shape needs, as (length factor, widest arc radius in mm):
-        #   length factor - how much longer than the stent the artery is built,
-        #     so its clamped inlet/outlet ends sit clear of the stent. An S-bend
-        #     needs more again, because its two arcs eat into the straight runs.
-        #   widest arc radius - caps how gentle a bend may get. Without it a
-        #     shallow bend angle produces an arc so wide the artery is visually
-        #     straight. None for a straight artery, which has no arc.
+        # Per shape: (length as a multiple of the stent, widest arc radius in mm).
+        # The multiple keeps the clamped ends clear of the stent; the cap stops a
+        # shallow bend angle producing an arc so wide the artery looks straight.
         shapes = {"straight": (1.5, None),
                   "curved":   (1.5, 20.0),
                   "s_bend":   (2.0, 15.0)}
