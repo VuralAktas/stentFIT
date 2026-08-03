@@ -1,7 +1,3 @@
-"""
-The :class:`Stent` class: an STL stent design carried through skeletonisation.
-"""
-
 import os
 import re
 import shutil

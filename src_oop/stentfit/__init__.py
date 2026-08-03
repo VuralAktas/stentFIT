@@ -1,20 +1,3 @@
-"""
-stentFIT — semi-automated virtual stent implantation via contact simulation.
-
-Object-oriented API built around three domain classes:
-
-* :class:`~stentfit.stent.Stent` — an STL stent design through sampling, ring
-  detection, 2D/3D skeletonisation, and spline fitting.
-* :class:`~stentfit.artery.Artery` — a parametric test artery surface and its
-  GMSH-meshed 3D wall solid.
-* :class:`~stentfit.simulation.Simulation` — composes the two into a runnable
-  4C beam-to-solid input.
-
-Everything else in the package is module-level functions: the numerical
-kernels in :mod:`stentfit.core` and the Plotly views in
-:mod:`stentfit.core.plotting`.
-"""
-
 from .stent import Stent
 from .artery import Artery
 from .simulation import Simulation

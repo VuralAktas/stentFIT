@@ -1,7 +1,3 @@
-"""
-The :class:`Artery` class: a parametric test artery and its 3D wall solid.
-"""
-
 from pathlib import Path
 
 import numpy as np

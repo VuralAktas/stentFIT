@@ -1,13 +1,3 @@
-"""
-Artery geometry kernels: parametric surface generation and GMSH solid meshing.
-
-Pure functions re-homed unchanged from the procedural package's
-``artery_generate.py`` (centreline + tube-surface construction) and
-``artery_mesh.py`` (GMSH volume meshing, BeamMe import, beam-to-solid assembly).
-The :class:`~stentfit.artery.Artery` and :class:`~stentfit.simulation.Simulation`
-classes call these; the functions themselves hold no state.
-"""
-
 import numpy as np
 import trimesh
 import gmsh

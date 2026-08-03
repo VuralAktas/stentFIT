@@ -1,7 +1,3 @@
-"""
-The :class:`Simulation` class: composes a stent and an artery into a 4C input.
-"""
-
 from pathlib import Path
 
 import numpy as np
