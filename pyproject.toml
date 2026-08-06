@@ -5,10 +5,28 @@ build-backend = "poetry.core.masonry.api"
 [tool.poetry]
 name = "stentfit"
 version = "0.1.2"
-description = "Semi-automated virtual stent implantation via contact simulation"
+description = "Semi-automated Pipeline for Virtual Stent Implantation with Mixed-Dimensional Modelling"
 authors = ["Vural Aktas <vural.aktas@rwth-aachen.de>"]
 license = "MIT"
 readme = "README.md"
+homepage = "https://github.com/VuralAktas/stentFIT"
+repository = "https://github.com/VuralAktas/stentFIT"
+documentation = "https://stentfit.readthedocs.io"
+keywords = ["stent", "biomechanics", "finite-element", "beam-to-solid",
+            "mesh-generation", "cardiovascular", "4C", "simulation",
+            "mixed-dimensional", "semi-automated", "pipeline", "stent-implantation", 
+            "virtual-stent-implantation", "skeletonization"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Healthcare Industry",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Scientific/Engineering :: Medical Science Apps.",
+    "Operating System :: OS Independent",
+]
+
+
+
 
 [tool.poetry.dependencies]
 python = ">=3.13,<3.14" # capped to match BeamMe's supported Python range
