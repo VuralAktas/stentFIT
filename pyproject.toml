@@ -4,10 +4,10 @@ build-backend = "poetry.core.masonry.api"
 
 [tool.poetry]
 name = "stentfit"
-version = "0.1.2"
+version = "0.1.3"
 description = "Semi-automated Pipeline for Virtual Stent Implantation with Mixed-Dimensional Modelling"
 authors = ["Vural Aktas <vural.aktas@rwth-aachen.de>"]
-license = "MIT"
+license = "GPL-3.0-or-later"
 readme = "README.md"
 homepage = "https://github.com/VuralAktas/stentFIT"
 repository = "https://github.com/VuralAktas/stentFIT"

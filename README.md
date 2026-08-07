@@ -1,6 +1,8 @@
 # stentFIT
 
 [![Documentation Status](https://readthedocs.org/projects/stentfit/badge/?version=latest)](https://stentfit.readthedocs.io/en/latest/?badge=latest)
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
+[![ORCID](https://img.shields.io/badge/ORCID-0009--0000--3181--7695-A6CE39?logo=orcid&logoColor=white)](https://orcid.org/0009-0000-3181-7695)
 
 Semi-automated virtual stent implantation with mixed-dimensional modelling
 
@@ -84,7 +86,26 @@ This confirms that the stent-to-artery mapping and the 4C input generation work 
 
 ## License
 
-`stentfit` was created by Vural Aktas. It is licensed under the terms of the MIT license.
+`stentfit` was created by Vural Aktas. It is licensed under the terms of the **GNU General Public License v3.0 or later** (GPL-3.0-or-later). See [LICENSE](LICENSE) for the full text.
+
+Releases up to and including `v0.1.2` were published under the MIT license and remain available under those terms.
+
+## Citation
+
+Author: **Vural Aktas**, RWTH Aachen University — ORCID [0009-0000-3181-7695](https://orcid.org/0009-0000-3181-7695)
+
+If `stentFIT` contributes to work you publish, please cite it. GitHub's **Cite this repository** button (repo sidebar) generates APA and BibTeX entries from [`CITATION.cff`](CITATION.cff), or use:
+
+```bibtex
+@software{aktas_stentfit,
+  author  = {Aktas, Vural},
+  title   = {{stentFIT}: Semi-Automated Virtual Stent Implantation with
+             Mixed-Dimensional Modelling},
+  year    = {2026},
+  version = {0.1.3},
+  url     = {https://github.com/VuralAktas/stentFIT}
+}
+```
 
 ## Contributing
 
