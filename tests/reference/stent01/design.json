@@ -1,0 +1,6 @@
+{
+  "note": "These numbers come from the stent01 design itself, not from any pipeline run. They are the only expected values in the whole test suite that we know are right without trusting the code. Never change them to make a test pass. If a test fails, the pipeline is what is wrong.",
+
+  "n_rings": 10,
+  "n_curves": 135
+}

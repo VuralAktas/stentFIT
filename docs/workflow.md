@@ -53,7 +53,7 @@ graph LR
     S[["Stent(stl_file,<br/>stent_name,<br/>output_dir)"]] --> P1 --> P2 --> P3 --> D[["splines ready<br/>for meshing"]]
 ```
 
-**Phase 1 — {py:meth}`~stentfit.stent.Stent.skeletonize_2d`**
+**Phase 1 - {py:meth}`~stentfit.stent.Stent.skeletonize_2d`**
 
 | Step | Fills in | Writes |
 |---|---|---|
@@ -62,7 +62,7 @@ graph LR
 | {py:func}`~stentfit.core.skeleton_2d.skeletonize_rings_2d` | `ring_2d`, `ring_order` | `skeleton_plots/ring_XX.html`, `ring_XX_convergence.html`, `ring_XX_2d.csv` |
 | {py:meth}`~stentfit.stent.Stent.save_checkpoint` | | `ring_2d.pkl` |
 
-**Phase 2 — {py:meth}`~stentfit.stent.Stent.edit_and_assemble`**
+**Phase 2 - {py:meth}`~stentfit.stent.Stent.edit_and_assemble`**
 
 | Step | Fills in | Writes |
 |---|---|---|
@@ -74,7 +74,7 @@ the skeleton is lifted to 3D. After a kernel restart,
 {py:meth}`~stentfit.stent.Stent.load` rebuilds the object from `ring_2d.pkl`
 and you can carry on from here without recomputing phase 1.
 
-**Phase 3 — {py:meth}`~stentfit.stent.Stent.finalize`**
+**Phase 3 - {py:meth}`~stentfit.stent.Stent.finalize`**
 
 | Step | Fills in | Writes |
 |---|---|---|

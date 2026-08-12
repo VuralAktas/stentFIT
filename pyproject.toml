@@ -59,3 +59,11 @@ docs = [
     "sphinx-rtd-theme (>=3.1.0,<4.0.0)",
     "sphinxcontrib-mermaid (>=2.1.0,<3.0.0)"
 ]
+test = [
+    "pytest (>=8.0.0,<10.0.0)"
+]
+
+
+[tool.pytest.ini_options]
+# So that plain `pytest` from the repository root finds the suite.
+testpaths = ["tests"]

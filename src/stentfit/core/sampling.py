@@ -181,17 +181,17 @@ def preprocess_stent(
         z_cyl   = z_cyl[band_keep]'''
 
         # Hard axial clamp for this stent
-        pts     = pts[z_cyl > -9.8]
-        shifted = shifted[z_cyl > -9.8]
-        r       = r[z_cyl > -9.8]
-        theta   = theta[z_cyl > -9.8]
-        z_cyl   = z_cyl[z_cyl > -9.8]
+        pts     = pts[z_cyl > -8.4567] #put -9.8 or -8.4567
+        shifted = shifted[z_cyl > -8.4567]
+        r       = r[z_cyl > -8.4567]
+        theta   = theta[z_cyl > -8.4567]
+        z_cyl   = z_cyl[z_cyl > -8.4567]
 
-        pts     = pts[z_cyl < 10.1]
-        shifted = shifted[z_cyl < 10.1]
-        r       = r[z_cyl < 10.1]
-        theta   = theta[z_cyl < 10.1]
-        z_cyl   = z_cyl[z_cyl < 10.1]
+        pts     = pts[z_cyl < 8.6572] # put 10.1 or 8.6572
+        shifted = shifted[z_cyl < 8.6572]
+        r       = r[z_cyl < 8.6572]
+        theta   = theta[z_cyl < 8.6572]
+        z_cyl   = z_cyl[z_cyl < 8.6572]
 
         print(f"[preprocess] removed supports: {len(pts)} points remain")
 

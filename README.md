@@ -84,6 +84,33 @@ This confirms that the stent-to-artery mapping and the 4C input generation work 
 
 ![Stent beam mesh warped into a curved artery, viewed in ParaView](https://raw.githubusercontent.com/VuralAktas/stentFIT/main/docs/images/paraview_stent_artery.png)
 
+## Tests
+
+Run `pytest` from the repository root. It checks that the pipeline produces the same results as a reference run and that the results are consistent with the stent design.
+
+The tests are grouped by the question they answer.
+
+**1. Did the answer change?** ([`tests/test_reference.py`](tests/test_reference.py))
+
+The files in `tests/reference/stent01/` come from an earlier run that was checked by hand. These tests run the pipeline again and compare. They do not check that the results are correct, only that they are the same as before. If a test in this group fails, either the new results are better than the reference and the reference should be updated, or the code has a bug since it doesn't match the reference anymore.
+
+**2. Does the answer make sense?** ([`tests/test_consistency.py`](tests/test_consistency.py))
+
+These check things that must be true for any correct skeleton of any stent:
+
+- The skeleton is a proper graph. Connections go both ways, no point links to itself, and the stored degree matches the real number of neighbours.
+- `r` and `theta` agree with `x` and `y`, and no point lies outside the stent wall.
+- The measured numbers agree with their own definitions, such as `strut_thickness == r_outer - r_inner`.
+- Every fitted curve is a valid B-spline, meaning `knots == control points + degree + 1`.
+
+These use no reference file. Deleting `tests/reference/` would not change a single one of them.
+
+**3. Is it the right stent?** ([`tests/test_design.py`](tests/test_design.py))
+
+The stent01 design has 10 rings and 135 struts. Those two numbers live in `tests/reference/stent01/design.json` and come from inspecting the design, not from the pipeline. They are the only expected values in the suite that do not depend on the code being right.
+
+Note: There are only tests for the skeletonisation process, not for the simulation. The first reason is that the skeletonisation is the part that this package actually contributes, so it is the part worth testing. If the wireframe is wrong, the beam mesh is wrong and the simulation is meaningless, no matter how correct the rest of the chain is. The simulation setup mostly assembles GMSH, BeamMe and 4C, and those projects test their own code. The second reason is that the simulation part still uses placeholder materials and tied meshtying instead of real contact. Testing it properly means running the real 4C solver and checking the physics, not just checking that an input file was written. That belongs with the deployment physics, which is planned but not implemented.
+
 ## License
 
 `stentfit` was created by Vural Aktas. It is licensed under the terms of the **GNU General Public License v3.0 or later** (GPL-3.0-or-later). See [LICENSE](LICENSE) for the full text.
