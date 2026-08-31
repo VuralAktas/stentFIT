@@ -6,8 +6,10 @@ abstract: >-
   for beam-to-solid contact simulation. It samples the stent surface, detects its
   rings, extracts a 2D skeleton from each ring, wraps that skeleton back onto the
   3D mid-surface, fits a B-spline to each strut curve, and meshes the result into
-  Simo-Reissner beams. It also generates parametric test arteries and writes
-  schema-validated 4C simulation input files.
+  Simo-Reissner beams. From that mesh it writes schema-validated 4C simulation
+  input files, solves them in a pinned container, and measures the stent response.
+  It also generates parametric test arteries and a catheter balloon to expand
+  the stent through contact.
 type: software
 authors:
   - given-names: Vural
@@ -16,8 +18,8 @@ authors:
     affiliation: RWTH Aachen University
     orcid: "https://orcid.org/0009-0000-3181-7695"
 license: GPL-3.0-or-later
-version: 0.1.3
-date-released: "2026-08-07"
+version: 0.2.0
+date-released: "2026-08-31"
 repository-code: "https://github.com/VuralAktas/stentFIT"
 url: "https://stentfit.readthedocs.io"
 keywords:

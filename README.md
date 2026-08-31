@@ -176,7 +176,7 @@ If `stentFIT` contributes to work you publish, please cite it. GitHub's **Cite t
   title   = {{stentFIT}: Semi-Automated Virtual Stent Implantation with
              Mixed-Dimensional Modelling},
   year    = {2026},
-  version = {0.1.3},
+  version = {0.2.0},
   url     = {https://github.com/VuralAktas/stentFIT}
 }
 ```
