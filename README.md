@@ -8,9 +8,9 @@ Semi-automated virtual stent implantation with mixed-dimensional modelling
 
 Full documentation, including the API reference and workflow diagrams, is hosted at [stentfit.readthedocs.io](https://stentfit.readthedocs.io/en/latest/).
 
-`stentFIT` turns a stent surface mesh (`.stl`) into a 1D beam-element model that is ready for beam-to-solid contact simulation. It samples the stent surface, detects its rings, extracts a 2D skeleton from each ring, wraps that skeleton back onto the 3D mid-surface, fits a B-spline to each strut curve, and meshes the result into Simo–Reissner beams with [BeamMe](https://beamme-py.github.io/beamme/).
+`stentFIT` turns a stent surface mesh (`.stl`) into a 1D beam-element model and then into a runnable simulation. It samples the stent surface, detects its rings, extracts a 2D skeleton from each ring, wraps that skeleton back onto the 3D mid-surface, fits a B-spline to each strut curve, and meshes the result into Simo–Reissner beams with [BeamMe](https://beamme-py.github.io/beamme/). From that mesh it writes a schema-validated [4C](https://github.com/4C-multiphysics/4C) input file, solves it in Docker, and measures what came out.
 
-Extracting the 1D wireframe is semi-automated, so you can check the intermediate steps and edit them by hand if you need to. Ring detection and 2D skeletonisation are the two steps where this matters most. There is also a smoke test that checks the quality of the 1D stent model inside a generated pipe-like 3D vessel.
+Extracting the 1D wireframe is semi-automated, so the intermediate steps can be checked and edited by hand. Ring detection and 2D skeletonisation are the two steps where that matters most, and both write their own inspectable files as they go.
 
 ## Installation
 
@@ -27,7 +27,7 @@ conda install -c conda-forge git
 pip install stentfit
 ```
 
-`pip` installs the core dependencies for you, such as `beamme` (stent beam meshing and artery solid meshing), `gmsh` (artery solid meshing) and `fourcipp`. To actually run the generated simulation input files you also need a compiled **4C** executable, which is not included in this package.
+`pip` installs the core dependencies for you, such as `beamme` (stent beam meshing and artery solid meshing), `gmsh` (artery solid meshing) and `fourcipp`. Solving the generated input files needs **4C**, which is not part of this package and comes from Docker instead, as described below.
 
 **Option B: clone the repo and start developing**
 
@@ -41,24 +41,40 @@ poetry install                        # installs stentfit + all dependency group
 
 This way `git` comes in automatically through `environment.yml`. You also get the example notebooks and the locked dependency versions (`poetry.lock`) that match the rest of the project.
 
+**To run the simulations you also need Docker**
+
+The skeletonisation needs nothing beyond the package. Solving does, because 4C is Linux-only, and `stentFIT` runs it inside a pinned container so there is no 4C to install and nothing to compile:
+
+| | |
+|---|---|
+| Docker Desktop 4.x (macOS / Windows) or Docker Engine (Linux) | 4C runs inside it |
+| about 6 GB of free disk | the image, which lives in Docker's VM and not in this repo |
+| Rosetta, on Apple Silicon | the image is amd64-only, so it runs emulated |
+
+`python -m stentfit.run doctor` checks all of it before you spend a solve finding out something is missing. If you already have 4C compiled, on Linux or on a cluster, you can skip Docker with `RunnerConfig(backend="local", local_executable="/path/to/4C")`.
+
 ## What it does & How to use it
 
 ```python
-from stentfit import Stent, Artery, Simulation
+from stentfit import Simulation, Stent
+from stentfit.sim import StentOnlySettings
 
 # 1. STL -> 1D spline wireframe
 stent = Stent(stl_file="stent01.stl", stent_name="stent01", output_dir="outputs/stent01")
 stent.skeletonize()
 
-# 2. A test artery sized to that stent
-artery = Artery(stent, artery_type="curved")
+# 2. Build a 4C input for it
+sim = Simulation(stent, sim_type="stent_only", settings=StentOnlySettings(),
+                 output_dir="outputs/simulation")
+sim.build_input()
+sim.check()
 
-# 3. Warp, tie, check, and write the 4C input
-sim = Simulation(stent, artery, sim_input_dir="outputs/simulation")
-sim.setup()
+# 3. Solve it and measure what came out
+sim.run()
+sim.postprocess()
 ```
 
-Just note that this example is a simplified version of the full workflow. Each call runs a fixed sequence of steps, and you can also call every step on its own. See [Workflows](https://stentfit.readthedocs.io/en/latest/workflow.html) for the breakdown.
+This is a simplified version of the full workflow. Each call runs a fixed sequence of steps, and every step can also be called on its own. See [Workflows](https://stentfit.readthedocs.io/en/latest/workflow.html) for the breakdown.
 
 **1. Stent skeletonisation** ([`examples/stent_skeleton.ipynb`](examples/stent_skeleton.ipynb))
 
@@ -71,18 +87,39 @@ Every stage writes its own files into the output directory, so you can check the
 
 ![Unrolled 2D skeleton with per-ring tuning diagnostics](https://raw.githubusercontent.com/VuralAktas/stentFIT/main/docs/images/skeleton_splines_2d.png)
 
-**2. Test artery generation & simulation setup** ([`examples/test_sim_generation.ipynb`](examples/test_sim_generation.ipynb))
+**2. Simulation** ([`examples/simulation_stent_only.ipynb`](examples/simulation_stent_only.ipynb), [`examples/simulation_stent_and_balloon.ipynb`](examples/simulation_stent_and_balloon.ipynb), [`examples/simulation_stent_and_artery.ipynb`](examples/simulation_stent_and_artery.ipynb))
 
-A synthetic/parametric smoke test exercises the full mixed-dimensional chain end-to-end:
+Three simulation types are built from the same beam mesh. They differ in what the second body is and in how the stent is loaded:
 
-- Generate a parametric test artery (straight / curved / S-bend) sized to the stent, and mesh its wall as a 3D solid with GMSH.
-- Warp the stent beam mesh onto the artery centreline.
-- Check beam-to-solid coupling compatibility (stiffness ratio, element-size ratios) and visualize the stent inside the artery via Paraview.
-- Tie the beam mesh to the artery lumen and write a schema-validated 4C simulation input file with a quasi-static radial expansion load.
+| type | second body | how the stent is loaded | interaction |
+|---|---|---|---|
+| `stent_only` | none | prescribed displacement | self-contact |
+| `stent_balloon` | balloon, solid elements | pressure through contact | beam-to-solid contact |
+| `stent_artery` | test artery | radial point force | meshtying |
 
-This confirms that the stent-to-artery mapping and the 4C input generation work end to end. It uses placeholder materials and tied meshtying instead of real contact. The full deployment physics, meaning contact, an HGO-C artery material and elasto-plastic beam bending, is planned but not implemented yet.
+Every type follows the same four steps, and each one writes into its own numbered run folder:
 
-![Stent beam mesh warped into a curved artery, viewed in ParaView](https://raw.githubusercontent.com/VuralAktas/stentFIT/main/docs/images/paraview_stent_artery.png)
+```
+build_input()  ->  check()  ->  run()  ->  postprocess()
+```
+
+- `build_input()` meshes the stent, welds its crowns, adds the second body and the boundary conditions, and writes a `.4C.yaml` that is validated against 4C's own schema. Alongside it goes a `run_parameters.yaml` recording every parameter behind that input, written at build time so a run that later fails is still identifiable.
+- `check()` reports the beam-to-solid coupling, following Steinbrecher et al. A build that breaks those rules is refused rather than written, because the run would still complete and only the answer would be mesh-dependent.
+- `run()` solves it in the container. Output goes to the screen and to `run.log`, and each run locks its own folder so several can be launched at once.
+- `postprocess()` reads the results back and reduces every load step to the numbers that mean something for a stent: diameter, length, foreshortening, peak strain, recoil, and how close the struts came to yielding.
+
+Long solves belong in a terminal rather than in a notebook cell, so there is a command line for them:
+
+```bash
+python -m stentfit.run doctor                              # check the toolchain
+python -m stentfit.run build  stent_balloon stent01        # write the input
+python -m stentfit.run solve  stent_balloon stent01        # solve the newest run
+python -m stentfit.run report stent_balloon stent01 run001 # measure that one
+```
+
+The animation below is a `stent_balloon` run at 0.6 MPa, over a full inflate-deflate cycle, coloured by displacement magnitude. The balloon opens the stent through contact and both return to their starting shape once the pressure is removed, because these runs use an elastic strut material and an elastic stent cannot keep its new shape.
+
+![Stent opened by an inflating balloon, over a full inflate-deflate cycle](https://raw.githubusercontent.com/VuralAktas/stentFIT/main/docs/images/stent_balloon_deployment.gif)
 
 ## Tests
 
@@ -109,7 +146,17 @@ These use no reference file. Deleting `tests/reference/` would not change a sing
 
 The stent01 design has 10 rings and 135 struts. Those two numbers live in `tests/reference/stent01/design.json` and come from inspecting the design, not from the pipeline. They are the only expected values in the suite that do not depend on the code being right.
 
-Note: There are only tests for the skeletonisation process, not for the simulation. The first reason is that the skeletonisation is the part that this package actually contributes, so it is the part worth testing. If the wireframe is wrong, the beam mesh is wrong and the simulation is meaningless, no matter how correct the rest of the chain is. The simulation setup mostly assembles GMSH, BeamMe and 4C, and those projects test their own code. The second reason is that the simulation part still uses placeholder materials and tied meshtying instead of real contact. Testing it properly means running the real 4C solver and checking the physics, not just checking that an input file was written. That belongs with the deployment physics, which is planned but not implemented.
+**4. Does the simulation input come out right?** ([`tests/test_simulation.py`](tests/test_simulation.py))
+
+Nothing here solves anything, because 4C runs for hours. What is checked is that every simulation type builds an input 4C's own schema accepts, that the shared rules hold, and that the numbers a solved run is measured with mean what they say:
+
+- Every type builds and validates. `dump(validate=True)` is what makes this worth running, since a wrong key fails there instead of being ignored by the solver.
+- The strut section and the coupling limits agree with values worked out by hand, and each coupling rule fails on its own and names itself.
+- The balloon mesh is not inside out, closes without a seam, sits at the radii it was asked for, and its two fibre families are perpendicular.
+- Settings round-trip through a record, including one written by an older version, and setting one field does not move another.
+- Run folders are claimed atomically and locked, so several terminals can build and solve at once without colliding.
+
+Whether the physics is right is a different question, and that needs solved runs compared against the literature rather than a test suite.
 
 ## License
 

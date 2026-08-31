@@ -124,83 +124,151 @@ clamped ends sit clear of the stent, and any bend radius is picked so the arc
 spans most of that length.
 
 Note that the constructor builds only the wall **surface**, which is a trimesh
-tube. The finite-element solid that 4C actually solves on comes from
-{py:meth}`~stentfit.artery.Artery.mesh_solid`, and
-{py:meth}`~stentfit.simulation.Simulation.setup` calls that for you.
+tube. The finite-element solid that 4C solves on comes from
+{py:meth}`~stentfit.artery.Artery.mesh_solid`, and the build calls that for you.
 
-## `Simulation`
 
-Composes a stent and an artery into a runnable 4C input.
-{py:meth}`~stentfit.simulation.Simulation.setup` runs the whole chain, and
-every step is also callable on its own.
+## `Balloon`
+
+A catheter balloon sized to sit just inside a stent, and the pressure that
+inflates it. Like `Artery`, it is built against a stent, and
+{py:class}`~stentfit.simulation.Simulation` builds it from the settings, so
+there is one block to read rather than two objects to keep in step.
 
 | Attribute | Holds |
 |---|---|
-| `stent`, `artery` | the two composed objects |
-| `sim_input_dir` | the folder every generated file goes into |
-| `beam_mesh` | the warped stent beam mesh |
-| `full_mesh` | the combined beam and solid mesh |
-| `coupling_report` | the pass/fail checks, including `all_passed` |
+| `stent` | the stent this balloon goes inside |
+| `r_inner`, `r_outer`, `wall` | the resolved dimensions, in mm |
+| `n_circ`, `n_axial` | the element counts, derived from the coupling rule |
+| `solid_yaml` | the path to the 4C solid, `None` until `mesh_solid` has run |
 
-Only the last three are results; the rest are what you passed in. Nothing is
-copied from the composed objects, so the stent features are read through as
-`sim.stent.stent_features` and the solid path as `sim.artery.solid_yaml`.
+The balloon is driven by a follower pressure on its inner surface with its ends
+on springs, so the radius it reaches is an outcome of the solve rather than
+something imposed. Its outer surface is what the stent touches.
+
+| Step | Fills in | Writes |
+|---|---|---|
+| {py:class}`~stentfit.balloon.Balloon` constructor | the material and loading settings | |
+| {py:meth}`~stentfit.balloon.Balloon.mesh_solid` | `r_inner`, `r_outer`, `n_circ`, `n_axial`, `solid_yaml` | `balloon.4C.yaml` |
+| {py:meth}`~stentfit.balloon.Balloon.add_pressure` | | the pressure condition, into the mesh |
+| {py:meth}`~stentfit.balloon.Balloon.add_end_springs` | | the end supports, into the mesh |
+
+The two length scales come from different places. The in-plane element size
+follows from the coupling rule, so the number of elements around and along the
+tube is set by the stent's strut thickness. The wall thickness is a property of
+the balloon itself, and it is much thinner than an element is wide.
+
+The balloon is placed against the stent's **measured** innermost strut surface,
+not against the averaged `r_inner` from the features file, because how far the
+innermost node sits inside that average changes from stent to stent.
+
+## `Simulation`
+
+One stent, one simulation type, from input file to measured result. Three types
+are available, and they all behave the same way.
+
+| Attribute | Holds |
+|---|---|
+| `stent`, `settings`, `runner` | what you passed in |
+| `sim_type` | `"stent_only"`, `"stent_balloon"` or `"stent_artery"` |
+| `output_dir` | the root, with the type and the stent name appended |
+| `balloon` | built from the settings, for `stent_balloon` only |
+| `artery` | the artery, required by `stent_artery` |
+| `built` | what {py:meth}`~stentfit.simulation.Simulation.build_input` produced, one dict per written input |
+| `runs` | what {py:meth}`~stentfit.simulation.Simulation.run` produced, by case name |
+
+Every parameter of a simulation lives in one flat settings class per type, in
+{py:mod}`stentfit.sim.settings`. Nothing is shared between the types, so setting
+one field never moves another.
 
 ```{mermaid}
-graph TD
-    I[["Simulation(stent, artery,<br/>sim_input_dir)"]] --> A[align]
-    A --> B[mesh_artery]
-    B --> C[assemble]
-    C --> D[export_paraview]
-    D --> E[check_coupling]
-    E -->|all_passed| F[write_input]
-    E -.->|fails| X([skip: fix element sizes or moduli])
+graph LR
+    S[["Stent<br/>(skeletonised)"]] --> I[["Simulation(stent,<br/>sim_type,<br/>settings)"]]
+    I --> B[build_input]
+    B --> C[check]
+    C --> R[run]
+    R --> P[postprocess]
+    B --> F[["runNNN/<br/>input .4C.yaml<br/>run_parameters.yaml"]]
+    P --> M[["results/<br/>metrics.csv<br/>summary.yaml"]]
+    I -.->|from_run| B
 ```
 
 | Step | Fills in | Writes |
 |---|---|---|
-| {py:meth}`~stentfit.simulation.Simulation.print_stent_summary` | | |
-| {py:meth}`~stentfit.simulation.Simulation.align` | `beam_mesh` | `stent_warped.4C.yaml` |
-| {py:meth}`~stentfit.simulation.Simulation.mesh_artery` | `artery.solid_yaml` | `artery_solid.4C.yaml` |
-| {py:meth}`~stentfit.simulation.Simulation.assemble` | `full_mesh` | `artery_stent.4C.yaml` |
-| {py:meth}`~stentfit.simulation.Simulation.export_paraview` | | `artery_stent_mesh_beam.vtu`, `artery_stent_mesh_solid.vtu` |
-| {py:meth}`~stentfit.simulation.Simulation.check_coupling` | `coupling_report` | |
-| {py:meth}`~stentfit.simulation.Simulation.plot_overview` | | `stent_artery_view.html` |
-| {py:meth}`~stentfit.simulation.Simulation.write_input` | | `simulation.4C.yaml` |
+| {py:meth}`~stentfit.simulation.Simulation.build_input` | `built` | `<case>.4C.yaml`, `*_mesh.vtu`, `run_parameters.yaml`, `runs_summary.csv` |
+| {py:meth}`~stentfit.simulation.Simulation.check` | | |
+| {py:meth}`~stentfit.simulation.Simulation.find_runs` | `built`, from disk | |
+| {py:meth}`~stentfit.simulation.Simulation.run` | `runs` | `run.log`, `out_*/` |
+| {py:meth}`~stentfit.simulation.Simulation.postprocess` | | `results/metrics.csv`, `results/summary.yaml`, `results/balloon_profile.csv` |
 
-{py:meth}`~stentfit.simulation.Simulation.align` meshes the straight stent as
-beams with {py:func}`~stentfit.core.splines.mesh_skeleton_beams`, then warps it
-onto the artery centreline.
-{py:meth}`~stentfit.simulation.Simulation.assemble` ties the beams to the lumen
-surface with {py:func}`~stentfit.core.artery_geom.import_artery_solid` and
-{py:func}`~stentfit.core.artery_geom.assemble_beam_solid`.
+`build_input` is the only step that creates a folder. `find_runs` is what lets
+`run` and `postprocess` work on a folder that already exists, so the run that
+was built, with the parameters that were set, is the one that gets solved.
+{py:meth}`~stentfit.simulation.Simulation.from_run` goes further and rebuilds
+the whole `Simulation` from a finished run's own record, which is how a study
+changes one parameter and compares.
 
-`write_input` only runs when all three coupling checks pass, because an input
-file that breaks the mixed-dimensional assumptions should not look runnable.
+### The three simulation types
+
+Each one is a module in {py:mod}`stentfit.sim.cases`, and none of them knows
+about the others. Everything they share lives in {py:mod}`stentfit.sim`: the
+meshing, the materials, the coupling rules, the runner and the run record.
+
+| | `stent_only` | `stent_balloon` | `stent_artery` |
+|---|---|---|---|
+| Second body | none | balloon, solid elements | test artery |
+| How the stent is loaded | prescribed displacement | pressure through contact | radial point force |
+| Interaction | self-contact | beam-to-solid contact | meshtying |
+| Settings class | {py:class}`~stentfit.sim.settings.StentOnlySettings` | {py:class}`~stentfit.sim.settings.StentBalloonSettings` | {py:class}`~stentfit.sim.settings.StentArterySettings` |
+
+`stent_only` has two load cases. Radial expansion drives every centreline node
+outwards and leaves the axial direction free, so the foreshortening comes out as
+a result rather than being imposed. Axial stretch clamps a band at each end and
+pulls, so the stent necks in through the gauge length as a test specimen does.
 
 ### Element sizing
 
 Both factors are relative to the stent's strut thickness, and their ratio is
-what {py:meth}`~stentfit.simulation.Simulation.check_coupling` tests:
+what {py:func}`~stentfit.sim.coupling.check_coupling` tests:
 
 ```
 solid_element_size = strut_thickness × factor_solid
 beam_element_size  = strut_thickness × factor_solid × factor_beam
 ```
 
-They are read-only properties, so they always follow the stent rather than
-drifting from it.
+`stent_only` is the exception. It has no solid to couple to, so its element
+length comes from `l_el_per_strut` directly.
 
 ### Coupling checks
 
 Following Steinbrecher et al., where the beam is one stent strut and the solid
-is the artery wall:
+is the artery wall or the balloon:
 
 | # | Check | Criterion |
 |---|---|---|
 | 1 | Stiffness ratio | `E_beam / E_solid ≥ 10` |
-| 2 | Rule of thumb | `L_solid ≥ D_beam` |
+| 2 | Solid element vs beam diameter | `L_solid ≥ D_beam`, in the plane of the coupled surface |
 | 3 | Element length ratio | `L_beam / L_solid` within `[1, 8]`, optimal `[1, 6]` |
+
+The lengths are checked at both ends of the measured distribution rather than
+against the target, because the mesher divides each strut into a whole number of
+elements and what comes out scatters around what was asked for.
+
+Breaking a rule is not a solver failure. The run would complete and hand back a
+mesh-dependent answer, so nothing downstream would catch it. That is why the
+build refuses to write an input that violates them.
+
+### Running from a terminal
+
+Long solves belong in a terminal rather than in a notebook cell, and several can
+run at once, because each run locks its own folder:
+
+```bash
+python -m stentfit.run doctor
+python -m stentfit.run build  stent_balloon stent01
+python -m stentfit.run solve  stent_balloon stent01 --cpus 4
+python -m stentfit.run report stent_balloon stent01 run001
+```
 
 See the [README](index.md) for what each output file contains, and the
 {doc}`API reference <autoapi/index>` for full signatures.
