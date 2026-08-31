@@ -1,696 +1,481 @@
+"""
+The one entry point: pick a simulation type, build it, run it, measure it.
+
+    sim = Simulation(stent, sim_type="stent_only", settings=StentOnlySettings())
+    sim.build_input(cases=["radial_expand"])
+    sim.run()
+    sim.postprocess()
+
+Three types are available. ``stent_only`` drives every beam node by prescribed displacement,
+``stent_balloon`` opens the stent through contact with a balloon, and ``stent_artery`` ties it into
+a test artery with meshtying. Each one is a module in :mod:`stentfit.sim.cases`, and none of them
+knows about the others.
+
+Everything they share lives in :mod:`stentfit.sim`: the meshing, the materials, the coupling rules,
+the runner and the run record.
+"""
+
 from pathlib import Path
 
-import numpy as np
-from plotly import graph_objects as go
-from plotly import io as pio
-from scipy.spatial import cKDTree
+import yaml
 
-from beamme.core.boundary_condition import BoundaryCondition
-from beamme.core.conf import bme
-from beamme.core.function import Function
-from beamme.core.geometry_set import GeometrySet
-from beamme.core.rotation import Rotation
-from beamme.cosserat_curve.cosserat_curve import CosseratCurve
-from beamme.cosserat_curve.warping_along_cosserat_curve import warp_mesh_along_curve
-from beamme.four_c.header_functions import (set_beam_to_solid_meshtying,
-                                            set_header_static,
-                                            set_runtime_output)
-from beamme.four_c.input_file import InputFile
-
-from .artery import Artery
+from .sim import beam_model as bm
+from .sim import results as _results
+from .sim.materials import section_properties
+from .sim.settings import (SETTINGS_CLASSES, default_settings, resolve_strut_thickness,
+                           settings_from_dict, settings_to_dict)
+from .sim.cases import BuildContext, get_builder
+from .sim.coupling import print_coupling
+from .sim.record import (plain, read_run_parameters, update_run_results, write_run_index,
+                         write_run_parameters, write_text_atomic)
+from .sim.runner import FourCRunner, RunnerConfig
 from .stent import Stent
-from .core import artery_geom as _geom
-from .core import splines as _splines
+
+#: Where results go by default, next to the skeletonisation output.
+DEFAULT_OUTPUT_DIR = "examples/data/output/simulation"
+
+#: Header written above every ``results/summary.yaml``.
+_SUMMARY_HEADER = ("# Headline results for one 4C run, written by stentFIT.\n"
+                   "#\n"
+                   "# The full per-step history is in metrics.csv beside this file.\n\n")
 
 
-def _radial_directions(points: np.ndarray, artery_cl: np.ndarray) -> np.ndarray:
+def _balloon_arg(record: dict):
     """
-    Find each point's outward radial direction relative to a centreline.
+    The balloon geometry the result measurements need, pulled out of a run record.
 
-    For each point, the nearest centreline point is found (KD-tree), and the
-    vector from that centreline point to the point has its tangent component
-    projected out — leaving only the component perpendicular to the centreline,
-    normalised to a unit vector. Used to point the balloon expansion force
-    straight out from the artery's local axis at each stent node, however the
-    artery bends.
-
-    :param points: ``(n, 3)`` points to find the radial direction at.
-    :param artery_cl: Artery centreline points.
-    :returns: ``(n, 3)`` unit vectors, each point's outward radial direction.
+    :param record: A parsed ``run_parameters.yaml``.
+    :returns: ``{"r_inner": mm, "r_outer": mm}``, or ``None`` for a type with no balloon.
     """
-    artery_cl = np.asarray(artery_cl, dtype=float)
-    tang = np.gradient(artery_cl, axis=0)
-    tang /= np.linalg.norm(tang, axis=1, keepdims=True)
+    balloon = record.get("balloon") or {}
+    if "r_inner_mm" not in balloon or "r_outer_mm" not in balloon:
+        return None
+    return {"r_inner": float(balloon["r_inner_mm"]), "r_outer": float(balloon["r_outer_mm"])}
 
-    _, idx = cKDTree(artery_cl).query(points)
-    radial = points - artery_cl[idx]
-    radial -= np.einsum("ij,ij->i", radial, tang[idx])[:, None] * tang[idx]
-    norm = np.linalg.norm(radial, axis=1, keepdims=True)
-    norm[norm < 1e-12] = 1.0
-    return radial / norm
+
+def _pressure_arg(record: dict):
+    """
+    The load profile the ``pressure_MPa`` column needs, pulled out of a run record.
+
+    Taken from the record rather than from ``self.settings`` so that re-measuring an old run
+    reports the pressure that run was actually built with.
+
+    :param record: A parsed ``run_parameters.yaml``.
+    :returns: ``{"max": MPa, "expression": str}``, or ``None`` for a run with no balloon pressure.
+    """
+    balloon = record.get("balloon") or {}
+    loading = record.get("loading") or {}
+    if "pressure_max_MPa" not in balloon:
+        return None
+    expression = loading.get("scale_of_t") or balloon.get("load_expression")
+    if not expression:
+        return None
+    return {"max": float(balloon["pressure_max_MPa"]), "expression": str(expression)}
+
+
+#: Files a run writes alongside its input: the separate bodies, and the warped stent. They are 4C
+#: inputs in their own right, but none of them is the file the run solves.
+INTERMEDIATE_INPUTS = ("balloon.4C.yaml", "artery_solid.4C.yaml", "artery_stent.4C.yaml",
+                       "stent_warped.4C.yaml")
+
+
+def _sole_input(run_dir: Path) -> Path:
+    """
+    Work out which ``.4C.yaml`` in a folder is the one 4C solves.
+
+    Only needed for folders built before the run record started naming it. Records written now
+    carry an ``input`` block, and this is not called.
+
+    :param run_dir: The run folder.
+    :returns: The input file.
+    :raises FileNotFoundError: If there is not exactly one candidate.
+    """
+    candidates = [p for p in sorted(run_dir.glob("*.4C.yaml"))
+                  if p.name not in INTERMEDIATE_INPUTS]
+    if len(candidates) != 1:
+        raise FileNotFoundError(
+            f"cannot tell which input {run_dir} solves - found {len(candidates)} candidates. "
+            f"Rebuild it, and the record will name the file.")
+    return candidates[0]
 
 
 class Simulation:
     """
-    A mixed-dimensional beam-to-solid simulation setup for one stent and artery.
+    One stent, one simulation type, from input file to measured result.
 
-    Composes a :class:`~stentfit.stent.Stent` and an
-    :class:`~stentfit.artery.Artery` into a runnable 4C input: the stent is
-    meshed as 1D beams and warped onto the artery centreline, the artery wall
-    is meshed as a 3D solid, the two are tied together with BeamMe's mortar
-    beam-to-solid coupling, and — provided the coupling assumptions hold — a
-    static solver header, boundary conditions and a quasi-static radial
-    expansion load are written out::
-
-        artery = Artery(stent, artery_type="curved", inner_margin=0.5)
-        sim = Simulation(stent, artery, "outputs/simulation/input")
-        sim.setup()
-
-    The artery is built first and passed in, so every artery-shape and
-    wall-material knob lives on :class:`~stentfit.artery.Artery` and everything
-    here concerns the stent, the coupling, and the load. Build both against the
-    *same* stent — the constructor rejects a mismatch.
-
-    This is a **smoke test**, not the physics of the reference papers: the
-    artery uses a placeholder ``StVenantKirchhoff`` material, coupling is tied
-    meshtying rather than true contact, and the balloon is a simplified radial
-    point force.
-
-    :param stent: The stent to deploy. Its skeletonisation must have run, since
-        the beam mesh is built from the splines in its output folder.
-    :param artery: The artery to deploy into, already built by
-        :class:`~stentfit.artery.Artery`. Every artery-shape and wall-material
-        parameter lives on that object, not here.
-    :param sim_input_dir: Folder every generated ``.4C.yaml`` and ``.vtu`` is
-        written into.
-    :param stent_youngs: Stent beam Young's modulus, in MPa.
-    :param stent_poisson: Stent beam Poisson's ratio.
-    :param stent_density: Stent beam material density.
-    :param beam_class_label: BeamMe beam element type, either
-        ``'Beam3rHerm2Line3'`` or ``'Beam3rLine2Line2'``.
-    :param factor_solid: Safety factor sizing the artery solid element size
-        relative to the beam diameter.
-    :param factor_beam: Additional safety factor sizing the beam element length
-        beyond ``factor_solid``.
-    :param n_steps: Number of load steps for the balloon expansion ramp.
-    :param expansion_force: Radial point-force magnitude for the balloon expansion.
-    :raises ValueError: If ``artery`` was built for a different stent.
+    :param stent: The stent to simulate. Its skeletonisation must have run.
+    :param sim_type: ``"stent_only"``, ``"stent_balloon"`` or ``"stent_artery"``.
+    :param settings: Every parameter of the simulation, from :mod:`stentfit.sim.settings`.
+        ``None`` uses that type's defaults. Must match ``sim_type``.
+    :param output_dir: Root for results. The type and the stent name are appended, so several
+        types and stents coexist.
+    :param runner: How 4C is launched.
+    :param artery: The artery, required by ``stent_artery``.
+    :param options: Anything else the case accepts.
+    :raises ValueError: If the type is unknown, if the settings are for a different type, or if
+        the artery was built for a different stent.
     """
 
     def __init__(self: "Simulation",
                  stent: Stent,
-                 artery: Artery,
-                 sim_input_dir: str | Path,
-                 stent_youngs: float = 2.0e5,
-                 stent_poisson: float = 0.3,
-                 stent_density: float = 0.0,
-                 beam_class_label: str = "Beam3rHerm2Line3",
-                 factor_solid: float = 1.5,
-                 factor_beam: float = 1.2,
-                 n_steps: int = 10,
-                 expansion_force: float = 1e-4):
-        # An artery sized against a different stent would pass the coupling
-        # checks against one stent and be meshed around another, so catch it here.
-        if artery.stent is not stent:
-            raise ValueError(
-                "this artery was built for a different stent "
-                f"({artery.stent.stent_name!r} vs {stent.stent_name!r}) - build "
-                f"the artery with Artery(stent, ...) using the same stent.")
-
-        # --- composed parts ---
+                 sim_type: str = "stent_only",
+                 settings=None,
+                 output_dir=DEFAULT_OUTPUT_DIR,
+                 runner: RunnerConfig = None,
+                 artery=None,
+                 **options):
+        self.builder = get_builder(sim_type)             # raises early on a bad type
         self.stent = stent
+        self.sim_type = sim_type
+
+        if settings is None:
+            settings = default_settings(sim_type)
+        expected = SETTINGS_CLASSES[sim_type]
+        if not isinstance(settings, expected):
+            raise ValueError(
+                f"sim_type {sim_type!r} needs {expected.__name__}, "
+                f"got {type(settings).__name__} - the two must agree, or half your parameters "
+                f"would be silently ignored")
+
+        self.settings = settings
+        self.runner = runner or RunnerConfig()
+        self.output_dir = Path(output_dir) / sim_type / stent.stent_name
+        self.options = dict(options)
+
+        # The balloon is built from the settings, so the notebook has one block to read rather
+        # than two objects to keep in step.
+        self.balloon = None
+        if sim_type == "stent_balloon":
+            from .balloon import Balloon
+            self.balloon = Balloon(
+                stent, material=settings.balloon_material,
+                clearance_frac=settings.clearance_frac, overhang_frac=settings.overhang_frac,
+                wall=settings.wall, pressure_max=settings.pressure_max,
+                end_spring_stiffness=settings.end_spring_stiffness,
+                load_profile=settings.load_profile,
+                neohooke_youngs=settings.neohooke_youngs,
+                neohooke_poisson=settings.neohooke_poisson,
+                fibre_longitudinal=settings.fibre_longitudinal,
+                fibre_circumferential=settings.fibre_circumferential)
+            self.options["balloon"] = self.balloon
+
+        # An artery built against a different stent would pass the coupling checks against one
+        # stent and be meshed around another, so catch it here rather than at the solve.
         self.artery = artery
-        self.sim_input_dir = Path(sim_input_dir)
+        if artery is not None:
+            if getattr(artery, "stent", stent) is not stent:
+                raise ValueError(
+                    f"this artery was built for a different stent "
+                    f"({artery.stent.stent_name!r} vs {stent.stent_name!r}) - build it with "
+                    f"Artery(stent, ...) using the same stent")
+            self.options["artery"] = artery
 
-        # --- element sizing, both factors relative to the stent's strut ---
-        self.factor_solid = factor_solid
-
-        # --- stent beam material / discretisation ---
-        self.stent_youngs = stent_youngs
-        self.stent_poisson = stent_poisson
-        self.stent_density = stent_density
-        self.beam_class_label = beam_class_label
-        self.factor_beam = factor_beam
-
-        # --- load stepping ---
-        self.n_steps = n_steps
-        self.expansion_force = expansion_force
-
-        # --- data this simulation produces ---
-        self.beam_mesh = None        # warped stent beam mesh (align)
-        self.full_mesh = None        # combined beam + solid mesh (assemble)
-        self.coupling_report = None  # pass/fail checks (check_coupling)
-
-    # ------------------------------------------------------------------
-    # Derived element sizing
-    # ------------------------------------------------------------------
-
-    @property
-    def beam_diameter(self: "Simulation") -> float:
-        """
-        :returns: The beam cross-section diameter — the stent's strut
-            thickness, read straight off the composed stent, in mm.
-        """
-        return self.stent.stent_features["strut_thickness"]
-
-    @property
-    def solid_element_size(self: "Simulation") -> float:
-        """
-        :returns: Target artery solid element size: the beam diameter with the
-            ``factor_solid`` safety factor applied, in mm.
-        """
-        return self.beam_diameter * self.factor_solid
-
-    @property
-    def beam_element_size(self: "Simulation") -> float:
-        """
-        :returns: Target beam element length: the solid element size with the
-            further ``factor_beam`` safety factor applied, in mm.
-        """
-        return self.beam_diameter * self.factor_solid * self.factor_beam
+        #: What :meth:`build_input` produced: one dict per written input.
+        self.built = []
+        #: What :meth:`run` produced, by case name.
+        self.runs = {}
 
     # ------------------------------------------------------------------
     # Steps
     # ------------------------------------------------------------------
 
-    def print_stent_summary(self: "Simulation") -> None:
+    def build_input(self: "Simulation", **options) -> list:
         """
-        Print the stent's key dimensions, as a sanity check before meshing.
+        Build the 4C input files for this simulation.
 
-        The values come from the live :class:`~stentfit.stent.Stent` object, so
-        unlike the procedural pipeline nothing is re-read from
-        ``stent_features.json`` / ``skeleton_points.csv``. A stent restored with
-        :meth:`~stentfit.stent.Stent.load` has no 3D skeleton in memory, so the
-        node count is only printed when it is available.
+        Each case gets its own folder, holding the input, a mesh preview and a
+        ``run_parameters.yaml`` recording every parameter that determined it. The record is
+        written now, not after the solve, so a run that later fails is still identifiable.
+
+        :param options: Extra case options for this call, e.g. ``cases=["radial_expand"]``.
+        :returns: The input files written.
         """
-        f = self.stent.stent_features
-        print(f"Loaded stent result from : {Path(self.stent.output_dir).resolve()}")
-        print(f"Centreline direction     : "
-              f"{np.asarray(self.stent.stent_centerline_direction).round(4)}")
-        print(f"length          : {f['length']:8.3f} mm")
-        print(f"diameter        : {f['diameter']:8.3f} mm")
-        print(f"r_outer         : {f['r_outer']:8.3f} mm")
-        print(f"strut_thickness : {f['strut_thickness']:8.3f} mm")
-        print(f"z range         : [{f['z_min']:.3f}, {f['z_max']:.3f}] mm")
-        print(f"sampled points  : {f['num_points']:,}")
-        if self.stent.skeleton_df is not None:
-            print(f"skeleton nodes  : {len(self.stent.skeleton_df):,}")
+        ctx = BuildContext(
+            stent_dir=Path(self.stent.output_dir),
+            stent_name=self.stent.stent_name,
+            features=bm.load_features(self.stent.output_dir),
+            output_dir=self.output_dir,
+            settings=self.settings, runner=self.runner,
+            options={**self.options, **options})
 
-    def mesh_artery(self: "Simulation") -> Path:
+        self.built = self.builder(ctx)
+
+        for case in self.built:
+            case["record"].setdefault("simulation_type", self.sim_type)
+            case["record"]["runner"] = settings_to_dict(self.runner)
+            write_run_parameters(case["run_dir"], case["record"])
+        if self.built:
+            index = write_run_index(self.output_dir)
+            print(f"\n[saved] {index}   (index of every run for this stent)")
+
+        return [case["input_path"] for case in self.built]
+
+    def find_runs(self: "Simulation", name: str = None) -> list:
         """
-        Mesh the artery wall as a 3D solid, sized to this simulation's stent.
+        Find inputs already on disk, instead of building new ones.
 
-        Thin wrapper over :meth:`~stentfit.artery.Artery.mesh_solid` that fills
-        in the element size (which depends on the stent's strut thickness, so
-        the artery cannot work it out alone) and the output path.
+        This is what solves the folder that was built rather than a fresh one. Building always
+        claims a new folder, so a solve that rebuilt would discard the parameters that were set and
+        quietly test something else.
 
-        :returns: Path to the written ``artery_solid.4C.yaml``.
+        Each run's own ``run_parameters.yaml`` names the file that was written, so nothing here has
+        to know how a simulation type names things.
+
+        :param name: Which folder, e.g. ``"run001"`` or ``"radial_expand"``. ``None`` takes every
+            run that has no results yet, so a folder that already cost hours is never re-solved by
+            accident. Name one to solve it again regardless.
+        :returns: The runs found, in the same shape :meth:`build_input` returns.
+        :raises FileNotFoundError: If nothing has been built for this stent and type, or if the
+            folder you named is not there.
         """
-        return self.artery.mesh_solid(
-            out_path=self.sim_input_dir / "artery_solid.4C.yaml",
-            element_size=self.solid_element_size)
+        folders = []
+        if (self.output_dir / "run_parameters.yaml").exists():
+            folders.append(self.output_dir)          # stent_artery writes into the root itself
+        if self.output_dir.is_dir():
+            folders += [d for d in sorted(self.output_dir.iterdir())
+                        if d.is_dir() and (d / "run_parameters.yaml").exists()]
 
-    def align(self: "Simulation") -> "Simulation":
-        """
-        Mesh the straight stent as beams and warp it onto the artery centreline.
+        if not folders:
+            raise FileNotFoundError(
+                f"no runs built under {self.output_dir} - build one first:\n"
+                f"  python -m stentfit.run build {self.sim_type} {self.stent.stent_name}")
 
-        Builds the beam mesh from the stent's fitted splines, represents the
-        artery centreline as a BeamMe ``CosseratCurve``, then warps the straight
-        stent onto it — rotating the stent's own straight axis onto the curve's
-        tangent, and centring the stent's ``z_min``/``z_max`` mid-point on the
-        curve's arc mid-point. Writes ``stent_warped.4C.yaml``.
-
-        Sets :attr:`beam_mesh`.
-
-        :returns: ``self``, so steps can be chained.
-        """
-        # 1. Build the straight stent as a BeamMe beam mesh from the fitted
-        #    splines in the stent's output folder.
-        self.beam_mesh = _splines.mesh_skeleton_beams(
-            input_dir=str(self.stent.output_dir),
-            l_el=self.beam_element_size,
-            youngs_modulus=self.stent_youngs,
-            poisson_ratio=self.stent_poisson,
-            density=self.stent_density,
-            beam_class_label=self.beam_class_label)
-
-        # 2. Represent the artery centreline as a Cosserat curve.
-        artery_cl = self.artery.centreline
-        curve = CosseratCurve(artery_cl)
-
-        # 3. Warp the straight stent onto the curve.
-        features = self.stent.stent_features
-        ref_rot = Rotation([0.0, 1.0, 0.0], -np.pi / 2.0)   # first basis vector -> +Z
-        total_arc = np.linalg.norm(np.diff(artery_cl, axis=0), axis=1).sum()
-        z_center = 0.5 * (features["z_min"] + features["z_max"])
-        origin = np.array([0.0, 0.0, z_center - total_arc / 2.0])
-
-        warp_mesh_along_curve(self.beam_mesh, curve, origin=origin,
-                              reference_rotation=ref_rot)
-
-        # Save the warped stent beam mesh as a 4C .yaml
-        stent_yaml = self.sim_input_dir / "stent_warped.4C.yaml"
-        stent_input = InputFile()
-        stent_input.add(self.beam_mesh)
-        stent_input.dump(str(stent_yaml), validate=False,
-                         add_footer_application_script=False)
-        print(f"[saved] {stent_yaml}")
-        return self
-
-    def assemble(self: "Simulation",
-                 lumen_surface_index: int = 0,
-                 bc_type=None,
-                 output_filename: str = "artery_stent.4C.yaml") -> "Simulation":
-        """
-        Import the artery solid and tie the stent beam mesh to it, as one 4C input.
-
-        Imports the artery's solid ``.yaml`` (written by
-        :meth:`~stentfit.artery.Artery.mesh_solid`), then couples it to
-        :attr:`beam_mesh` with BeamMe's mortar beam-to-solid method, writing the
-        combined 4C input file. Coupling defaults to tied meshtying; pass
-        ``bme.bc.beam_to_solid_surface_contact`` for a real deployment
-        simulation instead of this smoke test.
-
-        Sets :attr:`full_mesh`.
-
-        :param lumen_surface_index: Index into the artery solid's surface sets
-            for the lumen surface the beams couple to. ``0`` is the lumen
-            (``DSURFACE 1``, written first by the mesher).
-        :param bc_type: BeamMe beam-to-solid coupling type. ``None`` defaults to
-            tied meshtying.
-        :param output_filename: Filename for the assembled 4C input, written
-            into :attr:`sim_input_dir`.
-        :returns: ``self``, so steps can be chained.
-        """
-        if self.artery is None or self.artery.solid_yaml is None:
-            print("No artery solid mesh from the previous step — skipping assembly.")
-            return self
-
-        input_file, solid = _geom.import_artery_solid(self.artery.solid_yaml)
-
-        out_path = self.sim_input_dir / output_filename
-        _, self.full_mesh = _geom.assemble_beam_solid(
-            input_file, solid, self.beam_mesh,
-            lumen_surface_index=lumen_surface_index,
-            # bc_type defaults to beam_to_solid_surface_meshtying; switch to
-            # bme.bc.beam_to_solid_surface_contact for a real deployment run.
-            bc_type=bc_type,
-            output_path=out_path,
-        )
-
-        print(f"Wrote assembled beam-to-solid 4C input file -> {out_path}")
-        print("Next: materials (HGO-C artery), boundary conditions, expansion "
-              "driver, solver, run 4C.")
-        return self
-
-    def export_paraview(self: "Simulation", output_name: str = "artery_stent_mesh") -> tuple | None:
-        """
-        Export the assembled beam+solid mesh as separate ``.vtu`` files for ParaView.
-
-        BeamMe's ``write_vtk`` splits beams and solid elements into two files by
-        itself; this just names them and reports their paths.
-
-        :param output_name: Base filename; ``_beam.vtu`` / ``_solid.vtu`` are appended.
-        :returns: ``None`` if nothing has been assembled yet. Otherwise
-            ``(beam_vtu, solid_vtu)`` — the paths to the two written files.
-        """
-        if self.full_mesh is None:
-            print("No assembled mesh — run assemble() first.")
-            return None
-
-        self.full_mesh.write_vtk(output_name=output_name,
-                                 output_directory=str(self.sim_input_dir))
-        beam_vtu = self.sim_input_dir / f"{output_name}_beam.vtu"
-        solid_vtu = self.sim_input_dir / f"{output_name}_solid.vtu"
-        print(f"[vtk] {beam_vtu}")
-        print(f"[vtk] {solid_vtu}")
-        print("Open the .vtu files in ParaView to inspect the meshes.")
-        return beam_vtu, solid_vtu
-
-    def check_coupling(self: "Simulation",
-                       stiffness_ratio_min: float = 10.0,
-                       length_ratio_min: float = 1,
-                       length_ratio_max: float = 6,
-                       length_ratio_accuracy_max: float = 8.0) -> dict:
-        """
-        Check the mixed-dimensional beam-to-solid coupling assumptions.
-
-        Three checks, following Steinbrecher et al., each independent:
-
-        1. **Stiffness** — the beam must be much stiffer than the solid
-           (``E_beam / E_solid >= stiffness_ratio_min``), since the coupling
-           assumes the solid deforms around an effectively rigid-ish beam.
-        2. **Solid size vs. beam diameter** — the solid element size must be at
-           least the beam's cross-section diameter, the spatial-resolution limit
-           the mortar coupling is only valid above.
-        3. **Element length ratio** — beam elements should be longer than solid
-           elements, but not by too much: a valid band up to
-           ``length_ratio_accuracy_max``, and a narrower optimal band up to
-           ``length_ratio_max``.
-
-        The beam element length is measured from the meshed beams themselves
-        (mean end-to-end chord), not from the requested target.
-
-        Sets :attr:`coupling_report`.
-
-        :param stiffness_ratio_min: Minimum acceptable ``E_beam / E_solid``.
-        :param length_ratio_min: Lower bound of both the valid and optimal
-            ``L_beam / L_solid`` bands.
-        :param length_ratio_max: Upper bound of the optimal band.
-        :param length_ratio_accuracy_max: Upper bound of the valid band, above
-            which coupling accuracy degrades.
-        :raises ValueError: If the beam mesh has not been built yet.
-        :returns: The report dict, one entry per check plus ``all_passed``.
-        """
-        if self.beam_mesh is None:
-            raise ValueError("no beam mesh yet - call align() first.")
-
-        # Actual mean beam element length (chord, end-to-end) from the meshed beams.
-        beam_element_length = float(np.mean([
-            np.linalg.norm(np.asarray(el.nodes[-1].coordinates)
-                           - np.asarray(el.nodes[0].coordinates))
-            for el in self.beam_mesh.elements]))
-
-        beam_youngs = self.stent_youngs
-        solid_youngs = self.artery.artery_youngs
-        beam_diameter = self.beam_diameter
-        solid_element_length = self.solid_element_size
-
-        checks = {}
-
-        # 1. Stiffness ratio ---------------------------------------------------
-        stiff = beam_youngs / solid_youngs if solid_youngs > 0 else float("inf")
-        ok_stiff = stiff >= stiffness_ratio_min
-        checks["stiffness"] = dict(
-            E_beam_MPa=beam_youngs,
-            E_solid_MPa=solid_youngs,
-            ratio=round(stiff, 2),
-            threshold_min=stiffness_ratio_min,
-            passed=bool(ok_stiff),
-            note=(f"E_beam/E_solid = {stiff:.1f} "
-                  f"({'>=' if ok_stiff else '<'} {stiffness_ratio_min}) "
-                  f"- beam {'is' if ok_stiff else 'is NOT'} much stiffer than the solid"),
-        )
-
-        # 2. Solid element size >= beam cross-section diameter -----------------
-        rot = solid_element_length / beam_diameter if beam_diameter > 0 else float("inf")
-        ok_rot = solid_element_length >= beam_diameter
-        checks["solid_size_vs_beam_diameter"] = dict(
-            solid_element_mm=round(solid_element_length, 4),
-            beam_diameter_mm=round(beam_diameter, 4),
-            ratio=round(rot, 2),
-            threshold_min=1.0,
-            passed=bool(ok_rot),
-            note=(f"L_solid/D_beam = {rot:.2f} "
-                  f"({'>=' if ok_rot else '<'} 1) - solid element "
-                  f"{'>=' if ok_rot else '<'} beam cross-section diameter"),
-        )
-
-        # 3. Element length ratio: beam elements long vs solid, but not too long
-        #    Valid band [length_ratio_min, length_ratio_accuracy_max]: below ->
-        #    mortar coupling poorly conditioned; above ~8 -> L2 error grows.
-        lr = (beam_element_length / solid_element_length
-              if solid_element_length > 0 else float("inf"))
-        ok_lr = length_ratio_min <= lr <= length_ratio_accuracy_max
-        within_optimal = length_ratio_min <= lr <= length_ratio_max
-        if lr > length_ratio_accuracy_max:
-            lr_note = (f"L_beam/L_solid = {lr:.2f} (> {length_ratio_accuracy_max}) "
-                       f"- too long: L2 coupling error grows; refine the solid or "
-                       f"coarsen the beam")
-        elif lr < length_ratio_min:
-            lr_note = (f"L_beam/L_solid = {lr:.2f} (< {length_ratio_min}) "
-                       f"- beam elements are NOT fairly long vs solid elements")
-        elif within_optimal:
-            lr_note = (f"L_beam/L_solid = {lr:.2f} - in the optimal "
-                       f"{length_ratio_min}-{length_ratio_max} band")
+        if name is not None:
+            folders = [d for d in folders if d.name == name]
+            if not folders:
+                raise FileNotFoundError(f"no run named {name!r} under {self.output_dir}")
         else:
-            lr_note = (f"L_beam/L_solid = {lr:.2f} - acceptable "
-                       f"(above the {length_ratio_max} optimum, below the "
-                       f"{length_ratio_accuracy_max} accuracy limit)")
-        checks["element_length_ratio"] = dict(
-            beam_element_mm=round(beam_element_length, 4),
-            solid_element_mm=round(solid_element_length, 4),
-            ratio=round(lr, 2),
-            valid_band=(length_ratio_min, length_ratio_accuracy_max),
-            optimal_band=(length_ratio_min, length_ratio_max),
-            within_optimal=bool(within_optimal),
-            passed=bool(ok_lr),
-            note=lr_note,
-        )
+            solved = [d for d in folders if (d / "run.log").exists()]
+            folders = [d for d in folders if d not in solved]
+            if not folders:
+                raise FileNotFoundError(
+                    f"every run under {self.output_dir} has results already "
+                    f"({', '.join(d.name for d in solved)}). Name one to solve it again.")
 
-        all_passed = all(c["passed"] for c in checks.values())
-        checks["all_passed"] = all_passed
+        self.built = []
+        for run_dir in folders:
+            record = read_run_parameters(run_dir)
+            written = record.get("input") or {}
+            input_path = run_dir / written.get("file", "")
+            if not input_path.is_file():
+                input_path = _sole_input(run_dir)
+            self.built.append({
+                "name": run_dir.name, "input_path": input_path, "run_dir": run_dir,
+                "output_base": written.get("output_base", f"out_{run_dir.name}"),
+                "record": record, "coupling": None})
 
-        print("\nMixed-dimensional coupling assumption check")
-        print("-------------------------------------------")
-        for name in ("stiffness", "solid_size_vs_beam_diameter", "element_length_ratio"):
-            c = checks[name]
-            print(f"  [{'PASS' if c['passed'] else 'FAIL'}] {name:28s} {c['note']}")
-        print(f"  => {'ALL CHECKS PASSED' if all_passed else 'ONE OR MORE CHECKS FAILED'}")
+        print(f"found {len(self.built)} run(s): "
+              + ", ".join(c["name"] for c in self.built))
+        return self.built
 
-        self.coupling_report = checks
-        return checks
-
-    def plot_overview(self: "Simulation", show: bool = True) -> Path:
+    def check(self: "Simulation") -> list:
         """
-        Draw the artery surface, its centreline, and the warped stent together.
+        Report the coupling verdicts from the last build.
 
-        Writes ``stent_artery_view.html`` into :attr:`sim_input_dir`, and shows
-        the figure inline when running in a notebook.
+        The build already refuses to write an input that violates them, so this is for looking at
+        rather than for gating.
 
-        :param show: Try to display the figure inline as well as saving it.
-        :returns: Path to the written HTML view.
+        :returns: One report per case that has one.
+        :raises ValueError: If nothing has been built yet.
         """
-        elem_coords = np.array([[n.coordinates for n in el.nodes]
-                                for el in self.beam_mesh.elements])   # (n_el, 3, 3)
-        # 3 nodes + a NaN gap, so the line breaks between elements
-        seg = np.full((len(elem_coords), 4, 3), np.nan)
-        seg[:, :3, :] = elem_coords
-        beam_lines = seg.reshape(-1, 3)
+        if not self.built:
+            raise ValueError("nothing built yet - call build_input() first")
+        reports = []
+        for case in self.built:
+            if case["coupling"] is None:
+                # A type with no solid body has no beam-to-solid coupling to check. Saying so is
+                # better than printing nothing and leaving it ambiguous whether the checks passed
+                # or never ran.
+                print(f"{case['name']}: no beam-to-solid coupling in this simulation type "
+                      f"(no solid body), so there is nothing to check")
+                continue
+            print(f"{case['name']}:")
+            print_coupling(case["coupling"])
+            reports.append(case["coupling"])
+        return reports
 
-        artery_cl = self.artery.centreline
-        verts = np.asarray(self.artery.geometry.vertices)
-        faces = np.asarray(self.artery.geometry.faces)
-
-        fig = go.Figure()
-        fig.add_trace(go.Mesh3d(
-            x=verts[:, 0], y=verts[:, 1], z=verts[:, 2],
-            i=faces[:, 0], j=faces[:, 1], k=faces[:, 2],
-            color="lightpink", opacity=0.25, name="artery", showscale=False,
-        ))
-        fig.add_trace(go.Scatter3d(
-            x=artery_cl[:, 0], y=artery_cl[:, 1], z=artery_cl[:, 2],
-            mode="lines", line=dict(color="gray", width=3, dash="dash"),
-            name="centreline",
-        ))
-        fig.add_trace(go.Scatter3d(
-            x=beam_lines[:, 0], y=beam_lines[:, 1], z=beam_lines[:, 2],
-            mode="lines", line=dict(color="crimson", width=2), name="stent beams",
-        ))
-        fig.update_layout(
-            title=f"Stent warped onto {self.artery.artery_type} artery — "
-                  f"{self.stent.stent_name} "
-                  f"({len(self.beam_mesh.elements):,} beam elements)",
-            scene=dict(aspectmode="data"),
-            margin=dict(l=0, r=0, t=40, b=0),
-        )
-        stent_artery_html = self.sim_input_dir / "stent_artery_view.html"
-        pio.write_html(fig, str(stent_artery_html), auto_open=False)
-        print(f"[saved] {stent_artery_html}")
-        if show:
-            try:
-                fig.show()
-            except Exception as e:
-                print(f"[plotly] interactive view skipped ({e}); "
-                      f"use {stent_artery_html.name} instead")
-        return stent_artery_html
-
-    def write_input(self: "Simulation",
-                    out_path: str | Path | None = None,
-                    total_time: float = 1.0,
-                    inlet_surface_index: int = 1,
-                    outlet_surface_index: int = 2,
-                    fix_stent_node: bool = True) -> Path:
+    def run(self: "Simulation", cases: list = None, runner: FourCRunner = None,
+            force: bool = False) -> dict:
         """
-        Build a runnable, schema-validated 4C static simulation input.
+        Solve the built inputs.
 
-        Adds a static solver header and runtime VTK output, fixes the artery's
-        inlet and outlet surfaces (3 translational DOF, Dirichlet), and applies
-        a quasi-static radial "balloon" expansion: a point force at each beam
-        centreline node, directed radially outward from the artery centreline
-        and ramped from 0 to :attr:`expansion_force` over :attr:`n_steps` by a
-        time function. If ``fix_stent_node``, one stent node is also pinned in
-        translation to remove the stent's rigid-body motion, since the radial
-        forces alone do not constrain it.
+        Cases run one after another, and a failure does not stop the rest, so one case diverging
+        does not cost the others. Each takes an exclusive lock on its own folder, so this is safe to
+        launch from several terminals at once.
 
-        :param out_path: File path the simulation input is written to. ``None``
-            writes ``simulation.4C.yaml`` into :attr:`sim_input_dir`.
-        :param total_time: Total simulation time for the static solver.
-        :param inlet_surface_index: Index into the solid's surface geometry sets
-            for the inlet (fixed) surface.
-        :param outlet_surface_index: Index into the solid's surface geometry
-            sets for the outlet (fixed) surface.
-        :param fix_stent_node: Pin one stent centreline node's translation, to
-            remove rigid-body motion.
-        :raises ValueError: If nothing has been assembled yet, or the imported
-            solid is missing the inlet/outlet surface sets.
-        :returns: The path written.
+        :param cases: Which built cases to run. ``None`` runs all of them.
+        :param runner: A runner to use. ``None`` builds one from this simulation's config.
+        :param force: Clear a stale lock left by a dead process.
+        :returns: The result per case name.
+        :raises ValueError: If nothing has been built yet.
         """
-        if self.full_mesh is None:
-            raise ValueError("no assembled mesh yet - call assemble() first.")
-        if out_path is None:
-            out_path = self.sim_input_dir / "simulation.4C.yaml"
+        if not self.built:
+            raise ValueError("nothing built yet - call build_input() first")
 
-        mesh = self.full_mesh
-        artery_cl = self.artery.centreline
-        inp = InputFile()
+        runner = runner or FourCRunner(self.runner)
+        wanted = [c for c in self.built if cases is None or c["name"] in cases]
 
-        # --- Solver control (static, quasi-static steps) + runtime VTK output --
-        set_header_static(inp, n_steps=self.n_steps, total_time=total_time)
-        set_runtime_output(inp)
-        # Beam-to-solid interaction header (the coupling *condition* is already
-        # on the mesh).
-        set_beam_to_solid_meshtying(inp, bme.bc.beam_to_solid_surface_meshtying,
-                                    contact_discretization="mortar",
-                                    mortar_shape="line2")
+        for case in wanted:
+            print(f"\n{'=' * 78}\n=== {case['name']}\n{'=' * 78}")
+            result = runner.run(case["input_path"], case["output_base"], force=force)
+            self.runs[case["name"]] = result
+            status = ("converged" if result["ok"]
+                      else f"failed (exit {result['returncode']})")
+            update_run_results(case["run_dir"], {"status": status, **result})
 
-        # --- BCs: fix the artery inlet + outlet ends (solid, 3 DOF) -----------
-        surf = mesh.geometry_sets.get(bme.geo.surface, [])
-        if len(surf) <= max(inlet_surface_index, outlet_surface_index):
-            raise ValueError("Imported solid is missing the inlet/outlet surface sets.")
-        for i in (inlet_surface_index, outlet_surface_index):
-            mesh.add(BoundaryCondition(
-                surf[i],
-                {"NUMDOF": 3, "ONOFF": [1, 1, 1], "VAL": [0, 0, 0], "FUNCT": [0, 0, 0]},
-                bc_type=bme.bc.dirichlet))
+        write_run_index(self.output_dir)
+        ok = sum(1 for r in self.runs.values() if r["ok"])
+        print(f"\n{ok}/{len(self.runs)} case(s) finished cleanly")
+        return self.runs
 
-        # --- Radial "balloon" expansion force on the stent centreline nodes ---
-        # Beam3rHerm2Line3 nodes carry 9 DOF [disp(3), rot(3), tangent(3)]; only
-        # the Hermite centreline nodes (is_middle_node == False) have
-        # translational DOF. A time-ramp FUNCT (f(t) = t) scales the force from 0
-        # to full over the steps.
-        ramp = Function([{"SYMBOLIC_FUNCTION_OF_TIME": "t"}])
-        mesh.add(ramp)
+    def postprocess(self: "Simulation", cases: list = None) -> dict:
+        """
+        Measure every solved case and write its metrics.
 
-        cnodes = [n for n in self.beam_mesh.nodes if not n.is_middle_node]
-        coords = np.array([n.coordinates for n in cnodes])
-        radial = _radial_directions(coords, artery_cl)
+        :param cases: Which cases to measure. ``None`` measures all built ones.
+        :returns: Per-step metrics by case name, for cases that have results.
+        :raises ValueError: If nothing has been built yet.
+        """
+        if not self.built:
+            raise ValueError("nothing built yet - call build_input() first")
 
-        if fix_stent_node:              # remove stent rigid-body translation
-            mesh.add(BoundaryCondition(
-                GeometrySet([cnodes[0]]),
-                {"NUMDOF": 9, "ONOFF": [1, 1, 1, 0, 0, 0, 0, 0, 0],
-                 "VAL": [0] * 9, "FUNCT": [0] * 9},
-                bc_type=bme.bc.dirichlet))
+        junctions = bm.read_junctions(self.stent.output_dir)
+        # The thickness the run was *built* at, which is settings.strut_thickness whenever that
+        # overrides the measurement. Reading the features file directly would measure utilisation
+        # and contact penetration against a section the solve never used, so M/Mp and
+        # penetration-per-strut would be normalised by the wrong strut.
+        strut = resolve_strut_thickness(self.settings,
+                                        bm.load_features(self.stent.output_dir))
+        section = section_properties(strut, self.settings)
 
-        for node, r in zip(cnodes, radial):
-            f = self.expansion_force * r
-            mesh.add(BoundaryCondition(
-                GeometrySet([node]),
-                {"NUMDOF": 9,
-                 "ONOFF": [1, 1, 1, 0, 0, 0, 0, 0, 0],
-                 "VAL": [f[0], f[1], f[2], 0, 0, 0, 0, 0, 0],
-                 "FUNCT": [ramp, ramp, ramp, 0, 0, 0, 0, 0, 0]},
-                bc_type=bme.bc.neumann))
+        out = {}
+        for case in self.built:
+            if cases is not None and case["name"] not in cases:
+                continue
 
-        # --- Assemble + schema-validate + write -------------------------------
-        inp.add(mesh)
-        inp.dump(str(out_path), validate=True, add_footer_application_script=False)
+            # Both blocks are absent for a type with no balloon, and process_case then simply
+            # leaves out the columns that would have needed them.
+            record = case.get("record") or {}
+            balloon = _balloon_arg(record)
+            pressure = _pressure_arg(record)
 
-        print(f"[sim] static smoke test: {self.n_steps} steps, radial expansion "
-              f"force {self.expansion_force:g} N ramped over {len(cnodes):,} stent nodes")
-        print(f"[sim] BCs: artery inlet+outlet fixed"
-              + (", one stent node pinned" if fix_stent_node else "")
-              + "; coupling = beam-to-solid meshtying (tied)")
-        print(f"[saved] {out_path}")
-        print("[sim] schema-validated. Run in 4C on Linux: set BEAMME_FOUR_C_EXE "
-              "and launch 4C on this file.")
-        return Path(out_path)
+            rows = _results.process_case(case["run_dir"], junctions, section,
+                                         balloon=balloon, pressure=pressure)
+            if not rows:
+                print(f"[skip] {case['name']}: no results yet")
+                continue
+            out[case["name"]] = rows
+
+            results_dir = case["run_dir"] / "results"
+            csv = _results.write_csv(results_dir / "metrics.csv", rows)
+
+            # Earlier versions wrote metrics.csv into the run folder itself. Leaving it there
+            # beside the new one means two files with the same name and different contents,
+            # and no way to tell which a plot came from.
+            stale = case["run_dir"] / "metrics.csv"
+            if stale.is_file():
+                stale.unlink()
+            summary = _results.summarise(rows)
+            back = _results.recoil(rows)
+
+            print(f"\n{case['name']}: {summary['steps']} steps, "
+                  f"t_end {summary['t_end']:.2f}")
+            print(f"  diameter       {rows[0]['diameter']:.4f} -> "
+                  f"{summary['diameter_mm']:.4f} mm "
+                  f"({summary['radial_strain'] * 100:+.2f}%)")
+            if "diameter_peak_mm" in summary:
+                peak = f"  peak           {summary['diameter_peak_mm']:.4f} mm"
+                if "pressure_at_peak_MPa" in summary:
+                    peak += f" at {summary['pressure_at_peak_MPa']:.4f} MPa"
+                print(peak)
+            print(f"  foreshortening {summary['foreshortening_pct']:+.2f}%")
+            if "balloon_dogboning_pct_at_peak" in summary:
+                print(f"  dogboning      {summary['balloon_dogboning_pct_at_peak']:+.2f}% balloon, "
+                      f"{summary['stent_dogboning_pct_at_peak']:+.2f}% stent "
+                      f"(tip {summary['balloon_r_tip_ratio_at_peak']:.2f}x)")
+            if "penetration_per_strut_at_peak" in summary:
+                print(f"  contact        struts sink {summary['penetration_max_mm_at_peak']:.4f} mm, "
+                      f"{summary['penetration_per_strut_at_peak']:.2f} of a strut diameter")
+            if "radial_stiffness_mm_per_MPa" in summary:
+                print(f"  stiffness      {summary['radial_stiffness_mm_per_MPa']:.3f} mm/MPa")
+            if "peak_M_over_Mp" in summary:
+                print(f"  utilisation    M/Mp {summary['peak_M_over_Mp']:.2f} peak, "
+                      f"N/Np {summary.get('peak_N_over_Np', float('nan')):.2f} peak")
+            if back:
+                print(f"  recoil         {back['recoil_pct']:.2f}% "
+                      f"(peak {back['diameter_peak_mm']:.4f} -> "
+                      f"final {back['diameter_final_mm']:.4f} mm)")
+
+            full = {**summary, **({"recoil": back} if back else {})}
+            update_run_results(case["run_dir"], full)
+            write_text_atomic(results_dir / "summary.yaml",
+                              _SUMMARY_HEADER + yaml.safe_dump(plain(full), sort_keys=False))
+            print(f"  [saved] {csv.parent.name}/")
+
+            if balloon:
+                profile = _results.profile_table(case["run_dir"], rows, balloon)
+                if profile:
+                    _results.write_profile_csv(results_dir / "balloon_profile.csv", profile)
+                    print(f"  [saved] {csv.parent.name}/balloon_profile.csv   "
+                          f"({len(profile['curves'])} pressures, the paper's Fig. 5)")
+
+        write_run_index(self.output_dir)
+        return out
+
+    def setup(self: "Simulation", **options) -> "Simulation":
+        """
+        Build, check, run and measure, in that order.
+
+        :param options: Extra case options, passed to :meth:`build_input`.
+        :returns: ``self``.
+        """
+        self.build_input(**options)
+        self.check()
+        self.run()
+        self.postprocess()
+        return self
 
     # ------------------------------------------------------------------
-    # Full chain
+    # Reproducing an earlier run
     # ------------------------------------------------------------------
 
-    def setup(self: "Simulation", show_plot: bool = True) -> "Simulation":
+    @classmethod
+    def from_run(cls, run_dir, stent: Stent = None) -> "Simulation":
         """
-        Prepare a runnable 4C input, from the stent and artery through to the load.
+        Rebuild a simulation from a recorded run.
 
-        Chains the whole synthetic pipeline: prints the stent summary, meshes
-        the stent as beams and warps it onto the artery centreline
-        (:meth:`align`), meshes the artery wall as a 3D solid
-        (:meth:`mesh_artery`), assembles the
-        beam-to-solid mesh (:meth:`assemble`) and exports it for ParaView
-        (:meth:`export_paraview`). It then checks the coupling assumptions
-        (:meth:`check_coupling`), shows the overview plot, and — **only if those
-        checks pass** — writes the runnable input (:meth:`write_input`).
+        Every run writes the parameters that determined it, so a result can be reproduced without
+        remembering what was typed.
 
-        Named ``setup`` rather than ``run`` on purpose: it *prepares* a runnable
-        4C input, it does not execute the analysis. Running the solve is 4C's
-        job, external to this package.
-
-        :param show_plot: Display the artery/stent overview figure inline.
-        :returns: ``self``, holding the meshes and the coupling report.
+        :param run_dir: A run folder holding a ``run_parameters.yaml``.
+        :param stent: The stent. ``None`` loads it from the path in the record.
+        :returns: A simulation configured as that run was.
+        :raises FileNotFoundError: If there is no record there.
         """
-        self.sim_input_dir.mkdir(parents=True, exist_ok=True)
+        record = read_run_parameters(run_dir)
+        sim_type = record.get("simulation_type", "stent_only")
+        settings = settings_from_dict(SETTINGS_CLASSES[sim_type], record.get("settings"))
+        runner = settings_from_dict(RunnerConfig, record.get("runner"))
 
-        # Stent features, for the test-artery sizing
-        print("\nStent features")
-        print("--------------")
-        self.print_stent_summary()
+        if stent is None:
+            source = (record.get("stent") or {}).get("source")
+            if not source:
+                raise ValueError(f"{run_dir} records no stent source - pass stent=...")
+            stent = Stent.load(source)
 
-        # Stent meshing and alignment with the artery
-        print("\n Stent Meshing and Alignment")
-        print("--------------")
-        self.align()
+        run_path = Path(run_dir)
+        # output_dir/<type>/<stent>/<run>, so climb back to output_dir.
+        root = run_path.parent.parent.parent
 
-        # Mesh the artery WALL into a 3D solid with GMSH and write it as a 4C .yaml.
-        print("\n Test_Artery Meshing")
-        print("--------------")
-        self.mesh_artery()
-
-        # Create the assembly mesh for the stent and artery, and write it as a 4C .yaml.
-        print('\n Assembly of Stent and Test_Artery')
-        print("--------------")
-        self.assemble()
-
-        # Export the assembled mesh as separate .vtu files for ParaView.
-        print("\n Paraview")
-        self.export_paraview()
-
-        # Check the stent-artery fit and coupling assumptions
-        self.check_coupling()
-        coupling_ok = self.coupling_report["all_passed"]
-        if not coupling_ok:
-            print("\n[!] Coupling assumptions not satisfied — retune L_EL / "
-                  "SOLID_ELEMENT_SIZE (and the moduli) before building the "
-                  "simulation input.")
-
-        # Visualisation of geometries
-        self.plot_overview(show=show_plot)
-
-        # Build the runnable 4C simulation input: static solver + boundary
-        # conditions + a radial "balloon" expansion force on the stent, on top of
-        # the assembled beam-to-solid mesh. Gated on the coupling checks. Smoke
-        # test: placeholder material + meshtying (tied). The file is
-        # schema-validated here; running it needs a 4C binary on Linux.
-        if not coupling_ok:
-            print("[skip] Coupling checks failed — fix those before building "
-                  "the simulation.")
-        else:
-            simulation_yaml = self.write_input()
-            print(f"\nSimulation input ready -> {simulation_yaml}")
-
-        return self
+        return cls(stent, sim_type, settings=settings, output_dir=root, runner=runner)
 
     def __repr__(self: "Simulation") -> str:
-        """:returns: A short summary of how far this simulation has been set up."""
+        """:returns: A short summary of how far this simulation has got."""
         bits = []
-        if self.beam_mesh is not None:
-            bits.append(f"{len(self.beam_mesh.elements):,} beams")
-        if self.full_mesh is not None:
-            bits.append(f"{len(self.full_mesh.elements):,} total elements")
-        if self.coupling_report is not None:
-            bits.append("coupling "
-                        + ("OK" if self.coupling_report["all_passed"] else "FAILED"))
-        stage = ", ".join(bits) or "not set up"
-        return f"<Simulation {self.stent.stent_name!r} [{stage}] -> {self.sim_input_dir}>"
+        if self.built:
+            bits.append(f"{len(self.built)} case(s) built")
+        if self.runs:
+            bits.append(f"{sum(1 for r in self.runs.values() if r['ok'])}/{len(self.runs)} run")
+        stage = ", ".join(bits) or "not built"
+        return (f"<Simulation {self.sim_type} {self.stent.stent_name!r} "
+                f"[{stage}] -> {self.output_dir}>")
