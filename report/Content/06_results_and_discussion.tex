@@ -1,0 +1,107 @@
+\section{Results and Discussion}
+\label{sec:results_and_discussion}
+
+\subsection{Case 1}
+\label{sec:case-1}
+
+In the first case, the stent is loaded in two ways, radial expansion and axial stretch and both are solved to $t = 1$ in 20 load steps, and both converged without difficulty. The parameters of these runs can be found in \cref{tab:stent-only-run-parameters} of the appendix. As a first check, the imposed radial strain came out almost exactly as requested, which confirms that the boundary condition itself is applied correctly. The two motions also produce foreshortening of opposite sign, positive under radial expansion and negative under axial stretch, exactly as described in \cref{sec:step3-stent-only}. This foreshortening can be seen visually in \cref{fig:stent-only-deformed}. 
+
+\begin{figure}[htb]
+  \centering
+  \includegraphics[width=0.82\textwidth]{stent_only_deformed.png}
+  \caption{The stent at full load, radial expansion on the left and axial stretch on the right, coloured by axial strain at the Gauss points. The undeformed mesh for both cases is shown in \cref{fig:stent-only-bcs}.}
+  \label{fig:stent-only-deformed}
+\end{figure}
+
+It can be seen from \cref{fig:stent-only-deformed} that the two cases put the strain on a different feature of the stent. Under radial expansion, every centerline node carries the same given motion, so every crown has to open by about the same amount, and the high strain sits at the crowns, spread evenly along the whole length rather than in one place. Under axial stretch, the strain is not at the two ends themselves, since those nodes are driven or held directly and barely rotate at all. It instead gathers at the connectors that join one ring to the next, spread through the whole gauge length rather than sitting near either grip. This follows from how the stent is built which is explained in \cref{sec:problem}. A ring on its own does not change length, since it is a closed zig-zag pattern, so the axial stretch has to be taken up somewhere between one ring and the next. As described in \cref{sec:problem}, the rings are connected by short links called connectors, and those connectors are the parts of the stent that rotate the most to take up the axial stretch, and carry most of the strain that comes with it.
+
+\begin{figure}[htb]
+  \centering
+  \includegraphics[width=0.45\textwidth]{strain_coupling.png}
+  \caption{The two stent-only load cases plotted on one axis of axial strain against radial strain.}
+  \label{fig:stent-only-coupling}
+\end{figure}
+
+\Cref{fig:stent-only-coupling} shows why the two load cases are worth comparing directly, rather than only separately. The crowns and the connectors are the only parts of the stent that actually move, as \cref{fig:stent-only-deformed} already shows, and they link radial and axial motion through the same rotating mechanism no matter which direction drives it. Opening the crowns to widen the stent necessarily shortens it, and pulling the connectors apart to lengthen it necessarily narrows it, because both are the same linkage read in opposite directions. That is why the two branches meet smoothly at the origin and trace one continuous curve instead of two unrelated ones.
+
+Under radial expansion, the stent's own dogboning stays at about 0.01\% throughout, which is essentially zero. Therefore, there is no figure for it for this case-1 but this is the control for the balloon case in \cref{sec:case-2}. Because the imposed radial field is uniform, the stent expands uniformly, so any dogboning seen there is produced by the balloon and not by the stent's own geometry.
+
+\subsection{Case 2}
+\label{sec:case-2}
+
+In this case, the simulation was run with 100 load steps, and it took just over two hours. The parameters of this run can be found in \cref{tab:balloon-run-parameters} of the appendix.
+
+In \cref{fig:balloon-dogboning}, the dogboning effect is shown with two directions. In panel (a), the balloon diameter is plotted along its length at six pressures. A hump develops close to each end well before the pressure reaches its maximum, and this is very similar to \cref{fig:datz-fig5} as discussed in \cref{sec:comparison}. Panel (b) shows how much dogboning occurred in the stent and in the balloon over time. Even though there is a dogboning effect in the stent, both positive and negative, it stays below 2\%, and therefore the dogboning seen here comes from the balloon and not from the stent's own geometry.
+
+\begin{figure}[htb]
+  \centering
+  \includegraphics[width=0.75\textwidth]{dogboning_profile.png}
+  \caption{Dogboning for the stent-and-balloon run at 0.6 MPa, over the inflation branch.}
+  \label{fig:balloon-dogboning}
+\end{figure}
+
+Since the simulation is run only for the elastic case, the stent goes back to its original shape after the balloon is deflated, and it does not stay in the expanded shape. Therefore, the recoil measured here comes out at essentially exactly 100\%. The animation in \cref{fig:balloon-recoil} shows this directly, the stent and the balloon inflate together and then return to their starting shape once the pressure is removed.
+
+\begin{figure}[htb]
+  \centering
+  \animategraphics[
+    width=0.68\textwidth,
+    keepaspectratio,
+    autoplay,
+    loop,
+    controls
+  ]{10}{stent04_animation/stent_04_animation.}{0000}{0050}
+  \caption{Evolution of the stent-and-balloon run at 0.6 MPa, over the full inflate-deflate cycle (animated, requires Adobe Reader or Acrobat to play).}
+  \label{fig:balloon-recoil}
+\end{figure}
+
+It needs to be noted that some penetration of the stent into the balloon is expected and it could get bigger as the load increases, since the contact is enforced with a penalty and not with a hard constraint. This is an accuracy limit of the formulation rather than an error. In \cref{fig:contact-behaviour}, both quantities are shown for this run. Panel (a) shows the maximum penetration of the stent into the balloon, and at the peak pressure it is 10.9\% of the strut diameter. Even though this percentage looks larger, the actual penetration is about \SI{12}{\micro\metre}, since the struts are very thin. In panel (b), the number of nodes in contact grows alongside it and reaches 1243 nodes at the peak pressure, as more of the stent's surface is pushed against the balloon.
+
+\begin{figure}[htb]
+  \centering
+  \includegraphics[width=0.73\textwidth]{contact_behaviour.png}
+  \caption{Contact behaviour for the stent-and-balloon run at 0.6 MPa, over the inflation branch only.}
+  \label{fig:contact-behaviour}
+\end{figure}
+
+\subsection{Sensitivity and convergence study}
+\label{sec:convergence}
+
+In order to understand how the results depend on the mesh, a sensitivity and convergence study was performed. However, only the stent-only case was be able to be used for this study, because the stent-and-balloon case sits in the skeletonisation step, rather than in the meshing step. Because of the way the stent is skeletonised, the splines vary a lot in length, and the short connector splines are much shorter than the long strut splines. Moreover, while meshing the stent, the target element length is set to a fraction of the strut thickness, but it is just a target, and the actual element length produced by BeamMe scatters around it since the splines has different lengths. And this scatter is proportionally worse for the short connector splines than for the long strut splines. This means that refining the target length does not refine every part of the beam network at the same rate. Because of this and mesh conditions of \cref{eq:mesh-conditions} in the appendix, factor of solid at 1.5 and factor of beam at 1.2, both of them are close to the edge of what the coupling rule allows. Therefore, for the stent-and-balloon case there is little room to build several distinct mesh levels the way \cref{tab:stent-only-mesh} does for the stent-only case. This limitation is also discussed in \cref{sec:limitations_and_future} with the possible future work to fix it.
+
+In order to understand whether the results in the stent-only case converge to a solution, how much the foreshortening changes with the mesh refinement was measured. Therefore, the radial expansion case of the stent used in this report was solved five times, from coarse to fine, with the load and the number of load steps held fixed, so that the element length was the only thing that changed. The five levels are listed in \cref{tab:stent-only-mesh}.
+
+\begin{table}[htb]
+  \centering
+  \begin{tabular}{@{}>{\raggedright\arraybackslash}m{0.24\textwidth}>{\raggedright\arraybackslash}m{0.20\textwidth}>{\raggedright\arraybackslash}m{0.24\textwidth}>{\raggedright\arraybackslash}m{0.22\textwidth}@{}}
+    \toprule
+    Element length [$\times$ strut] & Elements & Foreshortening [\%] & Radial strain \\
+    \midrule
+    3.0 & 635 & 21.863 & 0.6008 \\
+    \midrule
+    2.0 & 968 & 19.917 & 0.6001 \\
+    \midrule
+    1.5 & 1258 & 20.778 & 0.5994 \\
+    \midrule
+    1.0 & 1880 & 20.108 & 0.5999 \\
+    \midrule
+    0.6 & 3136 & 20.125 & 0.6000 \\
+    \bottomrule
+  \end{tabular}
+  \caption{Mesh convergence of the radial expansion case, five element lengths on the stent used in this report.}
+  \label{tab:stent-only-mesh}
+\end{table}
+
+\Cref{tab:stent-only-mesh} shows that the foreshortening has settled by the finer end of this range. The two finest levels, 1880 and 3136 elements, agree to within 0.02 percentage points, and only the coarsest level, 635 elements, falls outside a band of plus or minus one percent around the finest result. The production element length used throughout \cref{sec:case-1}, one strut thickness, corresponds to 1880 elements and already sits inside the converged region. Moreover, the imposed radial strain itself stays between 0.599 and 0.601 across every level, which is a check on the boundary condition rather than a result of the mesh study, and it confirms that the boundary condition is applied correctly.
+
+\subsection{Comparison with reference data}
+\label{sec:comparison}
+
+The mechanical response of this work is compared against the reference data of \citet{datz2025}. Even though most of the parameters and methods are taken from that paper, some are different because of the differences in the stent geometries, mainly the stent material, the peak pressure and the starting diameter, and these are listed in \cref{tab:comparison} of the appendix. However, when the dogboning of the balloon is compared, the results here are very similar to the reference data as shown in \cref{fig:datz-fig5}, and panel (b) of \cref{fig:balloon-dogboning} shows that this dogboning comes from the balloon and not from the stent's own geometry. This agreement on the dogboning provides a good starting point for the consistency checks for the method which can be increased in the future.
+
+\begin{figure}[htb]
+  \centering
+  \includegraphics[width=0.82\textwidth]{datz2025_fig5.png}
+  \caption{Balloon diameter at different pressures, reproduced from Fig. 5 of \citet{datz2025}.}
+  \label{fig:datz-fig5}
+\end{figure}

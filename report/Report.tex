@@ -1,0 +1,121 @@
+%----------------------------------------------------------------------
+% Report -- based on the CATS student thesis template
+%----------------------------------------------------------------------
+\documentclass[paper=a4,11pt,titlepage,listof=totoc,index=totoc,bibliography=totoc]{scrartcl}
+
+\usepackage[english]{Libraries/CATSStyles}   % use [german] for a German report
+
+\setlength{\marginparwidth}{2cm}
+
+\usepackage{amssymb}
+\usepackage{xcolor}
+\usepackage{booktabs}   % nicer tables
+\usepackage{todonotes}  % \todo[]{}
+\usepackage{siunitx}    % \SI{}{} units
+\usepackage{listings}   % code listings
+\usepackage{enumitem}   % compact lists via [nosep,leftmargin=*]
+\usepackage{animate}    % \animategraphics{}, requires Adobe Reader/Acrobat to play
+\usepackage[section]{placeins}  % floats cannot drift past the end of their own section
+\usepackage[nameinlink,capitalize,noabbrev]{cleveref}
+
+\graphicspath{{Content/Figures/introduction_figures/}{Content/Figures/background_figures/}%
+              {Content/Figures/methodology_figures/}{Content/Figures/results_figures/}%
+              {Content/Figures/appendix_figures/}{Content/Figures/}{Frontpage/Figures/}{./}}
+
+%----------------------------------------
+% OWN COMMANDS
+%----------------------------------------
+% \newcommand{\toolname}{\texttt{MyTool}}
+
+\usetikzlibrary{positioning,fit,backgrounds,calc,arrows.meta}
+
+\input{symbols.tex}
+
+\begin{document}
+
+\newcommand{\ThesisType}{Report}
+
+%----------------------------------------
+% TITLE PAGE
+%----------------------------------------
+\input{Frontpage/titlepage.tex}
+
+%----------------------------------------
+% TABLE OF CONTENTS
+%----------------------------------------
+\pagestyle{Inhaltsverzeichnis}
+\tableofcontents
+\newpage
+
+\pagestyle{Inhalt}
+\pagenumbering{Roman}
+
+%----------------------------------------
+% GLOSSARY
+%----------------------------------------
+\printglossary[type=main, style=Glossar-parent]
+\printglossary[type=index, style=Glossar]
+\printglossary[type=\acronymtype, style=Abkzg]
+\newpage
+
+%----------------------------------------
+% LISTS
+%----------------------------------------
+\listoffigures
+\newpage
+\listoftables
+\newpage
+%\listoftodos
+
+%----------------------------------------
+% CONTENT
+%----------------------------------------
+\pagenumbering{arabic}
+\noindent
+
+\input{Content/01_introduction.tex}
+\input{Content/02_background.tex}
+\input{Content/03_methods.tex}
+\input{Content/06_results_and_discussion.tex}
+\input{Content/08_conclusion.tex}
+
+\noindent
+
+%----------------------------------------
+% APPENDIX
+%----------------------------------------
+% blank separator page before the appendix
+\clearpage
+\thispagestyle{empty}
+\mbox{}
+\clearpage
+
+\appendix
+
+% Appendix floats and equations are numbered A.1, A.2, ... so that every
+% reference from the main text shows at a glance that the target is in the
+% appendix rather than in the body.
+\setcounter{table}{0}
+\setcounter{figure}{0}
+\setcounter{equation}{0}
+\renewcommand{\thetable}{\thesection.\arabic{table}}
+\renewcommand{\thefigure}{\thesection.\arabic{figure}}
+\renewcommand{\theequation}{\thesection.\arabic{equation}}
+
+\input{Content/appendix.tex}
+\newpage
+
+%----------------------------------------
+% SOURCES
+%----------------------------------------
+\def \QuelleA {MyBib.bib}
+\def \QuelleB {}
+\def \QuelleC {}
+\def \Quellen {\QuelleA\QuelleB\QuelleC}
+
+\nocite{*}
+
+\bibliography{\Quellen}
+\bibliographystyle{unsrtnat}
+
+\end{document}

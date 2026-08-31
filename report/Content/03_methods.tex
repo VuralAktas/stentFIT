@@ -1,0 +1,218 @@
+\section{Methods}
+\label{sec:methods}
+
+\subsection{Overview of the approach}
+\label{sec:approach-overview}
+
+As mentioned in \cref{sec:problem}, the main objective of this project is to develop a semi-automated pipeline for virtual stent implantation with mixed-dimensional modelling. The pipeline is built in two main steps, and each of them removes one of the obstacles that were described there. These two steps hold seven stages in total, and \cref{tab:pipeline-stages} summarises them. In order to connect these two steps a docker container is used, so that the solver itself runs inside a Docker container. The construction of this container and how it is pinned is explained in \cref{app:container} of the appendix. The implementation of this methodology can be found in the documentation as stated in the \cref{sec:introduction} and the restrictions of this project are collected in \cref{sec:limitations_and_future}.
+
+\begin{table}[htb]
+  \centering
+  \footnotesize
+  \setlength{\tabcolsep}{4pt}
+  \makebox[\textwidth][c]{%
+  \begin{tabular}{@{}*{6}{>{\raggedright\arraybackslash}p{0.155\textwidth}|}>{\raggedright\arraybackslash}p{0.155\textwidth}@{}}
+    \toprule
+    \multicolumn{4}{c|}{\textbf{Main Step 1}} & \multicolumn{3}{c}{\textbf{Main Step 2}} \\
+    \multicolumn{4}{c|}{\emph{geometry to beam mesh (\cref{sec:step-1})}} & \multicolumn{3}{c}{\emph{input, run, results (\cref{sec:step-2})}} \\
+    \midrule
+    \multicolumn{1}{c|}{\textbf{Sub-step 1}} & \multicolumn{1}{c|}{\textbf{Sub-step 2}} & \multicolumn{1}{c|}{\textbf{Sub-step 3}} & \multicolumn{1}{c|}{\textbf{Sub-step 4}} & \multicolumn{1}{c|}{\textbf{Sub-step 5}} & \multicolumn{1}{c|}{\textbf{Sub-step 6}} & \multicolumn{1}{c}{\textbf{Sub-step 7}} \\
+    \midrule
+    STL sampled into a point cloud, features measured &
+    Rings detected, points labelled, regions built &
+    Rings unrolled, rasterised and thinned to a skeleton &
+    Skeletons wrapped to 3D, fitted with splines, meshed into beams &
+    Mesh, materials and conditions written into one input file &
+    Run started in the container, convergence history logged &
+    Results read back, stent response measured \\
+    \bottomrule
+  \end{tabular}}
+  \caption{The seven stages of the pipeline, grouped into the two main steps.}
+  \label{tab:pipeline-stages}
+\end{table}
+
+\subsection{Step 1}
+\label{sec:step-1}
+
+The first step turns the surface geometry of a stent into a beam model. The input is an STL file, which is a triangulated surface, and the output is a mesh of Simo-Reissner beam elements that follows the centerline of every strut. 
+
+The workflow starts with turning the surface geometry of a stent, which is an STL file as input, into a beam model which is a mesh of Simo-Reissner beam elements that follows the centerline of every strut. The reason for this step was already given in \cref{sec:problem}. A mixed-dimensional model needs a one-dimensional description of the stent, but a real stent is only available as a surface. So the centerline has to be measured from the surface itself. However, the measurement is not done directly in 3D. Since the stent is a thin-walled tube, its surface can be opened onto a flat plane to see the pattern of the stent more clearly, And since skeletonisation on a 2D image is a well understood operation with a mature implementation \citep{scikitimage}, it can be applied on this 2D flat plane. Therefore, there is whole detour for the having 1D beam model of the stent. The surface is sampled, aligned, split into rings, opened onto a plane, thinned there, and wrapped back again to volume.
+
+\subsubsection{From the surface mesh to an aligned point cloud}
+\label{sec:substep1-sampling}
+
+As mentioned before, the input is an STL file, which is a triangulated surface, but since the vertices of the triangles are not a good sample of the shape, and some point it depends on the meshing, in order to get a better geometry representation, the surface is sampled to get a point cloud. Points are drawn on the triangles with a probability proportional to the triangle area, so the density becomes uniform over the whole surface. The number of the points is decided by a cheap pre-pass, since it depends on the shape and the size of the stent. 
+
+Therefore, a principal component analysis on the raw vertices gives the length and the diameter of the stent, and the ratio between them decides how many points are targeted. Therefore, the length and the diameter of the stent can be measured from the raw vertices applying a principal component analysis, and the ratio between them decides how many points are targeted. A short and wide stent needs usually fewer points than a long and slender one. After the proper number of points is sampled, all the processing is done on that cloud, and the triangles are not used anymore.
+
+The sampled cloud is then aligned. A second principal component analysis, this time on the sampled points, gives the main axis of the stent. A rotation maps this axis onto the $z$ axis, and the rotated points are written in cylindrical coordinates $(r, \theta, z)$. Every later stage works in this frame. This alignment is important to have because it makes the unrolling easier for the next stage, and it also makes the measurement of the characteristic features of the stent more robust. 
+
+Before moving on directly extracting the centerline of the stent, the characteristic features of the stent are measured from the aligned cloud, in order to have an applicable and robust pipeline. Three of these features are measured, and they are then used in the later stages of the pipeline. The length and the outer diameter come directly from the bounding box boundries. The strut thickness needs more care, because it cannot be read from a single number. The stent is cut into one hundred slices along its axis, and in every slice the thickness is taken as the difference between the largest and the smallest radius. Since the struts converge at the ends of the stent, and there could be some noise in the measurement, while calculating the average thickness, five slices at each end are dropped.  This measurement is shown in \cref{fig:strut-thickness} for the stent used in this report. The two walls stay clearly separated along the whole stent, and the thickness of the single slices oscillates around its mean, because struts and gaps alternate inside every slice.
+
+\begin{figure}[htb]
+  \centering
+  \includegraphics[width=0.64\textwidth]{strut_thicknesss_calc.png}
+  \caption{The inner and outer wall along the axis (top), the thickness of every slice with its mean (middle), and the distribution of the radius over all points (bottom).}
+  \label{fig:strut-thickness}
+\end{figure}
+
+The mid-wall radius $r_\mathrm{mid}$ is measured the same way, as the mean of the inner and the outer radius over those slices. It is used twice later. Once to unroll the surface in \cref{sec:substep3-skeleton2d}, and once as a fallback radius when the skeleton is wrapped back to 3D in \cref{sec:substep4-3d}.
+
+\subsubsection{Splitting the stent into rings}
+\label{sec:substep2-rings}
+
+In \cref{sec:problem}, it stated that the stent is a repeating pattern of ring-shaped units, and the rings are connected to each other by short links called connectors. Instead of skeletonising the whole stent in one piece, the pipeline takes advantage of this structure and splits the stent into rings along its axis. The reason is that skeletonising the whole unrolled stent in one piece would force a single resolution on the whole stent, and then a single defect anywhere would spoil the result everywhere. But ring by ring, each ring gets its own resolution and it can be repaired on its own.
+
+In order to split the stent into rings, the pipeline uses the point-count profile along the axis. The stent is cut into two hundred thin slices, the number of points in every slice is counted, and the resulting profile is smoothed. Where the struts converge at the crowns, less material sits in the slice, so the profile dips. These dips are the natural places to cut. In order to prevent to mistake shallow ripples for dips, a prominence threshold and a depth cutoff are used while detecting the peaks of the negated profile. This calculation can be seen in \cref{fig:ring-dips}. 
+
+\begin{figure}[htb]
+  \centering
+  \includegraphics[width=0.91\textwidth]{ring_detect_calc.png}
+  \caption{Point-count profile along the stent axis.}
+  \label{fig:ring-dips}
+\end{figure}
+
+
+Once the count is known, an even grid of boundaries is laid down. A boundary is moved onto a nearby dip only when that dip sits close to it, within a fifth of the ring pitch. Equal ring width is the priority here, and a far-off dip is ignored on purpose. The detected count is then shown to the user, who can accept it or type a different one and repeat the split. This is the first of the two points where the pipeline is semi-automated rather than automatic. For the stent used here the detection gives ten rings, and they were accepted without a correction. After the split, every point of the cloud is labelled with a ring index.
+
+Before any skeletonisation happens in 2D domain, the stent is also split into small regions. The quality check which is explained later builds on this split. Each ring is cut into three equal pieces along the axis. Inside every piece, points that lie closer to each other than a connectivity radius are grouped into connected components, and each component becomes one region. In order to prevent to have a bridge between two struts that are close but not touching, the connectivity radius is limited as the smaller of two estimates, three times the average point spacing and the strut thickness. 
+
+
+Also regions that end up much smaller than the others are absorbed into their nearest normal-sized neighbour. It is very useful to have to find the pairs of regions that touch in 3D. This is stored as an adjacency table and it is the ground truth for everything that follows. This adjacency table in 3D is carried into the 2D skeletonisation, and it is what flags a wrong connection as wrong. For example in \cref{sec:substep3-skeleton2d}, a false connection may appear in the 2D skeletonisation, but the adjacency table says that the two regions it connects do not touch in 3D, so the connection is recognised as false and this jump will be able to be flagged.
+
+\subsubsection{Unrolling and 2D skeletonisation}
+\label{sec:substep3-skeleton2d}
+
+In this step, the stent is opened onto a flat plane, and the skeleton of every ring is extracted there. The unrolling is done in cylindrical coordinates $(r, \theta, z)$, where the angle $\theta$ is turned into an arc length $s = r_\mathrm{mid} \theta$ by multiplying it with the mid-wall radius $r_\mathrm{mid}$ that was measured in \cref{sec:substep1-sampling}. The height $z$ is kept as it is. The result is a flat $(s, z)$ plane where every ring sits in a horizontal band. This map is not exact, because it replaces every point's true radius with the single value $r_\mathrm{mid}$, so points away from the mid-wall are stretched or compressed by a different amount. The distortion stays small since the wall is thin, and it does not carry over into the final result, because every point gets its local radius back when the skeleton is wrapped to 3D in \cref{sec:substep4-3d}.
+
+During the unrolling, the rings are not opened alone, but together with a halo taken from their neighbours. This halo is a band of two fifths of the ring height on each side, and it is there so that a strut crossing a ring boundary is not cut in the middle. After the skeleton is computed, the result is trimmed back to the ring band, but a small overlap of two pixels is kept past each edge. That overlap matters, because neighbouring rings are skeletonised on separate pixel grids which are not aligned with each other, so without shared points the two halves of a boundary strut would not meet again in 3D. The arc seam is handled by wrapping the pixel grid itself, so that the last column is a neighbour of the first one, and the two halves are joined into one curve once the skeleton is back in 3D. All of this is shown in \cref{fig:unroll-ring} for one ring of the stent used here.
+
+\begin{figure}[htb]
+  \centering
+  \includegraphics[width=0.77\textwidth]{unroll_ring.png}
+  \caption{One ring of the stent unrolled onto a flat plane with its halo bands and seam lines}
+  \label{fig:unroll-ring}
+\end{figure}
+
+After successfully unrolling the ring, the skeleton should be extracted from the flat point cloud. In order to do that, a python package called scikit-image \citep{scikitimage} is used. It has a built-in function for skeletonisation, but it works on a raster image as shown in teh \cref{fig:scikit-image} and not on a point cloud. The point cloud is therefore rasterised first, and the skeleton is extracted from that raster. The raster of a sampled point cloud include many gaps, because the points are individual samples and not a filled area. Thinning such a raster directly gives a hairy skeleton with holes in it. The raster is therefore dilated first with a disk of a given radius, small remaining gaps are closed, and only then is the image thinned to a line of one pixel width with the skeletonisation of scikit-image \citep{scikitimage}.
+
+\begin{figure}[htb]
+  \centering
+  \includegraphics[width=0.64\textwidth]{scikit-image.png}
+  \caption{Example of the skeletonisation of scikit-image \citep{scikitimage}}
+  \label{fig:scikit-image}
+\end{figure}
+
+So, therefore during the skeletonisation, two parameters are needed. The first one is the pixel size of the raster which controls how fine the raster is relative to the strut thickness, and the second one is the dilation radius which controls how much it should be thickened before thinning. A good pair is not the same for every stent, and it is not even the same for every ring of the same stent, so it is searched automatically with a heuristic search. The search needs a way to say how bad a given skeleton is by giving it an error score, and during the search, the algorithm tries to minimise that error. There are two terms in the error. While the first one counts the number of defects in the skeleton, the second one measures how coarse the raster is relative to the dilation. The two terms are added together to give the total error that the search tries to minimise.
+
+Three kinds of defects are counted. The first one is a bad connection, which is an edge of the skeleton that joins two regions the adjacency table says do not touch in 3D. It means the skeleton has bridged two struts that only run close to each other. The second one is a loop, which is a small closed cycle in the skeleton. Loops are found through the two-core of the skeleton graph, which is what remains after dead-end nodes are peeled away repeatedly, so that only nodes that really sit on a cycle survive. A cycle is only counted as a defect when it is small, that is when its bounding diagonal stays under twice the strut thickness. A larger cycle is a cell of the stent design and not an error. The third one is an empty region, which is a region that received no skeleton point at all, and it is weighted by how large that region is compared with the median.
+
+These three counts are combined into a single defect error with fixed weights. Loops are weighted heaviest here. The reason is that a loop is a false topology which survives into the beam model as an extra closed circuit, while an empty region only costs a missing piece that is often recovered from a neighbouring ring. Even a defect error of zero is not enough on its own though, because many coarse parameter pairs give a skeleton with no visible defect while still resolving the struts badly. A second term is therefore added. It is a resolution residual that only depends on the two parameters, and it shrinks as the raster gets finer relative to the dilation. The power here is 2, not 1. That way the residual falls fast at first and flattens out near zero, instead of shrinking at a constant rate. Its purpose is to keep a gradient after the skeleton is already clean, so the search keeps refining instead of stopping at the first crude result that happens to pass. Both terms are given in \cref{eq:error-terms}, and the total error that the search minimises over $(\mathrm{pps}, \mathrm{dil})$ is their sum.
+
+\begin{equation}
+  E_\mathrm{defect} = w_\mathrm{conn} \, n_\mathrm{conn} + w_\mathrm{loop} \, n_\mathrm{loop} + w_\mathrm{empty} \, e_\mathrm{empty} , \qquad
+  E_\mathrm{quality} = 100 \left( 1 - \mathrm{fineness} \right)^{\gamma} ,
+  \label{eq:error-terms}
+\end{equation}
+
+The search is a defect-driven heuristic. It basically reads which defect dominates and moves the two parameters accordingly. The counts are first normalised by the number of regions, and then a small set of rules updates the resolution and the dilation.
+
+The rules themselves are simple. Bad connections and empty regions both raise the resolution, because a finer raster separates struts that were merged and fills regions that were skipped. Loops raise the dilation, because a thicker raster closes the holes that create them, and bad connections lower it at the same time, because a thinner raster breaks false bridges. If the skeleton is already clean, only the resolution is raised by a fixed step, and this shrinks the residual. Two limits sit on top of these rules. If loops remain but the dilation already sits at its cap, the resolution is lowered instead, because there is nothing left to thicken. The dilation is also never raised above the resolution, because a dilation wider than the strut spacing would merge neighbouring struts by construction.
+
+The best pair seen so far is chosen lexicographically. A clean skeleton always beats a defective one, whatever the residual is, and only among skeletons of the same kind does the total error decide. This ordering is done in order to prevent a very fine but defective skeleton from winning over a coarser but clean one on the residual alone. 
+
+The search stops for one of three reasons. Firstly it stops on a time budget, and it also stops before a step that is projected to exceed that budget. The reason of that is the cost of a step grows with the resolution, so one very fine step can be more expensive than everything before it together. It stops when the best result has not improved for five steps after the skeleton first became clean. It also stops when the same parameter pair is visited twice, which means the rule is cycling or pinned against a bound. The values of the weights, the step sizes and the bounds are collected in \cref{app:parameters} of the appendix.
+
+What comes out of the search is the centerline of the struts of that ring, together with a report of the defects that are left. Bad connections that were detected are removed automatically. The whole thin bridge between the two junctions that bound it is deleted, not only the flagged edge, since deleting a single pixel would leave two stubs behind. After these automatic repairs, the skeleton is scored again, so that only defects the automatic repair could not handle stay flagged. The rest of the defects can be corrected by hand with two operations with a simple interactive view. One is collapsing a loop between two chosen anchors, and the other is deleting a wrong bridge. This makes the second point where the pipeline is semi-automated. 
+
+After having a clean skeleton for every ring, the skeletons are connected to each other across the ring boundaries, so that the whole stent has a single skeleton. In \cref{fig:po_2d_skeleton}, the skeleton of the stent used in this report is shown to give an idea of the result of this sub-step. The error convergence and the final skeleton for each ring can be seen in that \cref{fig:po_2d_skeleton}. More examples can be found in \cref{app:2d-skeletons} of the appendix.
+
+\begin{figure}[htb]
+  \centering
+  \includegraphics[width=0.73\textwidth]{po_2d_skeleton.png}
+  \caption{The error convergence of the search for each ring (top) and the final skeletons (bottom).}
+  \label{fig:po_2d_skeleton}
+\end{figure}
+
+\subsubsection{Back to 3D, splines and beam elements}
+\label{sec:substep4-3d}
+
+The flat skeletons of every ring are lifted back onto the stent. Each point keeps its angle and its height, but not its radius. That comes from the surface points around it in the flat plane, so the centerline follows the real surface instead of a fixed radius. The points are then built into a graph, where two points count as neighbours if they lie within a small multiple of the pixel size. This step connects the stent back together too, since the seam and the ring boundaries end up at the same place in 3D. Small blobs of junction points are collapsed into one centroid. Short dead-end chains are removed. The graph is finally split into curves: one between every pair of junctions or endpoints, plus any closed loop that has no junction at all. 
+
+Every curve is fitted with a cubic B-spline, and a closed one is fitted as a periodic spline. What comes out is a smooth centerline with a tangent everywhere. This is important, because the beam element used here needs that tangent at every node, and the raw skeleton is only a chain of pixels without any of them. After that, with BeamMe, these splines are meshed into Simo-Reissner beam elements which are set to have a circular cross-section with the measured strut thickness. Also, the nodes shared at a junction keep the curves connected into one network so that the final result is a beam mesh that follows the centerline of every strut.
+
+
+\subsection{Step 2}
+\label{sec:step-2}
+
+The second step is about preparing the simulation input file for the solver, one \texttt{.4C.yaml}, for a given load case. The file contains the material, the mesh, the boundary conditions and, if a solid body is also part of the case, its own mesh and the coupling between it and the beams. Before the file is written to disk, it needs to be checked against the schema of 4C. Thankfully, this file is not written manually, but generated by BeamMe, then it is solved inside the container described in \cref{app:container} of the appendix, and the results are read back on the host afterwards. The choices set out in this subsection apply to every simulation type, and the modelling follows \citet{datz2025} closely.
+
+Generating this file is heavily dependent on the simulation type since the other parameters can be applied based on that, and this is explained in the following subsections. Before that, it is recommended to check \cref{tab:sim-types}, since it summarises the differences and the similarities between these three simulation types. Several of the parameters are also shared by every simulation type, and they are collected in \cref{tab:common-ingredients} of the appendix. Moreover, the theory behind the beam element and the coupling to a solid body was already given in \cref{sec:governing-equations,sec:numerical-formulation}, so the table only points back to it rather than repeating them.
+
+\begin{table}[htb]
+  \centering
+  \begin{tabular}{@{}>{\raggedright\arraybackslash}m{0.19\textwidth}>{\raggedright\arraybackslash}m{0.25\textwidth}>{\raggedright\arraybackslash}m{0.25\textwidth}>{\raggedright\arraybackslash}m{0.21\textwidth}@{}}
+    \toprule
+     & \textbf{Stent alone} & \textbf{Stent and balloon} & \textbf{Stent and artery} \\
+    \midrule
+    Second body & none & balloon, solid elements & test artery \\
+    \midrule
+    How the stent is loaded & prescribed displacement & pressure through contact & radial point force \\
+    \midrule
+    Interaction & self-contact, switched off & beam-to-solid contact & meshtying \\
+    \midrule
+    Reported here & yes & yes & no \\
+    \bottomrule
+  \end{tabular}
+  \caption{The three simulation types built by the pipeline. Only the first two are reported here, as stated in \cref{sec:objectives}.}
+  \label{tab:sim-types}
+\end{table}
+
+
+\subsubsection{Stent alone}
+\label{sec:step3-stent-only}
+
+
+This case is done in order to analyze the stent's own kinematics, and it is the first simulation type in \cref{tab:sim-types}. Therefore, there is no second body and no contact. Other than just kinematocs, this case also helps to exercise the whole workflow from end to end with cheaper computational cost than the other two simulation types. To see this kinematics from more than one direction, two distinct loading scenarios are employed. While the radial expansion case drives the stent outwards which resembles a real deployment with a balloon, the axial stretch case drives the stent inwards which is the opposite of a deployment to have just a different perspective. Pulling the two ends apart rotates the struts in the opposite direction, so the stent lengthens and necks inward at the same time. These two independent load cases make \cref{fig:stent-only-coupling} a check on the model, rather than just a restatement of one boundary condition. 
+
+In the radial expansion case, every centerline node is driven directly by a prescribed displacement. The stent is already aligned to the $z$ axis and centred on the origin from Step 1, so a uniform radial scaling is linear in each node's own position, and no cylindrical coordinates are needed. The displacement is simply $u_x = (x - c_x)\,\varepsilon\, t$, with the same expression for $y$, where $\varepsilon$ is the imposed strain at $t = 1$, and one Dirichlet condition therefore covers the whole mesh. The axial direction is left free on purpose, so the foreshortening comes out as a result rather than being imposed, which is the headline measurement of \cref{sec:case-1}. The only rigid body mode left, translation along $z$, is pinned at the single node nearest to mid-length. However, prescribing every node this way is a strong constraint, and it is why this case, and the axial one below, cannot be run with a plastic material, as discussed further in \cref{sec:limitations_and_future}.
+
+Meanwhile, in the axial stretch case, only the two ends of the stent are driven, and the middle is left free to respond. A band of nodes at each end stands in for the grips of a test machine. The band is sized as a fraction of the tip ring's own length, taken from the ring boundaries found in \cref{sec:substep2-rings}, and not as a fraction of the total length, so it scales with the crown spacing and means the same thing on any stent. The bottom band is fully fixed. The top band is moved along $z$ by a fraction of the stent length and is held laterally, which is what rigid grips do. The middle is left free, so the stent necks in through the gauge length exactly as a test specimen does between its grips. All rigid body modes are already removed by the fixed band, so no extra pin is needed here.
+
+\begin{table}[htb]
+  \centering
+  \begin{tabular}{@{}>{\raggedright\arraybackslash}m{0.20\textwidth}>{\raggedright\arraybackslash}m{0.37\textwidth}>{\raggedright\arraybackslash}m{0.37\textwidth}@{}}
+    \toprule
+     & \textbf{Radial expansion} & \textbf{Axial stretch} \\
+    \midrule
+    Driven & all centerline nodes, radially & the top band, along $z$ \\
+    \midrule
+    Held & translation along $z$, at one node & the bottom band, fully, the top band, laterally \\
+    \midrule
+    Strain at $t = 1$ & $+0.60$ & $+0.10$ \\
+    \midrule
+    Measured as a result & the foreshortening & the radial response \\
+    \bottomrule
+  \end{tabular}
+  \caption{The two stent-only load cases, what each one drives and holds, and what each one measures as a result rather than imposes.}
+  \label{tab:stent-only-cases}
+\end{table}
+
+\begin{figure}[htb]
+  \centering
+  \includegraphics[angle=90,width=0.64\textwidth]{stent_only_bcs_radial_expand.png}\\[1mm]
+  {\small (a) radial expansion, the pinned node in red}\\[4mm]
+  \includegraphics[angle=90,width=0.64\textwidth]{stent_only_bcs_axial_stretch.png}\\[1mm]
+  {\small (b) axial stretch, the grip bands in orange}
+  \caption{The undeformed beam mesh of the stent used in this report, with the boundary conditions of the two stent-only load cases marked on it. Every other node is free.}
+  \label{fig:stent-only-bcs}
+\end{figure}
+
+\subsubsection{Stent and balloon}
+\label{sec:step3-stent-balloon}
+
+Different than the previous simulation, this one drives the stent by a pressure through the balloon, so it tests the mechanism of a real deployment. Moreover, it also tests the part of the method the whole project is built around, the mixed-dimensional beam-to-solid contact described in \cref{sec:related-work}. However, no artery is present here, so what is tested is the contact between the stent and the balloon only, rather than the physics of a deployment into tissue. A different stent is also used here than in \cref{sec:step3-stent-only}, one with a more crimped design that is closer to the real geometry of a stent before deployment.
+
+The balloon is defined as a solid body with structured mesh, and it has a contact interface with the stent from its outer surface, and from its inner surface it is inflated by a pressure. Instead of holding the ends of the balloon fixed, a spring is used to hold it in place like the method of \citet{datz2025}. The material is orthotropic, which is what makes a plain cylinder inflate like a folded catheter balloon instead of stretching lengthwise. The pressure inside of the balloon rises to a maximum and returns to zero with linear ramps. The geometry, the material, the boundary conditions and the pressure loading of the balloon are given in \cref{tab:balloon-ingredients} of the appendix.
+
+Because of the fact that stent is loaded by contact against a smooth tube, it needs to still carry rigid body modes of its own. Also, every restraint placed on it must act tangentially, because a restraint with a radial component would fight the very expansion that the contact is meant to drive. The idea of \citet{datz2025} is used to remove those modes with a small set of point conditions at chosen crowns. The contact between the stent and the balloon, together with the mesh conditions it has to satisfy, can be found in \cref{tab:balloon-ingredients} of the appendix.

@@ -1,0 +1,27 @@
+% ========================================================================
+% Glossary categories (parent groups in the symbol list)
+% ========================================================================
+\newglossaryentry{latin}{name={Latin symbols}, description={\nopostdesc}}
+\newglossaryentry{greek}{name={Greek symbols}, description={\nopostdesc}}
+
+% ========================================================================
+% Symbols -- used in the text as \gls{key}
+% ========================================================================
+\newglossaryentry{length}{name=\ensuremath{L}, description={characteristic length},
+  sort=ll, type=main, parent=latin}
+\newglossaryentry{time}{name=\ensuremath{t}, description={time},
+  sort=lt, type=main, parent=latin}
+\newglossaryentry{density}{name=\ensuremath{\rho}, description={density},
+  sort=gr, type=main, parent=greek}
+
+% ========================================================================
+% Indices -- printed in the second glossary
+% ========================================================================
+\newglossaryentry{idx0}{name=\ensuremath{0}, description={initial value},
+  sort=0, type=index}
+
+% ========================================================================
+% Acronyms -- \gls{key}, \glspl{key}, \acrlong{key}
+% ========================================================================
+\newacronym{FEM}{FEM}{Finite Element Method}
+\newacronym{CFD}{CFD}{Computational Fluid Dynamics}

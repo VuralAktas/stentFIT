@@ -1,0 +1,45 @@
+%----------------------------------------------------------------------
+% Konventionen bezueglich der Schreibweise von Matrizen, Vektoren, etc.
+%
+%
+% Autor: G. Wellmer
+% Erstellt: unbekannt
+%
+% Letzte Aenderungen: - <Aenderung>,<Datum>,<Person>
+%----------------------------------------------------------------------
+
+%----------------------------------------------------------------------
+% eingerueckt = ergaenzt
+% \integ (Integral) hinzugefuegt
+% \ointeg (Ringintegral) hinzugefuegt
+%----------------------------------------------------------------------
+
+% Formatierungen Text
+\newcommand{\file}[1]{\texttt{\emph{#1}}}
+\newcommand{\code}[1]{\ttfamily {#1}\rmfamily}
+%
+% Formatierungen Formeln
+\newcommand{\pderiv}[2]{\ensuremath{\displaystyle\frac{\partial{#1}}{\partial{#2}}}}
+\newcommand{\deriv}[2]{\ensuremath{\displaystyle\frac{d{#1}}{d{#2}}}}
+\newcommand{\limint}[1]{\ensuremath{\displaystyle\int\limits_{#1}}}
+\newcommand{\limsum}[2]{\ensuremath{\\displaystyle\sum\limits_{#1}^{#2}}}
+\newcommand{\matr}[1]{\mbox{\boldmath{$\mathsf {#1}$}}}
+\newcommand{\vekt}[1]{\mbox{\boldmath{${#1}$}}}
+\newcommand{\ind}[1]{\textsubscript{\ensuremath{\mathsf {#1}}}}
+% eigene
+\newcommand{\integ}[2]{\ensuremath{\displaystyle\int\limits_{#1}^{#2}}}
+\newcommand{\ointeg}[2]{\ensuremath{\displaystyle\oint\limits_{#1}^{#2}}}
+%
+\renewcommand{\baselinestretch}{1.15}
+\parskip 1ex
+%
+
+\newenvironment{tttable}[1]{%
+   \begingroup
+   \sffamily
+   \urlstyle{sf}% URL-Schriftart in Tabelle weicht ab.
+   \begin{table}{#1}
+}{%
+   \end{table}
+   \endgroup
+}

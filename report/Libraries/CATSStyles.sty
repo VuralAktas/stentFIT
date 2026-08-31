@@ -1,0 +1,64 @@
+%Paket deklarieren
+\NeedsTeXFormat{LaTeX2e}
+\ProvidesPackage{Libraries/CATSStyles}
+
+%-------------------------------------------------
+% Notwendige Packages fuer die bestehende Vorlage
+%-------------------------------------------------
+
+% Hinzufuegen der Optionen "german" "babel" und "translator" um die Pakete [ngerman]{babel} bzw. [ngerman]{translator} aufzurufen
+\newif\if@german
+\newif\if@english
+
+\DeclareOption{german}{
+\@germantrue}
+
+\DeclareOption{english}{
+\@englishtrue}
+
+\ProcessOptions
+
+\if@german
+	\RequirePackage[ngerman]{babel}
+	\RequirePackage[ngerman]{translator}
+\else
+	\RequirePackage[english]{babel}
+	\RequirePackage[english]{translator}
+\fi
+
+% Schrift
+\usepackage[T1]{fontenc}			%europaeischer Zeichensatu
+\usepackage[utf8]{inputenc} % Microsoft Codepage fuer Windows
+
+\usepackage{graphicx} % Zur Einbindung von Bilddateien
+\usepackage{scrlayer-scrpage} % Notwendig um z.B. Kopfzeile zu definieren
+\usepackage{subfig}   %subfloats, also mehrere Bilder nebeneinander
+
+%----------------------------------------
+% Weitere nuetzliche Pakete
+%----------------------------------------
+\usepackage{amsmath} % Griechische Buchstaben fett gedruckt, durch Voranstellen von \boldsymbol in der Gleichung vor dem Gewuenschten Symbol
+
+\usepackage[numbers]{natbib}   % anstelle von cite, bessere Zitier-Moeglichkeiten
+                               % numbers fuer numeric mode: [1], [2] etc.
+\usepackage{color} 		         % farbige Schrift
+
+\usepackage[pdftex,colorlinks,hypertexnames=false]{hyperref}
+\hypersetup{%
+	linkcolor={blue},
+	citecolor={red},
+}
+
+% Definitionen bezueglich der Schreibweise von Matrizen, Vektoren, etc.
+\RequirePackage{Libraries/mathstyles}
+
+% Definition verschiedener Glossare, benoetigt das Paket glossaries
+\if@english
+	\RequirePackage[english]{Libraries/myglossaries}
+\else
+	\RequirePackage[german]{Libraries/myglossaries}
+\fi
+%Page Sytle
+\RequirePackage{Libraries/PageStyle}
+
+\endinput

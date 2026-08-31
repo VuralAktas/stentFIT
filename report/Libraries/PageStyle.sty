@@ -1,0 +1,37 @@
+% R�nder
+\usepackage[a4paper,left=2.5cm,right=2.0cm,top=2.5cm,bottom=2.0cm]{geometry}
+
+% Vermeidung von Schusterjungen und Hurenkindern
+\usepackage{Libraries/schuster}
+
+%Schriftart
+%\usepackage{mathptmx} % neuster Times Schriftsatz, aber inkompatibel mit bm
+                       % bzw. boldmath
+%\usepackage{times}    % VERALTET
+
+\usepackage{palatino}
+% Schriftarten mit KOMA Script fuer Ueberschriften setzen
+%\setkomafont{disposition}{\normalcolor\bfseries\rmfamily}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%Festlegen des Absatzeinzuges
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\setlength{\parindent}{0em}
+
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%% Definitionen des Seitenlayouts                                     %
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+
+\defpagestyle{Inhaltsverzeichnis}{{\hfill \ThesisType}{\ThesisType \hfill}{\hfill \ThesisType}(\textwidth,.4pt)}{{}{}{}} %Latex, geht mit KOMA einfacher
+
+\defpagestyle{Inhalt}{{\pagemark\hfill \ThesisType}{\ThesisType \hfill\pagemark}{\ThesisType \hfill \pagemark}(\textwidth,.4pt)}{{}{}{}} %Latex, geht mit KOMA einfacher vgl. lhead{},chead{}
+
+
+\renewcommand{\footnotesize}{\small}
+\newcommand{\lyxline}[1][1.25pt]{
+  \par\noindent
+  \rule[.5ex]{\linewidth}{#1}\par}

@@ -1,0 +1,180 @@
+% +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+% +                                                                                                           +
+% +   3 Glossare                                                                                              + 
+% +      -main                                                                                                +
+% +      -index                                                                                               +
+% +      -abkz                                                                                                +
+% +   mit vier verschiedenen Formatierungen:                                                                  +
+% +      -Abkzg   (Abkürzungsverzeichnis ohne Untergruppen)                                                   +
+% +      -Glossar (Glossar ohne Untergruppen)                                                                 +
+% +      -Abkzg-parent   (Abkürzungsverzeichnis mit Untergruppen)                                             +
+% +      -Glossar-parent (Glossar mit Untergruppen)                                                           +
+% +                                                                                                           +
+% +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+% +                                                                                                           +
+% +   Beispiel für zwei Einträge in der Gruppe GriechBst (griechische Buchstaben) im Glossar main:            +
+% +                                                                                                           +
+% +   \newglossaryentry{GriechBst}{                             % Bezeichnung der Gruppe                      +
+% +   name={griechische Buchstaben},                            % Gruppenüberschrift                          +                                                          
+% +   description={\nopostdesc}                                 % Beschreibung leer lassen                    +
+% +   }                                                                                                       +
+% +                                                                                                           +
+% +   \newglossaryentry{alpha}{                                 % Bezeichnung des Eintrags                    +
+% +   name=\ensuremath{\alpha},                                 % Anzuzeigendes Symbol                        +
+% +   description={erster Buchstabe im griechischen Alphabet},  % Beschreibung                                +
+% +   sort=ga,                                                  % Sortierungsschlüssel (g: griechisch)        +
+% +   type=main,                                                % Einordnung in das entspr. Glossar           +
+% +   parent=GriechBst                                          % Gruppenzugehörigkeit                        +
+% +   }                                                                                                       +
+% +                                                                                                           +
+% +   \newglossaryentry{beta}{                                  % Bezeichnung des Eintrags                    +
+% +   name=\ensuremath{\beta},                                  % Anzuzeigendes Symbol                        +
+% +   description={zweiter Buchstabe im griechischen Alphabet}, % Beschreibung                                +
+% +   sort=gb,                                                  % Sortierungsschlüssel (g: griechisch)        +
+% +   type=main,                                                % Einordnung in das entspr. Glossar           +
+% +   parent=GriechBst                                          % Gruppenzugehörigkeit                        +
+% +   }                                                                                                       +
+% +                                                                                                           +
+% +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+%Define language options
+\newif\if@german
+\newif\if@english
+
+\DeclareOption{german}{
+\@germantrue}
+
+\DeclareOption{english}{
+\@englishtrue}
+
+\ProcessOptions
+
+
+% =============================================================================================================
+% Allgemeine Aufrufe und Formatierung
+% -------------------------------------------------------------------------------------------------------------
+% Package einbinden
+\usepackage[toc, nonumberlist, style=longheader, acronym]{glossaries}[=v4.46]
+
+% Zusätzliche Glossare 'index' und 'abkz'
+\if@german
+	\newglossary[slg]{index}{syi}{syg}{Indizes}
+	\newglossary[abg]{abkz}{abi}{abo}{Abkürzungen}
+\else
+	\newglossary[slg]{index}{syi}{syg}{Indices}
+	\newglossary[abg]{abkz}{abi}{abo}{Acronyms}
+\fi
+
+
+% Glossare anlegen
+\makeglossaries
+
+% Allgemeine Formatierung der Glossare
+\renewcommand*{\glsgroupskip}{}		% Entfernen des Abstandes zwischen Gruppen
+\renewcommand*{\glspostdescription}{}	% Der Punkt am Ende jeder Beschreibung wird weggelassen 
+\renewcommand{\glossaryname}{Glossar}	% Überschrift für das Glossar 'main'
+
+% Style für Sub-Entries
+\renewcommand*{\glossarysubentryfield}[6]{\glossaryentryfield{#2}{#3}{#4}{#5}{#6}}
+
+
+% Hier müssen \entryname und \description mit leeren Argumenten definiert werden da ansonsten in den Headern die default Bezeichnungen "Notation" und "Description" zusammen mit den in Abkz und Glossar vorgegebenen Bezeichnungen ausgegeben werden
+\renewcommand{\entryname}{}
+\renewcommand{\descriptionname}{}
+% =============================================================================================================
+
+
+
+% =============================================================================================================
+% Glossar-Styles
+% -------------------------------------------------------------------------------------------------------------
+
+% Variablen für Spaltenbreiten
+\newlength{\glstargetwidth}
+\newlength{\glshspace}
+\newlength{\OLDtabcolsep}
+
+% Angabe der Spaltenbreiten
+\setlength{\glstargetwidth}	{0.29\textwidth} % Breite der Symbol-Spalte
+\setlength{\glshspace}		{0.02\textwidth} % Breite des Abstands zwischen Symbol- und Beschreibungs-Spalte
+\setlength{\glsdescwidth}	{0.69\textwidth} % Breite der Beschreibungs-Spalte
+\setlength{\OLDtabcolsep}{\tabcolsep}            % Abstand zwischen den Spalten sichern
+\setlength{\tabcolsep}{0pt}			 % kein zusätzlicher Abstand zwischen den Spalten
+
+% -------------------------------------------------------------------------------------------------------------   
+% Abkürzungen - ohne Untergruppen
+% -------------------------------------------------------------------------------------------------------------
+\newglossarystyle{Abkzg}
+{
+	\if@german
+ 		\renewcommand*{\glossaryheader}{\bfseries {Abkürzung} & \bfseries {Bedeutung}\\ & \\\endhead}
+	\else
+		\renewcommand*{\glossaryheader}{\bfseries {Abbreviation} & \bfseries {Description}\\ & \\\endhead}
+	\fi
+  \renewenvironment{theglossary}
+    { \begin{longtable} {p{\glstargetwidth} @{\hspace{\glshspace}} p{\glsdescwidth}} }
+    { \end{longtable} }
+  % Format für Gruppenüberschrift festlegen
+  \renewcommand*{\glossaryentryfield}[5]{\textbf{\glstarget{##1}{##2}} & ##3 \\}
+  % Format für Einträge
+  %\renewcommand*{\glossarysubentryfield}[6]{##3 & ##4 \\}
+}
+% -------------------------------------------------------------------------------------------------------------
+% Glossar - ohne Untergruppen
+% -------------------------------------------------------------------------------------------------------------
+\newglossarystyle{Glossar}
+{
+	\if@german
+		\renewcommand*{\glossaryheader}{\bfseries {Zeichen} & \bfseries {Bedeutung}\\ & \\\endhead}
+	\else
+		\renewcommand*{\glossaryheader}{\bfseries {Symbols} & \bfseries {Description}\\ & \\\endhead}
+	\fi
+  \renewenvironment{theglossary}
+    { \begin{longtable}{p{\glstargetwidth} @{\hspace{\glshspace}} p{\glsdescwidth}} }
+    { \end{longtable} }
+  % Format für Gruppenüberschrift festlegen
+  \renewcommand*{\glossaryentryfield}[5]{\textbf{\glstarget{##1}{##2}} & ##3 \\}
+  % Format für Einträge
+  %\renewcommand*{\glossarysubentryfield}[6]{##3 & ##4 \\}
+}
+% -------------------------------------------------------------------------------------------------------------   
+% Abkürzungen - mit Untergruppen
+% -------------------------------------------------------------------------------------------------------------
+\newglossarystyle{Abkzg-parent}
+{
+	\if@german
+		\renewcommand*{\glossaryheader}{\bfseries {Abkürzung} & \bfseries {Bedeutung}\\\endhead}
+	\else
+		\renewcommand*{\glossaryheader}{\bfseries {Abbreviation} & \bfseries {Description}\\\endhead}
+	\fi
+  \renewenvironment{theglossary}
+    { \begin{longtable}{p{\glstargetwidth} @{\hspace{\glshspace}} p{\glsdescwidth}} }
+    { \end{longtable} }
+  % Format für Gruppenüberschrift festlegen
+  \renewcommand*{\glossaryentryfield}[5]{ & \\ \mbox{\textbf{\glstarget{##1}{##2}}} & \\}
+  % Format für Einträge
+  \renewcommand*{\glossarysubentryfield}[6]{##3 & ##4 \\}
+}
+% -------------------------------------------------------------------------------------------------------------
+% Glossar - mit Untergruppen
+% -------------------------------------------------------------------------------------------------------------
+\newglossarystyle{Glossar-parent}
+{
+	\if@german
+		\renewcommand*{\glossaryheader}{\bfseries {Zeichen} & \bfseries {Bedeutung}\\\endhead}
+	\else
+		\renewcommand*{\glossaryheader}{\bfseries {Symbols} & \bfseries {Description}\\\endhead}
+	\fi
+  \renewenvironment{theglossary}
+    { \begin{longtable}{p{\glstargetwidth} @{\hspace{\glshspace}} p{\glsdescwidth}} }
+    { \end{longtable} }
+  % Format für Gruppenüberschrift festlegen
+  \renewcommand*{\glossaryentryfield}[5]{ & \\ \mbox{\textbf{\glstarget{##1}{##2}}} & \\}
+  % Format für Einträge
+  \renewcommand*{\glossarysubentryfield}[6]{##3 & ##4 \\}
+}
+
+% Abstand zwischen den Spalten wiederherstellen
+\setlength{\tabcolsep}{\OLDtabcolsep}
+% =============================================================================================================
+

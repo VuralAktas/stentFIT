@@ -1,0 +1,133 @@
+% =====================================================================
+% Pipeline overview diagram (TikZ)
+% Included from Content/03_methods.tex inside a figure environment.
+%
+% HOW TO FILL IN THE IMAGE SLOTS
+% ------------------------------
+% Every slot currently draws an empty framed box via \pipeimg{<file>}.
+% The intended file name is written in each call, so you can see what
+% belongs where.
+%
+%   * To switch ONE slot on: replace that \pipeimg{foo.png} call with
+%       \includegraphics[width=\pipew,height=\pipeh,keepaspectratio]{foo.png}
+%   * To switch ALL slots on at once (when every file exists): comment out
+%     the placeholder \newcommand below and uncomment the \newcommand
+%     underneath it.
+%
+% Put the image files in this same folder (Content/Figures/).
+% =====================================================================
+
+\newlength{\pipew}\setlength{\pipew}{2.2cm}    % landscape slot (steps 2 and 3)
+\newlength{\pipeh}\setlength{\pipeh}{1.3cm}
+\newlength{\pipewv}\setlength{\pipewv}{1.7cm}  % portrait slot (step 1, stent stands up)
+\newlength{\pipehv}\setlength{\pipehv}{2.6cm}
+\newlength{\pipeww}\setlength{\pipeww}{5.4cm}  % wide slot (the unrolled 2D skeleton)
+\newlength{\pipehw}\setlength{\pipehw}{3.0cm}
+
+% --- placeholder version (active) ------------------------------------
+\newcommand{\pipeimg}[1]{%
+  \fcolorbox{black!35}{black!4}{\rule{0pt}{\pipeh}\rule{\pipew}{0pt}}}
+% --- real version (swap with the one above once the files exist) ------
+% \newcommand{\pipeimg}[1]{\includegraphics[width=\pipew,height=\pipeh,keepaspectratio]{#1}}
+
+% fixed portrait image area: keeps all four step-1 slots the same size
+\newcommand{\pipeboxv}[1]{%
+  \parbox[c][\pipehv][c]{\pipewv}{\centering
+    \includegraphics[width=\pipewv,height=\pipehv,keepaspectratio]{#1}}}
+
+% wide fixed image area, for the unrolled skeleton sitting above the row
+\newcommand{\pipeboxw}[1]{%
+  \parbox[c][\pipehw][c]{\pipeww}{\centering
+    \includegraphics[width=\pipeww,height=\pipehw,keepaspectratio]{#1}}}
+
+\newcommand{\pipecap}[1]{\\[3pt]\parbox{\pipew}{\centering\footnotesize #1}}
+
+% badge colour (dark red, like the numbered markers in the seminar slides)
+\definecolor{stentaccent}{RGB}{140,25,35}
+
+\begin{tikzpicture}[
+    font=\small,
+    slot/.style     = {draw=black!45, rounded corners=2pt, fill=white,
+                       inner sep=4pt, align=center, anchor=north},
+    band/.style     = {rounded corners=4pt, fill=black!5, draw=black!20},
+    bandlab/.style  = {font=\bfseries\footnotesize, text=black!70, anchor=west},
+    badge/.style    = {circle, fill=stentaccent, text=white, font=\bfseries\tiny,
+                       inner sep=1.4pt, minimum size=11pt},
+    flow/.style     = {-{Stealth[length=5pt]}, thick, draw=black!55},
+    note/.style     = {font=\tiny, text=black!65, align=center},
+  ]
+
+% ---------------------------------------------------------------------
+% geometry: 4 columns, 3.85cm apart, centred on x = 5.775
+% ---------------------------------------------------------------------
+\def\rowA{0}      % y of band 1 slots
+\coordinate (cx) at (4.30,0);   % centre line, for the vertical arrows
+\def\rowB{-8.2}   % y of band 2 slots
+\def\rowC{-13.0}  % y of band 3 slots
+
+% =====================  STEP 1  =======================================
+% slots 1, 2 and 4 stand side by side; slot 3 is the unrolled skeleton, which
+% is wide and flat, so it sits above them and spans the whole row.
+\node[slot] (s1) at (0.00,\rowA) {\pipeboxv{po_stl.png}\pipecap{STL surface}};
+\node[slot] (s2) at (4.30,\rowA) {\pipeboxv{po_rings.png}\pipecap{point cloud}};
+\node[slot] (s4) at (8.60,\rowA) {\pipeboxv{po_3d_splines.png}\pipecap{beam mesh}};
+
+\node[slot, anchor=north] (s3) at (4.30,4.30)
+  {\pipeboxw{po_2d_skeleton.png}\pipecap{unrolled 2D skeleton}};
+
+\draw[flow] (s1.east) -- (s2.west);
+\draw[flow] (s2.north) -- (s3.south -| s2.north);          % up into the skeleton
+\draw[flow] (s3.south -| s4.north) -- (s4.north);          % back down to the beams
+
+% measured-features callout under slot 2
+\node[note, below=5mm of s2.south, anchor=north, align=left, text width=4.6cm] (feat)
+  {\textbf{measured features:} length \SI{18.09}{\milli\metre}, diameter
+   \SI{3.15}{\milli\metre}, strut thickness \SI{0.107}{\milli\metre}, 10 rings};
+\draw[draw=black!35, dashed] (s2.south) -- (feat.north);
+
+\node[bandlab] (lab1) at (0.00,5.05) {STEP 1 \textemdash{} geometric pre-processing};
+\begin{scope}[on background layer]
+  \node[band, fit=(lab1)(s1)(s2)(s3)(s4)(feat), inner sep=3mm] (band1) {};
+\end{scope}
+
+% =====================  STEP 2  =======================================
+\node[slot] (host) at (2.30,\rowB) {\pipeimg{pipe_host.png}\pipecap{host}};
+\node[slot] (cont) at (5.90,\rowB) {\pipeimg{pipe_docker.png}\pipecap{container}};
+
+\draw[flow] ([yshift=3mm]host.east) -- node[above, font=\tiny] {input file}
+            ([yshift=3mm]cont.west);
+\draw[flow] ([yshift=-4mm]cont.west) -- node[below, font=\tiny] {results}
+            ([yshift=-4mm]host.east);
+
+\node[note, anchor=west, align=left] (osnote) at (8.30,{\rowB-1.0})
+  {two operating systems,\\one shared run folder};
+
+\node[bandlab] (lab2) at (2.30,{\rowB+1.05}) {STEP 2 \textemdash{} solver coupling};
+\begin{scope}[on background layer]
+  \node[band, fit=(lab2)(host)(cont)(osnote), inner sep=3mm] (band2) {};
+\end{scope}
+
+\draw[flow] (band1.south -| cx) -- (band2.north -| cx);
+
+% =====================  STEP 3  =======================================
+\node[slot] (s6) at (1.65,\rowC) {\pipeimg{pipe_input.png}\pipecap{input file}};
+\node[slot] (s7) at (4.95,\rowC) {\pipeimg{pipe_run.png}\pipecap{4C run}};
+\node[slot] (s8) at (8.25,\rowC) {\pipeimg{pipe_results.png}\pipecap{results}};
+
+\draw[flow] (s6.east) -- (s7.west);
+\draw[flow] (s7.east) -- (s8.west);
+
+\node[bandlab] (lab3) at (1.65,{\rowC+1.05}) {STEP 3 \textemdash{} input assembly and run};
+\begin{scope}[on background layer]
+  \node[band, fit=(lab3)(s6)(s8), inner sep=3mm] (band3) {};
+\end{scope}
+
+\draw[flow] (band2.south -| cx) -- (band3.north -| cx);
+
+% =====================  badges  =======================================
+% placed just outside the top-left corner of each slot, so they never
+% sit on top of a band label
+\foreach \n/\a in {1/s1, 2/s2, 3/s3, 4/s4, 5/host, 6/s6, 7/s7, 8/s8}
+  \node[badge] at ([xshift=1.5mm,yshift=-1.5mm]\a.north west) {\n};
+
+\end{tikzpicture}

@@ -1,0 +1,27 @@
+\section{Conclusion}
+\label{sec:conclusion}
+
+\subsection{Summary}
+\label{sec:summary}
+
+In this project, a full python package was built to turn the surface mesh of a stent into a mixed-dimensional finite element simulation. The skeletonisation was tested on several stent designs. The beam models which it produces were used in two types of simulation, one of them driven by a prescribed displacement and the other one driven by pressure through contact with an inflating balloon. This report describes the pipeline in detail, and it also shows the robustness and the agreement of the results with reference data. The pipeline is publicly available on GitHub to be tested and used by others, and it is also built to be extended in the future. 
+
+\subsection{Limitations and future work}
+\label{sec:limitations_and_future}
+
+The pipeline presented in this report works from end to end, but it does so under several restrictions. Some of them are simplifications that were needed to get it running within the time of a one-semester project, so those are deliberate restrictions of the scope rather than oversights. The others are extensions that the pipeline is already built for but that were not reached. Both of these kinds limit what the results in \cref{sec:results_and_discussion} can be used for.
+
+\begin{itemize}[nosep,leftmargin=*]
+  \item \textbf{Stent designs tested:} The method was tested on several publicly available stent designs and one commercial design. However, most of the public designs are not crimped and they are already partly expanded. Since commercial stents are normally supplied crimped, the method still needs to be tested on genuinely crimped geometries.
+  \item \textbf{A route without image processing:} The current method goes through 2D image processing at its centre, with two points where the intermediate result is checked and corrected by hand. In order to have a fully automated pipeline which removes the need for human intervention, a route can be try to be built that skips the image processing entirely. This would also give something to compare the current method against directly. 
+  \item \textbf{Spline length:} This is not a limitation of the skeletonisation itself, but of what its output allows in the simulation step, as discussed in \cref{sec:convergence}. The splines vary a lot in length, short connectors next to long struts, and this blocks a proper mesh convergence study for the stent-and-balloon case, so merging the short connector splines into their neighbouring strut splines is a concrete next step.
+  \item \textbf{Plasicity:} The stent and the balloon are elastic in every run reported here, so the runs show the response during loading but not a permanent expansion and deformation. Attempts to use an elasto-plastic material did not converge, so that is the natural next step. After implementing plasticity, the recoil can be checked against the reference data of \citet{datz2025}.
+  \item \textbf{Self-contact:} A beam-to-beam penalty contact already exists for the stent-only case, but it is switched off in every run reported here, and on the designs where the crimped geometry brings the struts close together they do cross under axial stretch. This does not change the global kinematics, which come from the rotation of the struts, but no local quantity is claimed near a fold, and enabling the contact for those designs is a natural next step.
+  \item \textbf{Balloon shape:} In order to have a direct comparison with the reference data of \citet{datz2025}, the balloon is built to match their geometry which is a straight cylinder with stiffened ends rather than the tapered shape of a real catheter balloon. It is a direct simplification of the real geometry, and it is also what produces the dogboning discussed in \cref{sec:case-2}. Building a balloon closer to the real shape could be done in the future, and it would be interesting to see if that reduces the dogboning.
+  \item \textbf{An artery:} No run reported here includes an artery, even though a deployment into tissue is the whole point of the mixed-dimensional method, and although the pipeline can already build a test artery and tie the stent into it by meshtying, that case has never been run in 4C.
+  \item \textbf{A curved centerline:} Both are modelled along a straight axis, and a curved centerline would be needed for the artery case anyway, since a real artery is rarely straight. 
+  \item \textbf{Parallelism:} Every run reported here didn't use any parallelism, yet in order to get the results in a reasonable time and to be able to run the larger cases, parallelism is needed. 
+\end{itemize}
+
+
+

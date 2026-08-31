@@ -1,0 +1,447 @@
+\section{Appendix}
+\label{app:appendix}
+
+\FloatBarrier
+\subsection{Theoretical background}
+\label{app:theory}
+
+\subsubsection{Governing equations}
+\label{sec:governing-equations}
+
+In order to formulate beam-to-solid coupling problem, instead of balance equations, the whole method is built on one idea called \emph{principle of virtual work}. Instead of starting from the momentum balance and arriving at a system of partial differential equations for the displacement field, the same equilibrium is expressed by imagining a tiny virtual movement of the structure. At equilibrium, the total work done by all forces during that imaginary movement must add up to zero,
+
+\begin{equation}
+  \delta W = \delta W_\mathrm{int} - \delta W_\mathrm{ext} = 0 , \label{eq:pvw}
+\end{equation}
+
+where the internal part is the work done by the internal stresses as the material virtually deforms and the external part is the work done by the outside forces. The balance equations give the strong form, while \cref{eq:pvw} gives the weak form directly, which is what a finite element method needs.
+
+They used this principle to formulate the beam-to-solid coupling problem such that there are three independent contributions to the total virtual work, one for the solid body $\Omega^S$, one for the beam $\Omega^B$ embedded in it, and one for the coupling between them.
+
+\begin{equation}
+  \delta W = \delta W^S + \delta W^B + \delta W^C = 0 . \label{eq:split}
+\end{equation}
+
+This makes the problem easier to solve, since the solid and the beam contributions do not depend on the coupling, standard formulations can be used for both, and only the third term is new.
+
+\begin{figure}[htb]
+  \centering
+  \includegraphics[width=0.9\textwidth]{beam_solid_configurations.png}
+  \caption{Reference and deformed configuration of the coupled beam-solid system. Figure from \citet{steinbrecher2020}.}
+  \label{fig:beam-solid-configurations}
+\end{figure}
+
+\paragraph{Solid contribution $\delta W^S$:} In order to the model the solid part of the problem, they used standard nonlinear continuum mechanics. As shown on \cref{fig:beam-solid-configurations}, the solid occupies a domain $\Omega^S_0$ in the reference configuration, and a domain $\Omega^S$ in the deformed configuration. So a material point of the solid is identified by its reference position $\boldsymbol{X}^S$, and its current position can be found by adding the displacement field to it, $\boldsymbol{x}^S(\boldsymbol{X}^S) = \boldsymbol{X}^S + \boldsymbol{u}^S(\boldsymbol{X}^S)$. By using these definitions for imaginary movement, the virtual work of the solid is written as
+
+\begin{equation}
+  \delta W^S = \underbrace{\int_{\Omega^S_0} \boldsymbol{S} : \delta \boldsymbol{E} \, \mathrm{d}V_0}_{-\delta W^S_\mathrm{int}} - \underbrace{\left( \int_{\Omega^S_0} \hat{\boldsymbol{b}} \cdot \delta \boldsymbol{u}^S \, \mathrm{d}V_0 + \int_{\Gamma_\sigma} \hat{\boldsymbol{t}} \cdot \delta \boldsymbol{u}^S \, \mathrm{d}A_0 \right)}_{\delta W^S_\mathrm{ext}} , \label{eq:solid}
+\end{equation}
+
+Here $\boldsymbol{E} = \tfrac{1}{2}(\boldsymbol{F}^\mathrm{T}\boldsymbol{F} - \boldsymbol{I})$ is the Green-Lagrange strain tensor, $\boldsymbol{F} = \partial \boldsymbol{x}^S / \partial \boldsymbol{X}^S$ is the material deformation gradient, and $\boldsymbol{S} = \partial \Psi(\boldsymbol{E}) / \partial \boldsymbol{E}$ is the second Piola-Kirchhoff stress tensor, which is derived from a strain energy function $\Psi(\boldsymbol{E})$. The first integral is the work done by the internal stresses. The two integrals in the brackets are the work done by the external loads, namely the prescribed body load $\hat{\boldsymbol{b}}$ and the surface traction $\hat{\boldsymbol{t}}$ that acts on the Neumann boundary $\Gamma_\sigma$. So it is basically the same as \cref{eq:pvw}, but written in a form that is suitable for just the solid part of the problem.
+
+\begin{figure}[htb]
+  \centering
+  \includegraphics[width=\textwidth]{beam_kinematics.png}
+  \caption{Kinematics of a geometrically exact beam. Figure from \citet{steinbrecher2020}.}
+  \label{fig:beam-kinematics}
+\end{figure}
+
+\paragraph{Beam contribution $\delta W^B$:} Similarly to the solid part, they used one of the standard beam theories to model the beam part of the problem, but they also used one kinematic assumption to simplify the problem which is that the cross-sections of the beam stay plane and rigid while the beam deforms. The beam is described by a centerline curve $\boldsymbol{r}(s)$ which connects the centroids of the cross-sections, and every cross-section carries a triad of right-handed orthonormal vectors $\boldsymbol{\Lambda}(s) = (\boldsymbol{g}_1(s), \boldsymbol{g}_2(s), \boldsymbol{g}_3(s))$ that describes how it is rotated. The coordinate $s \in [0, L]$ is the arc length along the undeformed centerline. A point of the beam is then given by $s$ together with the two cross-section coordinates $\alpha$ and $\beta$. Based on these definitions, the virtual work of the beam is written as
+
+\begin{equation}
+  \delta W^B = \underbrace{\delta \Pi_{\mathrm{int},(\cdot)}}_{-\delta W^B_\mathrm{int}} - \underbrace{\left( \int_{\Omega^B_L} \delta \boldsymbol{r} \cdot \tilde{\boldsymbol{f}} \, \mathrm{d}s + \delta W^B_{\mathrm{ext},(\cdot)} \right)} _{\delta W^B_\mathrm{ext}} , \label{eq:beam}
+\end{equation}
+
+The term $\tilde{\boldsymbol{f}}$ collects the distributed line loads along the beam, and the $(\cdot)$ means that the term depends on the chosen beam theory. \citet{steinbrecher2020} consider three of them: Simo-Reissner, Kirchhoff-Love and torsion-free. This work uses the Simo-Reissner theory. It is the most general one of the three, because it adds no extra kinematic constraint, so the beam is free to deform in all six modes: axial strain, two bending modes, torsion and two shear modes. Its internal elastic energy is
+
+\begin{equation}
+  \Pi_{\mathrm{int},\mathrm{SR}} = \frac{1}{2} \int_{\Omega^B_L} \left( \boldsymbol{\Gamma}^\mathrm{T} \boldsymbol{C}_F \boldsymbol{\Gamma} + \boldsymbol{\Omega}^\mathrm{T} \boldsymbol{C}_M \boldsymbol{\Omega} \right) \mathrm{d}s , \label{eq:simo-reissner}
+\end{equation}
+
+Here $\boldsymbol{\Gamma}$ is the material deformation measure and $\boldsymbol{\Omega}$ is the material curvature vector. The first one represents the axial tension and the shear strains, while the second one represents the torsion and the bending. The constitutive matrices are
+
+\begin{equation}
+  \boldsymbol{C}_F = \operatorname{diag}(EA,\, GA_2,\, GA_3) , \qquad \boldsymbol{C}_M = \operatorname{diag}(GI_T,\, EI_2,\, EI_3) , \label{eq:constitutive}
+\end{equation}
+
+Here $E$ is the Young's modulus, $G$ is the shear modulus and $A$ is the cross-section area. The effective shear areas are $A_2$ and $A_3$. The polar and planar second moments of area are $I_T$, $I_2$ and $I_3$.
+
+So in the beam part again, the \cref{eq:pvw} can be seen in \cref{eq:beam}, where the first term is the work done by the internal stresses, and the second term is the work done by the external loads. The only difference between the solid and beam parts is that the solid is a 3D object, while the beam is a 1D object, so the integrals are over a volume and a line, respectively.
+
+\paragraph{Coupling contribution $\delta W^C$:} As mentioned, the first two contributions coming from solid and beam are standard formulations, but the coupling term is where the two different objects, a beam and a solid, have to be made to act as if they were attached. The rule for this is simple: wherever they are connected, they must move together,
+
+\begin{equation}
+  \boldsymbol{u}^B - \boldsymbol{u}^S = \boldsymbol{0} \quad \text{on } \Gamma_c , \label{eq:constraint}
+\end{equation}
+
+where $\Gamma_c$ is the coupling domain. Writing the rule down is not enough, because the beam and solid meshes are generated separately and their nodes do not line up. A mechanism is needed that forces the discrete solution to obey it. In order to do that, they used the Lagrange multiplier method, which is a standard way to introduce a new unknown field $\boldsymbol{\lambda}$ that enforces the constraint. This new unknown field is a connecting force between the beam and solid that acts like an invisible glue and pushes back exactly hard enough to keep the two aligned. This gives two terms. The first is the work done by the connecting force,
+
+\begin{equation}
+  -\delta W_c = \int_{\Gamma_c} \boldsymbol{\lambda} \cdot \left( \delta \boldsymbol{u}^B - \delta \boldsymbol{u}^S \right) \mathrm{d}s , \label{eq:coupling-force}
+\end{equation}
+
+and the second enforces the constraint itself,
+
+\begin{equation}
+  \delta W_\lambda = \int_{\Gamma_c} \delta \boldsymbol{\lambda} \cdot \left( \boldsymbol{u}^B - \boldsymbol{u}^S \right) \mathrm{d}s , \label{eq:coupling-constraint}
+\end{equation}
+
+where $\delta \boldsymbol{\lambda}$ is the test function for $\boldsymbol{\lambda}$. The second equation states that for every admissible $\delta \boldsymbol{\lambda}$ the quantity $\boldsymbol{u}^B - \boldsymbol{u}^S$ must vanish. Introducing a force and then adding an equation that makes the force do its job is the standard signature of the Lagrange multiplier method. However, the authors of \citet{steinbrecher2020} did something unusual here: usually the Lagrange multiplier method is used to enforce a constraint on a surface, but here it is used to enforce a constraint along a line. As it can be seen from \cref{eq:coupling-force,eq:coupling-constraint}, the integrals are over the beam centerline instead of the beam surface. The reason for this is that the beam is very thin compared to the solid, so the surface integral would be very expensive to evaluate. Instead, the coupling is collapsed from a 2D-3D problem to a 1D-3D problem, and the Lagrange multiplier $\boldsymbol{\lambda}$ becomes a line load along the beam centerline. This makes the method cheap, because the coupling now lives on a simple 1D domain instead of a complicated 3D one.
+
+\begin{figure}[htb]
+  \centering
+  \includegraphics[width=0.55\textwidth]{kelvin_problem.png}
+  \caption{The classical Kelvin problem: a point force (a) and a line load (b) acting on an infinite solid. Figure from \citet{steinbrecher2020}.}
+  \label{fig:kelvin-problem}
+\end{figure}
+
+However, it should be noted that making the coupling a line load is also the weak point of the formulation because it actually introduces a singularity into the problem. A concentrated force acting along a single line inside a solid makes the stress and displacement fields blow up at that line, which is known as the classical \emph{Kelvin problem} and is shown in \cref{fig:kelvin-problem}. The singularity is built into the model and limits how fine the solid mesh may be, since refining it further only resolves an artefact. To keep the formulation valid, \citet{steinbrecher2020} state three requirements:
+
+\begin{itemize}
+  \item The beam must be much stiffer than the solid.
+  \item The beam cross-section must be small compared to the solid elements.
+  \item The beam elements must be fairly long compared to the solid elements.
+\end{itemize}
+
+In order to check these requirements, they performed a comparison study between a fully resolved 2D-3D reference solution and their 1D-3D formulation. As it can be seen from \cref{fig:element-ratio-error}, the error which is the difference between the two solutions stays flat as long as the beam elements are at most about five times longer than the solid elements. Beyond that ratio it grows quickly. Making the beam mesh finer than that does not help either, because the error does not drop any further.
+
+\begin{figure}[htb]
+  \centering
+  \includegraphics[width=0.7\textwidth]{element_length_ratio_error.png}
+  \caption{$L_2$ error for varying beam-to-solid element length ratios, at $h_\mathrm{solid} = \SI{0.14}{\metre}$. Figure from \citet{steinbrecher2020}.}
+  \label{fig:element-ratio-error}
+\end{figure}
+
+Collecting all contributions from \cref{eq:solid,eq:beam,eq:coupling-force,eq:coupling-constraint}, the governing equation of the coupled problem becomes
+
+\begin{equation}
+  \delta W^S + \delta W^B - \delta W_c + \delta W_\lambda = 0 . \label{eq:master}
+\end{equation}
+
+and also \Cref{tab:virtual-work} summarises the three parts, their unknown fields and their role.
+
+\begin{table}[htb]
+  \centering
+  \hyphenpenalty=10000 \exhyphenpenalty=10000
+  \begin{tabular}{@{}>{\centering\arraybackslash}m{0.16\textwidth}*{3}{>{\centering\arraybackslash}m{0.24\textwidth}}@{}}
+    \toprule
+     & \textbf{Solid} $\delta W^S$ & \textbf{Beam} $\delta W^B$ & \textbf{Coupling} $\delta W^C$ \\
+    \midrule
+    Equation & \cref{eq:solid} & \cref{eq:beam} & \cref{eq:coupling-force,eq:coupling-constraint} \\
+    Unknown field & displacement $\boldsymbol{u}^S$ & centerline position $\boldsymbol{r}(s)$ & connecting force $\boldsymbol{\lambda}(s)$ \\
+    Role & standard nonlinear continuum mechanics & geometrically exact Simo-Reissner beam & enforces $\boldsymbol{u}^B = \boldsymbol{u}^S$ through a line load along the centerline \\
+    \bottomrule
+  \end{tabular}
+  \caption{Summary of the three contributions to the total virtual work, their governing equations, unknown fields and role in the coupled problem.}
+  \label{tab:virtual-work}
+\end{table}
+
+\subsubsection{Numerical formulation}
+\label{sec:numerical-formulation}
+
+The equations of the previous section are continuous. To solve them with a computer, both bodies have to be discretised.
+
+The solid and the beam are meshed independently of each other. This is the practical advantage of the whole approach, because the artery mesh can be built without knowing where the struts will end up. In the solid, the geometry and the displacement are approximated with the usual isoparametric shape functions $N_k$. The beam centerline is interpolated with third-order Hermite polynomials. Every beam element then has two nodes, and every node carries six degrees of freedom, three for the position and three for the tangent \citep{steinbrecher2020}.
+
+The connecting force also has to be discretised. It lives on the beam centerline, so it is interpolated there,
+
+\begin{equation}
+  \boldsymbol{\lambda}_h = \sum_{j=1}^{n_\lambda} \Phi_j(\xi^B)\, \boldsymbol{\lambda}_j , \label{eq:lambda-interp}
+\end{equation}
+
+where $\Phi_j$ are its shape functions and $n_\lambda$ is the number of multiplier nodes, which does not have to match the number of beam nodes. In the language of contact mechanics, the beam is the slave side and the solid is the master side. The Hermite functions of the beam are not reused here. For two neighbouring beam elements of equal length the integral over the tangential ones becomes zero, which causes numerical problems, so standard Lagrangian shape functions are used instead. \citet{steinbrecher2020} compare linear, quadratic and cubic ones and recommend the linear interpolation.
+
+Inserting the discretised fields into \cref{eq:coupling-constraint} gives two coupling matrices,
+
+\begin{equation}
+  \boldsymbol{D}^{(j,l)} = \int_{\Gamma^B_{c,h}} \Phi_j \boldsymbol{H}_l \, \mathrm{d}s , \qquad \boldsymbol{M}^{(j,k)} = \int_{\Gamma^B_{c,h}} \Phi_j \left( N_k \circ \chi_h \right) \mathrm{d}s \, \boldsymbol{I}_{3\times3} , \label{eq:mortar-matrices}
+\end{equation}
+
+where $\boldsymbol{H}_l$ are the beam shape functions and $\chi_h$ projects a point of the centerline into the solid element. $\boldsymbol{D}$ connects the multipliers with the beam and $\boldsymbol{M}$ connects them with the solid.
+
+The result is a system of nonlinear equations, which is solved with the Newton-Raphson method. The multipliers are extra unknowns in this system, so it is larger than the uncoupled problem and its matrix has a saddle point structure. Both are avoided with a penalty regularisation,
+
+\begin{equation}
+  \boldsymbol{\lambda} = \epsilon\, \boldsymbol{\kappa}^{-1} \boldsymbol{g}_c(\boldsymbol{d}^S, \boldsymbol{d}^B) , \label{eq:penalty}
+\end{equation}
+
+where $\epsilon$ is the penalty parameter, $\boldsymbol{\kappa}$ is a scaling matrix and $\boldsymbol{g}_c$ collects the discrete constraint equations. The multipliers are now simple functions of the displacements and can be removed from the system. What is left contains only displacements and has the same size as the uncoupled problem. The price is that the constraint is no longer satisfied exactly. A larger $\epsilon$ reduces the violation but makes the system matrix badly conditioned, so the parameter has to be chosen in between.
+
+The mesh requirements from \cref{sec:governing-equations} appear here in a concrete form. With $D_\mathrm{fiber}$ a representative cross-section dimension, $h_\mathrm{solid}$ the characteristic solid element size and $h_\mathrm{beam}$ the beam element length, the two conditions are
+
+\begin{equation}
+  h_\mathrm{solid} \geq D_\mathrm{fiber} , \qquad h_\mathrm{solid} \leq h_\mathrm{beam} . \label{eq:mesh-conditions}
+\end{equation}
+
+The first one prevents force localisation effects and the second one prevents locking, and violating either of them spoils the convergence rate \citep{steinbrecher2020}. Both are quantities that the pre-processing produces and not the solver, which is why the pipeline described in this report checks them before an input file is written. These limits were measured for fibers embedded in a volume. \citet{datz2025} report that the same restriction is weaker when the beam only touches a solid surface, which is the case in this project. The conditions used here are therefore the strict ones, and a model that respects them is on the safe side.
+
+\FloatBarrier
+\subsection{Running the solver in a container}
+\label{app:container}
+
+Before the solver can be run, the necessary coupling between the Python package and the solver has to be built. Since 4C works on Linux and is not available as a pre-compiled binary for macOS or Windows, it cannot be installed next to the Python package in any operating system. Because of that, the pipeline keeps the pre-processing on the host operating system, and the solver runs inside a Docker container that carries a fixed 4C build.The two sides share only one thing, which is the folder of that run. It is mounted into the container, and it holds the input file, the log and the results. That folder is the whole interface between them.
+
+The image of the container is pinned by its digest and not by its tag, and this is what makes a result reproducible. A tag like \texttt{main} is a rolling nightly build, so it points to a different build after a few days, and naming the tag identifies nothing afterwards. The digest identifies that one build forever. It is checked before every run, and it is also written into the record of that run, so every result carries the exact solver build that produced it. The pinned build is given in \cref{tab:solver-build}. The nightly build was also chosen on purpose instead of a stable release. The input schema that comes with fourcipp is the one of the nightly, and if an older release were pinned, the input files would be validated against a newer schema than the 4C inside the container understands. That mismatch would pass silently.
+
+\begin{table}[htb]
+  \centering
+  \begin{tabular}{@{}>{\raggedright\arraybackslash}m{0.25\textwidth}>{\raggedright\arraybackslash}m{0.62\textwidth}@{}}
+    \toprule
+    \textbf{Quantity} & \textbf{Value} \\
+    \midrule
+    Image        & \texttt{ghcr.io/4c-multiphysics/4c:main} \\
+    Digest       & \texttt{sha256:17ac2c98d5d54e189c8ef2a4\newline 224731cc8cde45ab48856d8933e0d28f8fe5c6d1} \\
+    4C version   & \texttt{2026.3.0-dev} \\
+    Mount point  & \texttt{/work} \\
+    \bottomrule
+  \end{tabular}
+  \caption{The 4C build every result in this report was produced with.}
+  \label{tab:solver-build}
+\end{table}
+
+Before the run starts, a preflight check is done. It checks whether Docker is installed, whether its daemon is reachable, whether the image is pulled, whether its digest matches the pinned one, and whether the run folder can be written. Every failed check also names the command that fixes it, so a missing prerequisite costs seconds instead of a whole solve. The platform is detected and not assumed, so the same code runs on Intel machines, on Apple Silicon, on Linux and on Windows. When a 4C binary is already available on the machine itself, it is used instead of the container, because a native binary is always faster than an emulated one. During the run, the output goes to the screen and to a log file at the same time, since the convergence history is what is needed when a run fails.
+
+\FloatBarrier
+\subsection{Parameter tables}
+\label{app:parameters}
+
+\begin{table}[htb]
+  \centering
+  \begin{tabular}{@{}>{\raggedright\arraybackslash}m{0.58\textwidth}>{\centering\arraybackslash}m{0.16\textwidth}@{}}
+    \toprule
+    \textbf{Quantity} & \textbf{Value} \\
+    \midrule
+    \multicolumn{2}{@{}l}{\emph{Defect weights}} \\
+    Bad connection & \num{2} \\
+    Loop           & \num{10} \\
+    Empty region   & \num{1} \\
+    Loop size cutoff, in strut thicknesses & \num{2} \\
+    \midrule
+    \multicolumn{2}{@{}l}{\emph{Correction step sizes}} \\
+    Resolution, from bad connections & \num{25} \\
+    Resolution, from empty regions   & \num{20} \\
+    Resolution, from loops at the dilation cap & \num{15} \\
+    Resolution, once the skeleton is clean & \num{5} \\
+    Dilation radius, from loops & \num{20} \\
+    Dilation radius, from bad connections & \num{8} \\
+    \midrule
+    \multicolumn{2}{@{}l}{\emph{Bounds and stopping}} \\
+    Resolution range & \num{5} to \num{120} \\
+    Dilation radius range & \num{1} to \num{30} \\
+    Residual exponent & \num{2} \\
+    Defect error counting as clean & \num{1} \\
+    Steps without improvement before stopping & \num{5} \\
+    Repeats of one parameter pair before stopping & \num{2} \\
+    Time budget per ring & \SI{120}{\second} \\
+    \midrule
+    \multicolumn{2}{@{}l}{\emph{Held fixed}} \\
+    Seam padding, as a fraction of the raster width & \num{0.20} \\
+    Ring halo, as a fraction of the ring height & \num{0.40} \\
+    Pieces per ring, for the region segmentation & \num{3} \\
+    \bottomrule
+  \end{tabular}
+  \caption{Values used by the parameter search of the 2D skeletonisation. The resolution is the number of pixels across one strut width and the dilation radius is given in pixels, and these two are the only quantities the search changes.}
+  \label{tab:tuning-parameters}
+\end{table}
+
+\begin{table}[htb]
+  \centering
+  \begin{tabular}{@{}>{\raggedright\arraybackslash}m{0.22\textwidth}>{\raggedright\arraybackslash}m{0.46\textwidth}>{\raggedright\arraybackslash}m{0.22\textwidth}@{}}
+    \toprule
+    \textbf{Ingredient} & \textbf{Choice} & \textbf{Reference} \\
+    \midrule
+    Beam element & \texttt{Beam3rHerm2Line3}, Simo-Reissner, Hermite centerline & \cref{eq:simo-reissner,sec:numerical-formulation} \\
+    \midrule
+    Cross-section & solid circle, radius set to half of the strut thickness & \cref{sec:substep1-sampling} \\
+    \midrule
+    Material & linear elastic \texttt{MAT\_BeamReissnerElastHyper} & \cref{eq:constitutive} \\
+    \midrule
+    Yield reference & $N_p = \sigma_y A$, $M_p = \sigma_y \pi r^3 / 4$, the onset of yielding rather than the fully plastic moment & \citet{datz2025} \\
+    \midrule
+    Crown welding & point coupling at the junctions labelled in Step 1 & \cref{sec:substep4-3d} \\
+    \midrule
+    Element length & one strut thickness alone, or the mesh conditions of \citet{steinbrecher2020} when a solid body is present & \cref{eq:mesh-conditions} \\
+    \midrule
+    Solver & static, Newton-Raphson through NOX, load applied over pseudo-time steps to $t = 1$ &  \\
+    \midrule
+    Outputs and run record & beam positions, Gauss-point strains and forces, \texttt{run\_parameters.yaml} & \cref{tab:solver-build} \\
+    \bottomrule
+  \end{tabular}
+  \caption{Ingredients of the input file that are shared by every simulation type, and where each one is explained.}
+  \label{tab:common-ingredients}
+\end{table}
+
+\begin{table}[htb]
+  \centering
+  \footnotesize
+  \setlength{\tabcolsep}{3pt}
+  \makebox[\textwidth][c]{%
+  \begin{tabular}{@{}*{3}{>{\raggedright\arraybackslash}p{0.155\textwidth}>{\raggedright\arraybackslash}p{0.075\textwidth}|}>{\raggedright\arraybackslash}p{0.155\textwidth}>{\raggedright\arraybackslash}p{0.075\textwidth}@{}}
+    \toprule
+    \textbf{Parameter} & \textbf{Value} & \textbf{Parameter} & \textbf{Value} & \textbf{Parameter} & \textbf{Value} & \textbf{Parameter} & \textbf{Value} \\
+    \midrule
+    \multicolumn{8}{@{}l}{\emph{Stent}} \\
+    $E$ [MPa] & \num{200000} & Strut thickness [mm] & \num{0.1073} & Beam diameter [mm] & \num{0.1073} & Beam elements & \num{1880} \\
+    \midrule
+    \multicolumn{8}{@{}l}{\emph{Mesh}} \\
+    Element length [$\times$strut] & \num{1} & $h$ beam min [mm] & \num{0.0997} & $h$ beam mean [mm] & \num{0.1077} & $h$ beam max [mm] & \num{0.1112} \\
+    \midrule
+    \multicolumn{8}{@{}l}{\emph{Loading and boundary conditions}} \\
+    Load steps & \num{20} & Grip [$\times$tip ring] & \num{0.2} & Self-contact & off & & \\
+    \midrule
+    \multicolumn{8}{@{}l}{\emph{Solver}} \\
+    Max iterations & \num{20} & Residual tolerance & \num{1e-8} & Predictor & TangDis & Line search & Full Step \\
+    \midrule
+    \multicolumn{8}{@{}l}{Beam element \texttt{Beam3rHerm2Line3}, Simo-Reissner. Stent material linear elastic.} \\
+    \multicolumn{8}{@{}l}{Both load cases use these same values, only the prescribed displacement differs, see \cref{tab:stent-only-cases}.} \\
+    \multicolumn{8}{@{}l}{\scriptsize 4C image digest \texttt{sha256:17ac2c98d5d54e189c8ef2a4224731cc8cde45ab48856d8933e0d28f8fe5c6d1}} \\
+    \bottomrule
+  \end{tabular}}
+  \caption{Parameters of the two stent-only runs reported in \cref{sec:case-1}.}
+  \label{tab:stent-only-run-parameters}
+\end{table}
+
+\begin{table}[htb]
+  \centering
+  \begin{tabular}{@{}>{\raggedright\arraybackslash}m{0.22\textwidth}>{\raggedright\arraybackslash}m{0.46\textwidth}>{\raggedright\arraybackslash}m{0.22\textwidth}@{}}
+    \toprule
+    \textbf{Ingredient} & \textbf{Choice} & \textbf{Reference} \\
+    \midrule
+    Balloon geometry & structured HEX8 tube, periodic in angle, radius set from the measured innermost strut surface & \citet{datz2025} \\
+    \midrule
+    Balloon material & Neo-Hooke base with two exponential fiber families, orthotropic & \citet{datz2025}, Appendix B \\
+    \midrule
+    Pressure load & follower pressure on the inner surface, triangular profile rising to $t = 0.5$ and back to zero & \citet{datz2025} \\
+    \midrule
+    Balloon end conditions & Robin springs, all three directions, on both end caps & \citet{datz2025} \\
+    \midrule
+    Stent restraint & three point conditions at chosen crowns, tangential directions only & \citet{datz2025} \\
+    \midrule
+    Contact formulation & beam-to-solid surface contact, Gauss-point-to-segment, segmentation & \cref{eq:penalty,sec:related-work} \\
+    \midrule
+    Contact penalty & 10 N/mm\textsuperscript{2}, linear penalty law & \citet{datz2025} \\
+    \midrule
+    Mesh ratio rule & solid and beam element sizes chosen to satisfy the mesh conditions between them & \cref{eq:mesh-conditions}, \citet{steinbrecher2020} \\
+    \bottomrule
+  \end{tabular}
+  \caption{Ingredients of the input file that are specific to the stent-and-balloon case, and where each one is explained.}
+  \label{tab:balloon-ingredients}
+\end{table}
+
+\begin{table}[htb]
+  \centering
+  \footnotesize
+  \setlength{\tabcolsep}{3pt}
+  \makebox[\textwidth][c]{%
+  \begin{tabular}{@{}*{3}{>{\raggedright\arraybackslash}p{0.155\textwidth}>{\raggedright\arraybackslash}p{0.075\textwidth}|}>{\raggedright\arraybackslash}p{0.155\textwidth}>{\raggedright\arraybackslash}p{0.075\textwidth}@{}}
+    \toprule
+    \textbf{Parameter} & \textbf{Value} & \textbf{Parameter} & \textbf{Value} & \textbf{Parameter} & \textbf{Value} & \textbf{Parameter} & \textbf{Value} \\
+    \midrule
+    \multicolumn{8}{@{}l}{\emph{Stent}} \\
+    $E$ [MPa] & \num{200000} & Strut thickness [mm] & \num{0.1134} & Beam diameter [mm] & \num{0.1134} & Beam elements & \num{2863} \\
+    \midrule
+    \multicolumn{8}{@{}l}{\emph{Balloon}} \\
+    Neo-Hooke $E$ [MPa] & \num{17} & Wall [mm] & \num{0.04} & Radial strain & \num{0.5} & End spring [MPa/mm] & \num{1000} \\
+    Clearance [$\times$strut] & \num{0.02} & Initial clearance [mm] & \num{0.00227} & Overhang [$\times$length] & \num{0.1} & & \\
+    \midrule
+    \multicolumn{8}{@{}l}{\emph{Loading and contact}} \\
+    Max pressure [MPa] & \num{0.6} & Load steps & \num{100} & Penalty [N/mm\textsuperscript{2}] & \num{10} & Penalty $g_0$ [$\times$strut] & \num{0} \\
+    Gauss points & \num{6} & & & & & & \\
+    \midrule
+    \multicolumn{8}{@{}l}{\emph{Mesh}} \\
+    factor solid/diameter & \num{1.5} & factor beam/solid & \num{1.2} & $h$ solid radial [mm] & \num{0.04} & & \\
+    $h$ beam min [mm] & \num{0.1812} & $h$ beam mean [mm] & \num{0.2018} & $h$ beam max [mm] & \num{0.2575} & & \\
+    $h$ solid circ [mm] & \num{0.1649} & $h$ solid axial [mm] & \num{0.1692} & & & & \\
+    \midrule
+    \multicolumn{8}{@{}l}{\emph{Solver}} \\
+    Max iterations & \num{60} & Residual tolerance & \num{1e-8} & Increment tolerance & \num{1e-10} & Predictor & ConstDis \\
+    \midrule
+    \multicolumn{8}{@{}l}{Beam element \texttt{Beam3rHerm2Line3}, Simo-Reissner. Stent material linear elastic.} \\
+    \multicolumn{8}{@{}l}{Balloon material orthotropic Neo-Hooke with two fiber families.} \\
+    \multicolumn{8}{@{}l}{Load profile \texttt{ramp\_inflate\_deflate}, triangular, peak at $t = 0.5$.} \\
+    \multicolumn{8}{@{}l}{Contact \texttt{gauss\_point\_to\_segment} with \texttt{gap\_variation}, linear penalty law, Full Step line search.} \\
+    \multicolumn{8}{@{}l}{\scriptsize 4C image digest \texttt{sha256:17ac2c98d5d54e189c8ef2a4224731cc8cde45ab48856d8933e0d28f8fe5c6d1}} \\
+    \bottomrule
+  \end{tabular}}
+  \caption{Parameters of the stent-and-balloon run reported in \cref{sec:case-2}.}
+  \label{tab:balloon-run-parameters}
+\end{table}
+
+\begin{table}[htb]
+  \centering
+  \begin{tabular}{@{}>{\raggedright\arraybackslash}m{0.24\textwidth}>{\raggedright\arraybackslash}m{0.36\textwidth}>{\raggedright\arraybackslash}m{0.32\textwidth}@{}}
+    \toprule
+    & \textbf{\citet{datz2025}} & \textbf{This work} \\
+    \midrule
+    Stent model & Simo-Reissner beams & Simo-Reissner beams \\
+    \midrule
+    Stent material & elasto-plastic, $E = \SI{380}{\giga\pascal}$, $E_{ep} = \SI{64}{\giga\pascal}$ & linear elastic, \SI{200}{\giga\pascal} \\
+    \midrule
+    Balloon shape & straight cylinder & straight cylinder \\
+    \midrule
+    Balloon wall & \SI{0.04}{\milli\metre} & \SI{0.04}{\milli\metre} \\
+    \midrule
+    Balloon material & orthotropic Neo-Hooke, two fiber families & same, same $k_1$ and $k_2$ \\
+    \midrule
+    Balloon end springs & Robin springs, \SI{0.1}{\giga\pascal} (straight case) & Robin springs, \SI{1000}{\mega\pascal\per\milli\metre} \\
+    \midrule
+    Contact & beam-to-solid penalty, \SI{10}{\newton\per\milli\metre\squared} & same \\
+    \midrule
+    Peak pressure & 13 atm, \SI{1.01}{\mega\pascal} & \SI{0.6}{\mega\pascal} \\
+    \midrule
+    Wall-tension ratio & 0.728 & 0.741 \\
+    \midrule
+    Starting diameter & crimped, \SI{1.15}{\milli\metre} & skeletonised, \SI{1.92}{\milli\metre} \\
+    \midrule
+    Stent geometry source & parametric & extracted from an STL \\
+    \bottomrule
+  \end{tabular}
+  \caption{Modelling choices compared against \citet{datz2025}, for the stent-and-balloon run at 0.6 MPa.}
+  \label{tab:comparison}
+\end{table}
+
+\FloatBarrier
+\subsection{Additional figures}
+\label{app:figures}
+
+\subsubsection{2D skeletonisation, more stents}
+\label{app:2d-skeletons}
+
+This appendix shows five more stents. For each one, the per-ring tuning convergence is drawn on top and the assembled 2D skeleton below, the same view as \cref{fig:po_2d_skeleton} in the main text.
+
+\begin{figure}[htb]
+  \centering
+  \includegraphics[width=\textwidth]{appendix_skel_2d_16crown.png}
+  \caption{2D skeletonisation of the commercial stent design.}
+  \label{fig:2d-skel-16crown}
+\end{figure}
+
+\begin{figure}[htb]
+  \centering
+  \includegraphics[width=\textwidth]{appendix_skel_2d_stent02.png}
+  \caption{2D skeletonisation of the first public stent design.}
+  \label{fig:2d-skel-stent02}
+\end{figure}
+
+\begin{figure}[htb]
+  \centering
+  \includegraphics[width=\textwidth]{appendix_skel_2d_stent03.png}
+  \caption{2D skeletonisation of the second public stent design.}
+  \label{fig:2d-skel-stent03}
+\end{figure}
+
+\begin{figure}[htb]
+  \centering
+  \includegraphics[width=\textwidth]{appendix_skel_2d_stent04.png}
+  \caption{2D skeletonisation of the third public stent design.}
+  \label{fig:2d-skel-stent04}
+\end{figure}
+
+\begin{figure}[htb]
+  \centering
+  \includegraphics[width=\textwidth]{appendix_skel_2d_stent05.png}
+  \caption{2D skeletonisation of the fourth public stent design.}
+  \label{fig:2d-skel-stent05}
+\end{figure}
+
+\clearpage

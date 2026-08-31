@@ -1,0 +1,70 @@
+\section{Theoretical background}
+\label{sec:background}
+
+
+\subsection{Fundamentals}
+\label{sec:fundamentals}
+
+As explained in \Cref{sec:introduction}, the stent has a complex geometry with struts, crowns, connectors, and other features with a very slender cross-section, which makes it even harder to be modelled easily. However, despite of the complexity, the stent implentation into the lumen of the artery can be seen as placing a fiber structure inside a softer solid material. Thin and stiff members of the stent are embedded in a softer surrounding material, and they together carry the load. This is a general structure of fiber-in-material structures, which can be seen in many other applications in engineering, such as steel reinforcement bars embedded in concrete to compensate its low tensile strength, fiber-reinforced composites that exploit stiff fibers inside a soft matrix to build lightweight structures for spacecraft, boats and sports equipment, and even in biological tissue, where nature uses the same principle in the collagen fibers of the arterial wall \citep{steinbrecher2020}. The interaction between a stent and an artery can be seen as a similar arrangement, where a set of slender struts are pressed against a much softer vessel wall. Therefore, modeling a stent in an artery means solving the general problem of fiber-in-material structures. This general problem is known as the \emph{beam-to-solid coupling problem} \citep{steinbrecher2020}.
+
+As it can be seen from \cref{tab:coupling-approaches}, there are three different approaches to solve this problem. The first option (Approach A) is that not modelling the fibers at all and mixing the beam and solid properties into one averaged material. It is the cheapest and fastest option, but every local detail on the individual fibers is lost. The second option (Approach C) is the extreme opposite of the first one, where both the beams and the solid are modelled as full 3D bodies. This approach has usually most accurate result but unfortunately it is extremely expensive and painful to build because of the process of cutting the fiber shape out of the the solid and meshing them based on the interface between them. The last option (Approach B) is the one that sits between the two. In that option, the fibers are modelled as 1D beams along their centerline and the solid as a 3D object. The 3D object is meshed as if the fibers were not there, so the two of them overlap each other. Since this option is cheaper than the fully resolved model and far more detailed than the averaged one, it is the approach used in this project, and it is called \emph{mixed-dimensional modelling} \citep{steinbrecher2020}.
+
+\begin{table}[htb]
+  \centering
+  \includegraphics[width=0.91\textwidth]{beam_solid_coupling_approaches.png}
+
+  \vspace{1.2em}
+
+  \hyphenpenalty=10000 \exhyphenpenalty=10000
+  \begin{tabular}{@{}*{3}{>{\centering\arraybackslash}m{0.3\textwidth}}@{}}
+    \toprule
+    \textbf{Approach A} & \textbf{Approach B} & \textbf{Approach C} \\
+    \midrule
+    Fibres are not modelled at all &
+    Fibres as 1D beams, matrix as a 3D solid &
+    Everything modelled as full 3D bodies \\
+    \midrule
+    Fibre and solid properties are mixed into one averaged material &
+    The solid is meshed as if the fibers were not there, and beam and solid volume overlap &
+    The fiber shape is cut out of the solid and the mesh follows the interface \\
+    \midrule
+    Cheapest &
+    Cheaper than C &
+    Expensive and laborious \\
+    \midrule
+    All local detail of the individual fibers is lost &
+    More detailed than A &
+    Accurate near the fiber surface, if the mesh is fine enough there \\
+    \bottomrule
+  \end{tabular}
+
+  \caption{Modelling approaches for fiber-in-material structures, from cheapest to most accurate (a-c). Figure adapted from \citet{steinbrecher2020}.}
+  \label{tab:coupling-approaches}
+\end{table}
+
+The reason to use mixed-dimensional modelling for virtual stent implantation because of computational bottleneck of the fully resolved 3D model. As explained, with the fully resolved model, the artery and stent have to be meshed very fine, and this is what makes the problem very expensive. In \cref{tab:bottleneck}, the both approaches are compared by using the study of Datz et al. \citep{datz2025} as an example. In that study, the same stenting device is modelled with both approaches, and the numbers are compared. In order to have a fully resolved 3D model, estimately \num{155000} elements and \num{700000} degrees of freedom are needed, whereas just \num{588} beam elements and \num{8811} degrees of freedom are needed for the mixed-dimensional model for the same stent. Moreover, the contact interaction as well shrinks in the same way, from roughly \num{248000} evaluation points to \num{7000}. This is a huge reduction in the problem size, and it is what makes the mixed-dimensional approach feasible for this project. Even with this reduction, their patient-specific angioplasty simulation still needed \SI{23.4}{\hour} on 20 cores for \num{500} load steps. So one can imagine how much longer it would take with the fully resolved model, which would be far beyond what is practical. Therefore, the mixed-dimensional approach is chosen for this project.
+
+\begin{table}[htb]
+  \centering
+  \begin{tabular}{@{}*{4}{>{\centering\arraybackslash}m{0.21\textwidth}}@{}}
+    \toprule
+     & \textbf{3D solid stent} & \textbf{Mixed-dimensional} & \textbf{Ratio} \\
+    \midrule
+    Elements (stent)   & \num{155000} & \num{588}  & \num{264}$\times$ fewer \\
+    Degrees of freedom & \num{700000} & \num{8811} & \num{79}$\times$ fewer \\
+    Contact points     & \num{248000} & \num{7000} & \num{35}$\times$ fewer \\
+    \bottomrule
+  \end{tabular}
+  \caption{Model size of a fully resolved and a mixed-dimensional model of the same stenting device \citep{datz2025}.}
+  \label{tab:bottleneck}
+\end{table}
+
+\subsection{Governing equations and numerical formulation}
+\label{sec:theory-appendix}
+
+It is strongly recommended to look at the governing equations in \Cref{sec:governing-equations} and the numerical formulation in \Cref{sec:numerical-formulation} of the appendix before moving on to how the mixed-dimensional modelling is used for virtual stent implantation in this project. In those sections the study of \citet{steinbrecher2020} is followed closely, and all of the equations and formulations are taken from that work. In this project, however, the stent is coupled to a solid surface and not buried inside a solid volume, so the case that is finally used is the 1D-2D one. The formulation there is still written for the 1D-3D volume coupling, for two reasons. It is the case where the method was originally derived, and it is also the case where its validity limits were measured. Even though the surface options are extended versions, they are still based on the same formulation, so everything in those sections carries over to the surface case. 
+
+
+\subsection{Related work}
+\label{sec:related-work}
+As stated before, the formulation given in \cref{app:theory} of the appendix comes from \citet{steinbrecher2020}, who developed it for fibers embedded inside a solid volume. An extension followed this work later, which couples 1D beams to 2D solid surfaces \citep{steinbrecher2022surf}, and this was then extended to frictionless contact \citep{steinbrecher2021thesis}. This extension is the one that matters here because a stent is not a fiber buried inside the arterial wall. It is a device that presses against the lumen surface, so the interaction is a 1D-2D contact problem and not the 1D-3D volume coupling described above. The idea behind both is the same, namely a mortar formulation with penalty regularisation on meshes that do not match. After those extensions, as explained in \Cref{sec:state-of-the-art}, \citet{datz2025, ranno2025} used the method to simulate patient-specific case studies of stent implantation. These methods can be applicable with two software packages, so this project uses both of them. Simulation can run with 4C which is an open-source multi physics FEM framework to implement the beam formulations and mixed-dimensional contact. The other software is BeamMe which creates the necessary input files by building beam meshes and exporting them in the format expected by 4C \citep{beamme}. Using both leaves only one step open: extracting the centerline of the stent. 
