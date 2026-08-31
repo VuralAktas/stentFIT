@@ -39,12 +39,27 @@ trimesh = ">=4.12.2"
 scikit-image = ">=0.26.0"
 scikit-learn = ">=1.9.0"
 beamme = ">=0.2.0,<0.3.0" # 0.3.0 renamed/changed Mesh.write_vtk -> write_vtu (single-file, no beam/solid split); pin until ported
+# splinepy rebuilds a fitted B-spline from its stored knots and control points, and hands it to
+# BeamMe's create_beam_mesh_from_splinepy (stentfit.core.splines). It is imported unconditionally
+# by stent.py, so it is a core dependency. It arrives today only because beamme requires it, which
+# is not something to rely on.
+splinepy = ">=0.2.0"
 gmsh = ">=4.15.0"    # artery solid meshing (Mac-native; replaced Cubit/CubitPy)
 # fourcipp parses & writes 4C input files (needed to import the GMSH solid mesh
 # and dump the assembled .4C.yaml). Imported unconditionally by stent_splines.py
 # (via beamme.four_c), so it must be a core dependency, not an optional group
 # (Poetry's [dependency-groups] aren't installed by plain `pip install`).
 fourcipp = ">=1.132.0"
+# pyyaml writes and reads back run_parameters.yaml, the record of every parameter that
+# determined a run (stentfit.sim.record). Imported unconditionally by the simulation pipeline,
+# so it is a core dependency rather than an optional group. It arrives today only as a
+# transitive dependency of other packages, which is not something to rely on.
+pyyaml = ">=6.0"
+# pyvista reads 4C's .vtu / .pvd result files, which is how a solved run is measured
+# (stentfit.sim.results). It pulls in VTK and is the heaviest dependency here, so it is imported
+# lazily with a clear message if absent -- but a user who cannot postprocess cannot use half the
+# pipeline, so it is declared as a core dependency, not left to chance.
+pyvista = ">=0.48.0"
 
 
 [dependency-groups]
